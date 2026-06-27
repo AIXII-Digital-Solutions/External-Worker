@@ -17,4 +17,5 @@ api_data/
 # IDE
 .idea/
 .vscode/
+*.iml
 CLAUDE.md

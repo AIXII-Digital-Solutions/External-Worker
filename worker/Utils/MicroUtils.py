@@ -8,9 +8,6 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Any, Iterable
 
-from Database import Asset
-from Schemas import AssetSchema
-
 
 def cache_key_first_non_null(name: str, data: dict[str, Any], keys: Iterable[str], fallback: str = "all") -> Any:
     for key in keys:
@@ -26,26 +23,6 @@ def str_to_list(text: str | List[str]) -> List[str]:
         values = [v.strip() for v in values if v.strip()]
         return sorted(set(values))
     return sorted(text)
-
-
-def map_asset(asset: Asset) -> AssetSchema:
-    if not asset:
-        return AssetSchema(
-        file_name=None,
-        file_description=None,
-        file_data=None,
-        file_id=None
-    )
-
-    encoded = b64encode(asset.base64).decode()
-    data_uri = f"data:{asset.mime_type};base64,{encoded}"
-
-    return AssetSchema(
-        file_name=asset.asset_name,
-        file_description=asset.asset_description,
-        file_data=data_uri,
-        file_id=asset.id
-    )
 
 
 def to_bool(value: str) -> bool:

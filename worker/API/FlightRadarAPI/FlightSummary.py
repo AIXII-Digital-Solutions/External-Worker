@@ -5,12 +5,12 @@ from typing import Optional, List
 from uuid import UUID
 
 import aiohttp
-from sqlalchemy import select, delete
+from sqlalchemy import select
 
 from Config import setup_logger
 from settings import FLIGHT_RADAR_HEADERS, FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS, \
     FLIGHT_RADAR_MAX_REG_PER_BATCH, FLIGHT_RADAR_RANGE_DAYS, FLIGHT_RADAR_URL, FLIGHT_RADAR_PATH
-from Database import DatabaseClient, PBIRequestFRSummaryData
+from Database import DatabaseClient
 from Database.Models import FlightSummary, Registrations
 from Utils import parse_dt, ensure_naive_utc, write_csv, parse_date_or_datetime, performance_timer
 
@@ -229,19 +229,6 @@ async def fetch_all_ranges(
     )
 
     async with aiohttp.ClientSession() as http:
-        if correlation_id:
-            async with client.session("service") as service_session:
-                await service_session.execute(
-                    delete(PBIRequestFRSummaryData)
-                    .where(PBIRequestFRSummaryData.user == user)
-                )
-                init_record = PBIRequestFRSummaryData(
-                    correlation_id=correlation_id,
-                    user=user
-                )
-                service_session.add(init_record)
-                await service_session.commit()
-
         total_iterations = max_len * len(date_ranges)
         current_iteration = 0
 
@@ -256,27 +243,6 @@ async def fetch_all_ranges(
                 logger.debug(f"[Flight Summary] Range {i + 1} out of {len(date_ranges)}")
                 current_iteration += 1
 
-                if correlation_id:
-                    async with client.session("service") as service_session:
-                        result = await service_session.execute(
-                            select(PBIRequestFRSummaryData)
-                            .where(PBIRequestFRSummaryData.correlation_id == correlation_id)
-                        )
-                        record: Optional[PBIRequestFRSummaryData] = result.scalar_one_or_none()
-
-                        if record:
-                            record.current_regs = ", ".join(reg_batch) if reg_batch else None
-                            record.current_airlines = ", ".join(icao_batch) if icao_batch else None
-                            # TODO: Add callsigns
-                            record.current_date_from = range_start.strftime("%Y-%m-%d")
-                            record.current_date_to = range_end.strftime("%Y-%m-%d")
-
-                            remaining = total_iterations - current_iteration
-                            record.estimate_time = remaining * 5.5
-
-                            service_session.add(record)
-                            await service_session.commit()
-
                 flights.append(await fetch_date_range(
                     icao=icao_batch,
                     regs=reg_batch,
@@ -287,20 +253,6 @@ async def fetch_all_ranges(
                     csv_path=csv_path,
                     callsigns=callsign_batch
                 ))
-
-                if correlation_id:
-                    async with client.session("service") as service_session:
-                        result = await service_session.execute(
-                            select(PBIRequestFRSummaryData)
-                            .where(PBIRequestFRSummaryData.correlation_id == correlation_id)
-                        )
-                        record: PBIRequestFRSummaryData = result.scalar_one_or_none()
-
-                        if record:
-                            record.rows_fetched = len(flights)
-
-                            service_session.add(record)
-                            await service_session.commit()
 
         logger.info("[Flight Summary] Query Fetch All Ranges completed")
 
