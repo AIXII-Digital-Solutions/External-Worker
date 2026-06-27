@@ -1,3 +1,2 @@
-# APScheduler-based Scheduler/jobs were replaced by ARQ tasks + cron jobs
-# (see external_worker/worker/tasks.py and main.py).
-# Domain jobs live in the PowerPlatformJobs subpackage.
+# APScheduler-based Scheduler/jobs were replaced by the registry-driven dispatcher
+# (see worker/tasks.py, worker/scheduler.py and worker/main.py). This package is now empty.

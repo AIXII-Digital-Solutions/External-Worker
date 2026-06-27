@@ -2,37 +2,26 @@
 ARQ task wrappers for external_worker.
 
 - On-demand tasks are enqueued by the API Server (flight summary, airports,
-  guest invite, subscription refresh, manual aircraft create/update).
-- cron_* coroutines are scheduled by ARQ cron (see main.py). They mirror the
-  previously APScheduler-defined jobs.
+  subscription refresh).
+- cron_* coroutines are registry-driven schedulable jobs (see scheduler.py / main.py).
 
-Function __name__ values must match the names the API Server enqueues.
+Function __name__ values must match the names the API Server / dispatcher enqueue.
 """
 import functools
 
 from Config import setup_logger
-from Schemas import InviteUserSchema
 from status import publish_status
 
 from API.FlightRadarAPI.FlightSummary import fetch_all_ranges
 from API.FlightRadarAPI.AirportsAPI import load_airports as _load_airports
 from API.FlightRadarAPI.LiveFlightsAPI import live_flights_adaptive
-from API.MSGraphAPI.Users import invite_guest_user
 from API.Utils import create_or_update_subscription, asg_regs_updater
-
-from Scheduler.PowerPlatformJobs import update_users_job, sync_engines_from_cirium
-from Scheduler.PowerPlatformJobs.Aircraft import (
-    update_aircraft_templates,
-    update_aircrafts as _update_aircrafts,
-    update_create_aircraft_manual as _update_create_aircraft_manual,
-)
-from Scheduler.PowerPlatformJobs.Airline import sync_airlines
 
 logger = setup_logger("external_worker_tasks")
 
 
 def status_task(func):
-    """Wrap an on-demand task with running→success/error status publishing.
+    """Wrap a task with running→success/error status publishing.
 
     Preserves __name__ so ARQ still enqueues/registers the task by the same name.
     Uses the ARQ job id (ctx["job_id"]) as the status job_id and the function name
@@ -76,12 +65,6 @@ async def load_airports(ctx, codes):
 
 
 @status_task
-async def invite_guest(ctx, data: dict) -> bool:
-    invitation = await invite_guest_user(data=InviteUserSchema(**data))
-    return invitation is not None
-
-
-@status_task
 async def refresh_subscription(ctx, subscription_id: str | None = None):
     await create_or_update_subscription(
         db_proxy=ctx["db_proxy"],
@@ -91,46 +74,32 @@ async def refresh_subscription(ctx, subscription_id: str | None = None):
     )
 
 
-@status_task
-async def update_create_aircraft_manual(ctx, target: int):
-    await _update_create_aircraft_manual(target)
-
-
 # -----------------------------
 # Scheduled (cron) jobs
 # -----------------------------
-async def cron_live_flights(ctx):
+# status_task-wrapped so scheduled AND forced runs publish status; registered in
+# WorkerSettings.functions (see SCHEDULED below) so scheduler.dispatch_due / run-now
+# can enqueue them by name.
+@status_task
+async def cron_live_flights(ctx, **_):
     await live_flights_adaptive()
 
 
-async def cron_update_users(ctx):
-    await update_users_job()
-
-
-async def cron_asg_regs(ctx):
+@status_task
+async def cron_asg_regs(ctx, **_):
     await asg_regs_updater()
 
 
-async def cron_update_ac_types(ctx):
-    await update_aircraft_templates()
-
-
-async def cron_update_engines(ctx):
-    await sync_engines_from_cirium()
-
-
-async def cron_update_airlines(ctx):
-    await sync_airlines()
-
-
-async def cron_update_aircrafts(ctx):
-    await _update_aircrafts()
-
-
+# On-demand tasks (enqueued by the API Server).
 ON_DEMAND = [
     fetch_flight_summary,
     load_airports,
-    invite_guest,
     refresh_subscription,
-    update_create_aircraft_manual,
+]
+
+# Registry-driven schedulable jobs. Registered in WorkerSettings.functions so the
+# scheduler dispatcher (and the /scheduler run-now endpoint) can enqueue them by name.
+SCHEDULED = [
+    cron_live_flights,
+    cron_asg_regs,
 ]

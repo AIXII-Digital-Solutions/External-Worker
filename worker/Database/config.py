@@ -46,11 +46,6 @@ class FlightRadarBase(AsyncAttrs, BaseMixin, DeclarativeBase):
     pass
 
 
-# Base class for others models in PowerPlatform DB
-class PowerPlatformBase(AsyncAttrs, BaseMixin, DeclarativeBase):
-    pass
-
-
 class AviationEdgeBase(AsyncAttrs, BaseMixin, DeclarativeBase):
     pass
 

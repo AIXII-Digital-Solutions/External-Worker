@@ -13,7 +13,6 @@ class QueueStatusEnum(str, __enum):
 
 class APITagsEnum(str, __enum):
     WEBHOOK = "Webhook"
-    POWERPLATFORM = "PowerPlatform"
     FLIGHTRADAR = "FlightRadar"
     AIRCRAFTS = "Aircrafts"
     AIRLINES = "Airlines"
@@ -22,9 +21,6 @@ class APITagsEnum(str, __enum):
     FILES = "Files"
     RULES = "Rules"
     CLAIMS = "Claims"
-
-class APIServiceEnum(str, __enum):
-    POWERPLATFORM = "MicrosoftGraphAPI"
 
 
 class FilesExtensionEnum(str, __enum):
