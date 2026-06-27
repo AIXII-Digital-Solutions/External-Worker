@@ -6,11 +6,6 @@ from sqlalchemy import String, Integer, Boolean, Date
 from sqlalchemy.orm import Mapped, mapped_column
 from .config import MainBase as Base
 
-try:
-    from Schemas.Enums import PowerPlatformAPI
-except ModuleNotFoundError:
-    from ..Schemas.Enums import PowerPlatformAPI
-
 
 class Registrations(Base):
     reg: Mapped[str] = mapped_column(String, index=True)
@@ -32,7 +27,7 @@ class Guests(Base):
     is_guest: Mapped[bool] = mapped_column(Boolean, default=False)
     inviter_email: Mapped[str] = mapped_column(String)
     expires_at: Mapped[date] = mapped_column(Date)
-    invite_status: Mapped[int] = mapped_column(Integer, default=PowerPlatformAPI.InvitationStatusEnum.PENDING_ACCEPTANCE.code)
+    invite_status: Mapped[int] = mapped_column(Integer, default=0)  # 0 = PendingAcceptance
 
 
 class Lease_Output(Base):

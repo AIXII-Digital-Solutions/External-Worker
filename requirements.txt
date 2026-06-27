@@ -18,6 +18,11 @@ fastapi==0.136.1
 aiohttp==3.13.5
 orjson==3.11.9
 
+# Scheduler dispatcher: parse cron_expr schedules in schedule_registry.
+# Optional at runtime — interval_seconds schedules work without it (dispatcher degrades
+# gracefully and logs a warning if a cron_expr row is present without croniter).
+croniter==2.0.5
+
 # Microsoft Graph
 msgraph-sdk==1.57.0
 azure-core==1.41.0
