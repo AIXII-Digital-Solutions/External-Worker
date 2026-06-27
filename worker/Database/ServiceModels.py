@@ -3,12 +3,9 @@ import sys
 from datetime import datetime
 from typing import Optional
 
-from pydantic import EmailStr
-
-from sqlalchemy import String, Integer, Float, DateTime, UniqueConstraint, Index, event, DDL, Computed
+from sqlalchemy import String, Integer, DateTime, Index, Boolean
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.dialects.postgresql import JSONB, UUID
-from pgvector.sqlalchemy import Vector as PGVector
+from sqlalchemy.dialects.postgresql import JSONB
 
 from .config import ServiceBase as Base
 
@@ -37,90 +34,56 @@ class JobStatus(Base):
     )
 
 
-class PBIRequestFRSummaryData(Base):
-    correlation_id: Mapped[UUID] = mapped_column(UUID, unique=True, nullable=False)
-    user: Mapped[str] = mapped_column(String, nullable=False)
-    rows_fetched: Mapped[int] = mapped_column(Integer, nullable=True)
-    current_date_from: Mapped[str] = mapped_column(String, nullable=True)
-    current_date_to: Mapped[str] = mapped_column(String, nullable=True)
-    current_regs: Mapped[str] = mapped_column(String, nullable=True)
-    current_airlines: Mapped[str] = mapped_column(String, nullable=True)
-    estimate_time: Mapped[float] = mapped_column(Float, nullable=True)
+class ScheduleEntry(Base):
+    """Runtime-controllable schedule for worker jobs — the scheduler control plane.
+
+    core-api OWNS this table (CRUD via the ``/scheduler`` router); the workers run a
+    dispatcher tick that reads ``enabled`` and not-``paused`` rows whose ``next_run_at``
+    is due (or whose ``run_now`` flag is set) and enqueues ``func_name`` onto ``queue``.
+
+    A row is driven either by a fixed interval (``interval_seconds``) OR a cron
+    expression (``cron_expr``) — exactly one should be set. ``run_now`` forces a single
+    immediate dispatch and is reset by the dispatcher. ``next_run_at``/``last_run_at``/
+    ``last_status`` are bookkeeping the dispatcher maintains. Schedulable jobs
+    self-register a default row on worker startup (insert-if-absent), so existing and
+    future jobs are controllable without code changes.
+    """
+    __tablename__ = "schedule_registry"
+
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    queue: Mapped[str] = mapped_column(String(64), nullable=False)             # e.g. "core:external"
+    func_name: Mapped[str] = mapped_column(String(128), nullable=False)        # ARQ function __name__ to enqueue
+    kwargs: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)       # enqueue kwargs (picklable)
+    interval_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cron_expr: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    run_now: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    next_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
 
-class PDF_Queue(Base):
-    filename: Mapped[str] = mapped_column(String, unique=True, nullable=False)
-    type: Mapped[str] = mapped_column(String, nullable=False)
-    queue_position: Mapped[int] = mapped_column(Integer, nullable=False)
-    status: Mapped[str] = mapped_column(String, nullable=False, default="Queued")
-    status_description: Mapped[str] = mapped_column(String, nullable=False, default="Pending")
-    user_email: Mapped[EmailStr] = mapped_column(String, nullable=False)
-    progress: Mapped[float] = mapped_column(Float, nullable=False, default=0)
-    progress_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    progress_done: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+class ApiToken(Base):
+    """A per-caller API key for the gateway, presented as ``X-Api-Key: <prefix>.<secret>``.
 
+    Only the sha256+pepper hash of the secret is stored — the secret itself is shown ONCE at
+    creation and never again. ``token_prefix`` is the public, indexed lookup id; ``scopes`` is
+    the granted domain-scope list (e.g. ["flights:read", "status:read"]). ``enabled`` is the
+    revocation switch; ``expires_at`` an optional hard expiry; ``last_used_at`` is best-effort
+    bookkeeping. core-api owns this table (CRUD via the ``/tokens`` admin router).
+    """
+    __tablename__ = "api_tokens"
 
-class DocumentEmbedding(Base):
-    file_name: Mapped[str] = mapped_column(String, nullable=False, index=True)
-    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
-    text: Mapped[str] = mapped_column(String, nullable=False)
-    embedding: Mapped[PGVector] = mapped_column(PGVector(1024))
-    meta_data: Mapped[dict] = mapped_column(JSONB, nullable=True)
-
-    __table_args__ = (
-        UniqueConstraint("file_name", "chunk_index", name="uq_document_chunk"),
-        Index("ix_document_file_name", "file_name"),
-    )
-
-
-class GlobalEmbedding(Base):
-    text: Mapped[str] = mapped_column(String, nullable=False)
-    text_hash: Mapped[UUID] = mapped_column(
-        UUID,
-        Computed("md5(text)::uuid", persisted=True),
-        unique=True,
-    )
-    embedding: Mapped[PGVector] = mapped_column(PGVector(1024))
-    meta_data: Mapped[dict] = mapped_column(JSONB, nullable=True)
-
-
-class FieldSynonym(Base):
-    field_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    synonym: Mapped[str] = mapped_column(String(255), nullable=False)
-    embedding: Mapped[PGVector] = mapped_column(PGVector(1024))
-    created_source: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    extra: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-
-    __table_args__ = (
-        UniqueConstraint("field_name", "synonym", name="uq_field_synonym"),
-        Index("ix_field_synonym_field_name", "field_name"),
-    )
-
-
-# DocumentEmbedding
-event.listen(
-    DocumentEmbedding.__table__,
-    "after_create",
-    DDL("""
-    CREATE INDEX IF NOT EXISTS idx_document_embedding_ivf
-    ON ai12_service.public.documentembeddings
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
-    """)
-)
-
-# GlobalEmbedding
-event.listen(
-    GlobalEmbedding.__table__,
-    "after_create",
-    DDL("""
-    CREATE INDEX IF NOT EXISTS idx_global_embedding_ivf
-    ON ai12_service.public.globalembeddings
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
-    """)
-)
-
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    token_prefix: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
+    token_hash: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    scopes: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
 
 _current_module = sys.modules[__name__]

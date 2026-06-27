@@ -1,6 +1,5 @@
 import inspect
 import sys
-from .PowerPlatformModels import *
 from .AirlabsModels import *
 from .CiriumModels import *
 from .FlightRadarModels import *
