@@ -5,7 +5,7 @@ asyncpg==0.31.0
 pgvector==0.4.2
 pydantic==2.13.4
 pydantic[email]
-pydantic-settings==2.14.1
+pydantic-settings==2.14.2
 inflect==7.5.0
 python-dotenv==1.2.2
 redis==5.3.1
