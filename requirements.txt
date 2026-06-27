@@ -1,0 +1,23 @@
+# External API Worker segment (ARQ worker)
+# --- base deps (inlined; was shared/requirements-base.txt) ---
+SQLAlchemy==2.0.49
+asyncpg==0.31.0
+pgvector==0.4.2
+pydantic==2.13.4
+pydantic[email]
+pydantic-settings==2.14.1
+inflect==7.5.0
+python-dotenv==1.2.2
+redis==5.3.1
+arq==0.26.3
+# Utils.Middlewares (DBProxy/performance_timer) subclasses FastAPI APIRouter,
+# so fastapi is required by every segment (workers included).
+fastapi==0.136.1
+
+# External HTTP APIs
+aiohttp==3.13.5
+orjson==3.11.9
+
+# Microsoft Graph
+msgraph-sdk==1.57.0
+azure-core==1.41.0

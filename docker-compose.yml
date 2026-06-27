@@ -1,0 +1,35 @@
+# external-worker — production compose.
+#
+# Connects to the SHARED external PostgreSQL + Redis cluster (set DB_HOST / REDIS_HOST in
+# .env). MUST use the SAME Redis as core-api (ARQ broker).
+#
+# SCHEDULER (ARQ cron): enable on EXACTLY ONE replica/instance, via SCHEDULER_ENABLED=true
+# in .env — otherwise cron jobs run multiple times.
+name: external-worker
+
+services:
+  external-worker:
+    build: .
+    image: external-worker:latest
+    container_name: external-worker
+    env_file: [.env]
+    networks: [aixii]
+    restart: unless-stopped
+    volumes:
+      - ext_data:/app/api_data            # its own FlightRadar/AviationEdge response storage
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'arq main.WorkerSettings' >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+volumes:
+  ext_data:
+
+networks:
+  aixii:
+    external: true
