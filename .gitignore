@@ -1,0 +1,20 @@
+# secrets / env
+.env
+.env.dev
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# runtime data
+Logs/
+api_data/
+
+# IDE
+.idea/
+.vscode/
+CLAUDE.md
