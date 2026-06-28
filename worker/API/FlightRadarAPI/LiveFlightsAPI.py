@@ -5,7 +5,7 @@ from typing import List, Optional, Set
 
 import aiohttp
 from redis.asyncio import Redis
-from sqlalchemy import select
+from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from Config import DBSettings
@@ -14,7 +14,7 @@ from settings import FLIGHT_RADAR_HEADERS, \
     FLIGHT_RADAR_CHECK_INTERVAL_MISS, FLIGHT_RADAR_CHECK_INTERVAL_FOUND, \
     FLIGHT_RADAR_FORCE_RECHECK_MISS, FLIGHT_RADAR_BOOTSTRAP_KEY
 from Database import DatabaseClient
-from Database.Models import Registrations, LivePositions
+from Database.Models import LivePositions
 from Utils import ensure_naive_utc, parse_dt, performance_timer
 
 try:
@@ -122,15 +122,11 @@ async def live_flights_adaptive(storage_mode: str = "db"):
     redis_storage = FlightPollingStorage(username, password, host, port)
     db_client = DatabaseClient()
 
-    async with db_client.session("main") as session:
-        stmt = (
-            select(
-                Registrations.reg
-            )
-            .where(Registrations.indashboard == True)
-        )
-        result = await session.execute(stmt)
-        all_regs = result.scalars().all()
+    # regs now come from api.registration (active aircraft synced from cirium.asg), not the
+    # defunct main.registrations. Every row is already an active tracked aircraft, so no filter.
+    async with db_client.session("cirium") as session:
+        result = await session.execute(text("SELECT reg FROM api.registration"))
+        all_regs = [row[0] for row in result.all()]
     await redis_storage.bootstrap(all_regs)
 
     regs_to_check = await redis_storage.get_regs_for_cycle()
