@@ -78,12 +78,15 @@ async def get_latest_live_position(client, reg: str, flight_number: str):
 
 
 async def get_airport_coords_by_iata(client, iata: str):
+    # Coords by IATA from main.virtual_airport_list — the legacy 18k-row airport reference,
+    # TEMPORARILY copied into the aixii `main` schema (migration a2b3c4d5e6f7) until core/main is
+    # rebuilt. Unknown IATA -> None and the caller falls back.
     async with client.session("main") as session:
         stmt = text("""
             SELECT
                 "Latitude"  AS latitude,
                 "Longitude" AS longitude
-            FROM virtual_airport_list
+            FROM main.virtual_airport_list
             WHERE "IATA Code" = :iata
             LIMIT 1
         """)
