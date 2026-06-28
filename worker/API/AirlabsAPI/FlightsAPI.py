@@ -3,13 +3,12 @@ from datetime import timezone, datetime
 from typing import List
 
 import aiohttp
-from sqlalchemy import select
+from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert
 
 from Config import setup_logger
 from settings import AIRLABS_API_KEY, AIRLABS_API_URL
 from Database import DatabaseClient, FlightSnapshot, AircraftState
-from Database.Models import Registrations
 from Schemas import FlightsTrackerResponseSchema
 from Utils import performance_timer
 
@@ -23,15 +22,10 @@ async def tracker_api(regs: list[str] | None = None):
 
     client: DatabaseClient = DatabaseClient()
     if regs is None:
-        async with client.session("main") as session:
-            stmt = (
-                select(
-                    Registrations.reg
-                )
-                .where(Registrations.indashboard == True)
-            )
-            result = await session.execute(stmt)
-            regs = result.scalars().all()
+        # regs come from api.registration (active aircraft synced from cirium.asg), not main.
+        async with client.session("cirium") as session:
+            result = await session.execute(text("SELECT reg FROM api.registration"))
+            regs = [row[0] for row in result.all()]
 
     params = {
         "api_key": AIRLABS_API_KEY,

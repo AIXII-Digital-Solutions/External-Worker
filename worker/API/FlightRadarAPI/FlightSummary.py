@@ -5,14 +5,14 @@ from typing import Optional, List
 from uuid import UUID
 
 import aiohttp
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from Config import setup_logger
 from settings import FLIGHT_RADAR_HEADERS, FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS, \
     FLIGHT_RADAR_MAX_REG_PER_BATCH, FLIGHT_RADAR_RANGE_DAYS, FLIGHT_RADAR_URL, FLIGHT_RADAR_PATH
 from Database import DatabaseClient
-from Database.Models import FlightSummary, Registrations
+from Database.Models import FlightSummary
 from Utils import parse_dt, ensure_naive_utc, write_csv, parse_date_or_datetime, performance_timer
 
 logger = setup_logger("flightradar")
@@ -198,15 +198,10 @@ async def fetch_all_ranges(
 ):
     client: DatabaseClient = DatabaseClient()
     if registrations is None and icao is None and callsigns is None:
-        async with client.session("main") as session:
-            stmt = (
-                select(
-                    Registrations.reg
-                )
-                .where(Registrations.indashboard == True)
-            )
-            result = await session.execute(stmt)
-            registrations = result.scalars().all()
+        # regs come from api.registration (active aircraft synced from cirium.asg), not main.
+        async with client.session("cirium") as session:
+            result = await session.execute(text("SELECT reg FROM api.registration"))
+            registrations = [row[0] for row in result.all()]
 
     logger.info("[Flight Summary] Starting query Fetch All Ranges")
 
