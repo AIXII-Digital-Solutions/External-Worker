@@ -16,6 +16,7 @@ from API.FlightRadarAPI.FlightSummary import fetch_all_ranges
 from API.FlightRadarAPI.AirportsAPI import load_airports as _load_airports
 from API.FlightRadarAPI.LiveFlightsAPI import live_flights_adaptive
 from API.Utils import create_or_update_subscription, asg_regs_updater, refresh_cirium_delta
+from API.Predictive.PredictiveUtilisation import predictive_utilisation_pipeline, predictive_cleanup
 
 logger = setup_logger("external_worker_tasks")
 
@@ -60,6 +61,11 @@ async def fetch_flight_summary(ctx, **kwargs):
 
 
 @status_task
+async def predictive_utilisation(ctx, icao, iata, date, **_):
+    await predictive_utilisation_pipeline(icao=icao, iata=iata, date=date)
+
+
+@status_task
 async def load_airports(ctx, codes):
     await _load_airports(codes=codes)
 
@@ -95,9 +101,15 @@ async def cron_refresh_delta(ctx, **_):
     await refresh_cirium_delta()
 
 
+@status_task
+async def cron_predictive_cleanup(ctx, **_):
+    await predictive_cleanup()
+
+
 # On-demand tasks (enqueued by the API Server).
 ON_DEMAND = [
     fetch_flight_summary,
+    predictive_utilisation,
     load_airports,
     refresh_subscription,
 ]
@@ -108,4 +120,5 @@ SCHEDULED = [
     cron_live_flights,
     cron_asg_regs,
     cron_refresh_delta,
+    cron_predictive_cleanup,
 ]
