@@ -1,4 +1,4 @@
 from .MSGraphSubscriptionManager import create_or_update_subscription
-from .RegsListUpdater import asg_regs_updater
+from .RegsListUpdater import asg_regs_updater, refresh_cirium_delta
 
 

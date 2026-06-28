@@ -1,6 +1,7 @@
 from datetime import datetime
 
-from sqlalchemy import String, BigInteger, Float, Enum, DateTime, Index, ForeignKey
+from sqlalchemy import String, BigInteger, Float, DateTime, Index, ForeignKey
+from sqlalchemy.dialects.postgresql import ENUM as PgEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .config import AirlabsBase as Base
 
@@ -8,6 +9,20 @@ try:
     from Schemas.Enums.Defaults import FlightStatusEnum
 except ImportError:
     from ..Schemas.Enums.Defaults import FlightStatusEnum
+
+
+# Shared native PG enum `airlabs.flight_status` — used by BOTH FlightSnapshot and AircraftState.
+# create_type=False: the type is created exactly ONCE by the aixii schema-baseline migration
+# (`flight_status_type.create(bind, checkfirst=True)`), so a single squashed initial migration
+# that builds both tables does not emit two conflicting `CREATE TYPE flight_status` statements.
+flight_status_type = PgEnum(
+    FlightStatusEnum,
+    name="flight_status",
+    schema="airlabs",
+    create_type=False,
+    create_constraint=False,
+)
+
 
 class FlightSnapshot(Base):
     # identifiers
@@ -41,12 +56,7 @@ class FlightSnapshot(Base):
     flag: Mapped[str] = mapped_column(String(4), nullable=True)
 
     status: Mapped[FlightStatusEnum] = mapped_column(
-        Enum(
-            FlightStatusEnum,
-            name="flight_status",
-            native_enum=True,
-            create_constraint=False
-        ),
+        flight_status_type,
         nullable=False
     )
 
@@ -72,12 +82,7 @@ class AircraftState(Base):
     airline_iata: Mapped[str] = mapped_column(String(4), index=True, nullable=True)
 
     status: Mapped[FlightStatusEnum] = mapped_column(
-        Enum(
-            FlightStatusEnum,
-            name="flight_status",
-            native_enum=True,
-            create_constraint=False
-        ),
+        flight_status_type,
         nullable=False
     )
 
@@ -85,7 +90,7 @@ class AircraftState(Base):
 
     snapshot_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey("flightsnapshots.id", ondelete="SET NULL"),
+        ForeignKey("flightsnapshot.id", ondelete="SET NULL"),
         nullable=True
     )
 
