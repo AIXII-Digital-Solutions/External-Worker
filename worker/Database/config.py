@@ -2,7 +2,7 @@ import inspect
 import sys
 from datetime import datetime
 
-from sqlalchemy import func, BigInteger, MetaData
+from sqlalchemy import func, BigInteger, MetaData, DateTime
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, declared_attr, Mapped, mapped_column
 
@@ -23,6 +23,18 @@ class BaseMixin:
         return cls.__name__.lower()
 
 
+class BaseMixinTz(BaseMixin):
+    """BaseMixin with timezone-aware created_at/updated_at (timestamptz). Used by the service
+    tables, whose writers pass tz-aware UTC datetimes (e.g. external-worker's publish_status) —
+    consistent with finished_at / next_run_at / expires_at, which are already timezone=True. The
+    aviation (aixii) tables keep plain BaseMixin: their timestamps are set by server defaults, so
+    they never receive a tz-aware Python value and don't need the (huge) column rewrite."""
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 # AIXII consolidation: the aviation domains now live as SCHEMAS inside ONE physical database
 # (`aixii`); each Base carries a schema-scoped MetaData so its tables emit `<schema>.<table>`.
 # `service` is a SEPARATE physical database (schema-less / public). `main` (core) is being
@@ -35,7 +47,7 @@ class MainBase(AsyncAttrs, BaseMixin, DeclarativeBase):
 
 
 # Base class for Service-DB models (separate `service` database, public schema)
-class ServiceBase(AsyncAttrs, BaseMixin, DeclarativeBase):
+class ServiceBase(AsyncAttrs, BaseMixinTz, DeclarativeBase):
     pass
 
 
