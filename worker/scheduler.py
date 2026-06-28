@@ -57,6 +57,14 @@ SCHEDULE_DEFAULTS = [
                                             # Set to "0 9 * * 1" to refresh in parallel instead.
         "description": "Refresh cirium.delta materialized view (after the ASG refresh).",
     },
+    {
+        "name": "cron_predictive_cleanup",
+        "queue": EXTERNAL_QUEUE,
+        "func_name": "cron_predictive_cleanup",
+        "interval_seconds": 1800,           # every 30 minutes
+        "cron_expr": None,
+        "description": "Truncate api.predictive_utilisation after 3h idle (reset ids).",
+    },
 ]
 
 

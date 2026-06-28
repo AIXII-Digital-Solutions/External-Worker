@@ -8,6 +8,7 @@ logger = setup_logger("registration_updater")
 
 ASG_VIEW = "cirium.asg"
 DELTA_VIEW = "cirium.delta"
+AIRLINES_VIEW = "cirium.airlines"
 
 
 async def regs_updater(client: DatabaseClient):
@@ -32,8 +33,9 @@ async def asg_regs_updater():
     client = DatabaseClient()
     logger.info("Refreshing %s", ASG_VIEW)
     await client.refresh_materialized_view("cirium", ASG_VIEW)
+    await client.refresh_materialized_view("cirium", AIRLINES_VIEW)
     await regs_updater(client=client)
-    logger.info("ASG refresh + api.registration sync complete")
+    logger.info("ASG refresh + cirium.airlines refresh + api.registration sync complete")
 
 
 @performance_timer
