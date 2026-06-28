@@ -12,11 +12,12 @@ services:
     build: .
     image: external-worker:latest
     container_name: external-worker
-    env_file: [.env]
-    networks: [aixii]
+    env_file: .env
+    networks:
+      - aixii_net_local
     restart: unless-stopped
     volumes:
-      - ext_data:/app/api_data            # its own FlightRadar/AviationEdge response storage
+      - ./ext_data:/app/api_data
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f 'arq main.WorkerSettings' >/dev/null || exit 1"]
       interval: 30s
@@ -27,9 +28,7 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "5" }
 
-volumes:
-  ext_data:
 
 networks:
-  aixii:
+  aixii_net_local:
     external: true
