@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from Config import setup_logger
 from settings import FLIGHT_RADAR_URL, FLIGHT_RADAR_HEADERS
 from Database import DatabaseClient
-from Database.Models import Airport, AirportRunway
+from Database.Models import Airports, AirportRunways
 from Utils import str_to_list
 
 
@@ -30,16 +30,16 @@ async def airport_exists(
         iata: Optional[str],
         icao: Optional[str],
 ) -> bool:
-    stmt = select(Airport.id)
+    stmt = select(Airports.id)
 
     if icao and iata:
         stmt = stmt.where(
-            (Airport.icao == icao) | (Airport.iata == iata)
+            (Airports.icao == icao) | (Airports.iata == iata)
         )
     elif icao:
-        stmt = stmt.where(Airport.icao == icao)
+        stmt = stmt.where(Airports.icao == icao)
     elif iata:
-        stmt = stmt.where(Airport.iata == iata)
+        stmt = stmt.where(Airports.iata == iata)
     else:
         return False
 
@@ -50,7 +50,7 @@ async def airport_exists(
 async def save_airport(session: AsyncSession, data: dict) -> None:
     country = data.get("country")
     timezone = data.get("timezone")
-    airport = Airport(
+    airport = Airports(
         name=data.get("name"),
         iata=data.get("iata"),
         icao=data.get("icao"),
@@ -76,7 +76,7 @@ async def save_airport(session: AsyncSession, data: dict) -> None:
 
         surface = rw.get("surface")
         airport.runways.append(
-            AirportRunway(
+            AirportRunways(
                 designator=rw.get("designator"),
                 heading=rw.get("heading"),
                 length=rw.get("length"),
