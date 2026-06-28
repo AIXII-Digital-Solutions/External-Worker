@@ -87,7 +87,8 @@ async def _collect(session, icao: str, iata: str, start_dt: datetime, end_dt: da
     await session.execute(COLLECT_SQL, {"icao": icao, "iata": iata, "start": start_dt, "end": end_dt})
 
 
-async def predictive_utilisation_pipeline(icao: str, iata: str, date: str, **_) -> None:
+async def predictive_utilisation_pipeline(icao: str, iata: str, date: str,
+                                          deep_research: bool = False, **_) -> None:
     d = datetime.strptime(date, "%Y-%m-%d").date()
     past_start = _minus_years(d, 2)
     past_end = d                                   # inclusive day d
@@ -115,6 +116,13 @@ async def predictive_utilisation_pipeline(icao: str, iata: str, date: str, **_) 
     # step 4 — collect (first pass)
     async with client.session("cirium") as session:
         await _collect(session, icao, iata, start_dt, end_dt)
+
+    # deep_research=False -> stop here: just expose whatever flightsummary data we already have,
+    # no FlightRadar backfill (steps 5–6).
+    if not deep_research:
+        logger.info("[predictive] shallow (deep_research=false): collected existing data only — "
+                    "icao=%s regs=%d", icao, len(active_regs))
+        return
 
     # step 5 — per-reg gaps in the window
     all_days, cur = [], past_start

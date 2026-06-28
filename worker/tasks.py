@@ -61,8 +61,8 @@ async def fetch_flight_summary(ctx, **kwargs):
 
 
 @status_task
-async def predictive_utilisation(ctx, icao, iata, date, **_):
-    await predictive_utilisation_pipeline(icao=icao, iata=iata, date=date)
+async def predictive_utilisation(ctx, icao, iata, date, deep_research=False, **_):
+    await predictive_utilisation_pipeline(icao=icao, iata=iata, date=date, deep_research=deep_research)
 
 
 @status_task
