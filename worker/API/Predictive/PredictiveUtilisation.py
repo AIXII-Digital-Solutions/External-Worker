@@ -6,6 +6,9 @@ Flow for an airline (icao/iata) + reference date `d`:
      'On order'/'On option') -> reg list.
   4. collect: replace this airline's rows in api.predictive_utilisation with every
      flightradar.flightsummary row of those regs in the window, joined with the aircraft fields.
+     Done by the SECURITY DEFINER fn api.collect_predictive_utilisation() (DELETE + INSERT..SELECT),
+     so the worker needs no INSERT/DELETE grant on api — only EXECUTE (PUBLIC) + USAGE on schema api.
+  (deep_research=False stops after step 4 — existing data only, no FlightRadar backfill.)
   5. per-reg gaps: days in the window with no flightsummary for that reg, grouped into <=14-day runs.
   6. backfill: regs sharing an identical set of ranges are batched; for each batch+range we await
      fetch_all_ranges (writes into flightradar.flightsummary). Then re-run step 4 once.
@@ -13,7 +16,7 @@ Flow for an airline (icao/iata) + reference date `d`:
 `cron_predictive_cleanup` TRUNCATEs the whole table (reset ids) once it has been idle for 3h.
 """
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import text
 
@@ -26,36 +29,9 @@ logger = setup_logger("predictive_utilisation")
 INACTIVE = ("On order", "On option")
 MAX_RANGE_DAYS = 14
 
-# wide INSERT ... SELECT: every flightsummary row of the airline's active aircraft in the window,
-# joined with the aircraft (step-3.3) fields. Server-side — no rows pulled into Python.
-COLLECT_SQL = text("""
-INSERT INTO api.predictive_utilisation
-  (airline_icao, fr24_id, flight, callsign, operating_as, painted_as, type, reg, orig_icao, orig_iata,
-   datetime_takeoff, runway_takeoff, dest_icao, dest_iata, dest_icao_actual, dest_iata_actual,
-   datetime_landed, runway_landed, flight_time, actual_distance, circle_distance, category, hex,
-   first_seen, last_seen, flight_ended,
-   msn, airline, status, delivery_date, in_service_date, first_flight_date, indicative_value, num_of_seats)
-SELECT :icao,
-  fs.fr24_id, fs.flight, fs.callsign, fs.operating_as, fs.painted_as, fs.type, fs.reg, fs.orig_icao, fs.orig_iata,
-  fs.datetime_takeoff, fs.runway_takeoff, fs.dest_icao, fs.dest_iata, fs.dest_icao_actual, fs.dest_iata_actual,
-  fs.datetime_landed, fs.runway_landed, fs.flight_time, fs.actual_distance, fs.circle_distance, fs.category, fs.hex,
-  fs.first_seen, fs.last_seen, fs.flight_ended,
-  ac."Serial Number", ac."Operator", ac."Status", ac."Delivery Date", ac."In Service Date",
-  ac."First Flight Date", ac."Indicative Market Value (US$m)", ac."Number of Seats"
-FROM flightradar.flightsummary fs
-JOIN (
-  SELECT DISTINCT ON ("Registration")
-     "Registration", "Serial Number", "Operator", "Status", "Delivery Date",
-     "In Service Date", "First Flight Date", "Indicative Market Value (US$m)", "Number of Seats"
-  FROM cirium.ciriumaircrafts
-  WHERE ("Operator ICAO" = :icao OR "Operator IATA" = :iata)
-    AND ("Status" IS NULL OR "Status" NOT IN ('On order', 'On option'))
-  ORDER BY "Registration", revision_id DESC
-) ac ON ac."Registration" = fs.reg
-WHERE fs.datetime_takeoff >= :start AND fs.datetime_takeoff < :end
-""")
-
-DELETE_SQL = text("DELETE FROM api.predictive_utilisation WHERE airline_icao = :icao")
+# DELETE this airline's rows + wide INSERT..SELECT of its active aircraft's flightsummary in the
+# window — all inside a SECURITY DEFINER function (api owns it), so the worker needs no write grant.
+COLLECT_FN = text("SELECT api.collect_predictive_utilisation(:icao, :iata, :start, :end)")
 
 
 def _minus_years(d: date, n: int) -> date:
@@ -83,8 +59,7 @@ def _group_runs(missing_days, max_len: int = MAX_RANGE_DAYS):
 
 
 async def _collect(session, icao: str, iata: str, start_dt: datetime, end_dt: datetime) -> None:
-    await session.execute(DELETE_SQL, {"icao": icao})
-    await session.execute(COLLECT_SQL, {"icao": icao, "iata": iata, "start": start_dt, "end": end_dt})
+    await session.execute(COLLECT_FN, {"icao": icao, "iata": iata, "start": start_dt, "end": end_dt})
 
 
 async def predictive_utilisation_pipeline(icao: str, iata: str, date: str,
@@ -92,8 +67,8 @@ async def predictive_utilisation_pipeline(icao: str, iata: str, date: str,
     d = datetime.strptime(date, "%Y-%m-%d").date()
     past_start = _minus_years(d, 2)
     past_end = d                                   # inclusive day d
-    start_dt = datetime.combine(past_start, datetime.min.time())
-    end_dt = datetime.combine(past_end + timedelta(days=1), datetime.min.time())   # exclusive
+    start_dt = datetime.combine(past_start, datetime.min.time(), tzinfo=timezone.utc)
+    end_dt = datetime.combine(past_end + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)  # exclusive
 
     client = DatabaseClient()
 
@@ -107,15 +82,14 @@ async def predictive_utilisation_pipeline(icao: str, iata: str, date: str,
         """), {"icao": icao, "iata": iata})).all()
     active_regs = [r.reg for r in rows if r.reg and (r.status is None or r.status not in INACTIVE)]
 
-    if not active_regs:
-        logger.info("[predictive] no active aircraft for icao=%s iata=%s — clearing rows", icao, iata)
-        async with client.session("cirium") as session:
-            await session.execute(DELETE_SQL, {"icao": icao})
-        return
-
-    # step 4 — collect (first pass)
+    # step 4 — collect (always; the fn clears this airline's rows and inserts active aircraft's
+    # flights in the window. No active aircraft -> just cleared.)
     async with client.session("cirium") as session:
         await _collect(session, icao, iata, start_dt, end_dt)
+
+    if not active_regs:
+        logger.info("[predictive] no active aircraft for icao=%s iata=%s — cleared rows", icao, iata)
+        return
 
     # deep_research=False -> stop here: just expose whatever flightsummary data we already have,
     # no FlightRadar backfill (steps 5–6).
