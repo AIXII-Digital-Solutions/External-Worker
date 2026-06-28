@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import String, DateTime, Integer, UniqueConstraint
+from sqlalchemy import String, DateTime, Integer, UniqueConstraint, Index
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .config import AviationEdgeBase as Base
@@ -17,6 +17,11 @@ class HistoricalSchedule(Base):
             "flight_number",
             name="uq_historical_schedule_unique_flight"
         ),
+        # canonical schedule lookups: departures/arrivals from an airport on a date,
+        # and a specific flight on a date
+        Index("ix_histsched_dep_iata_time", "departure_iata_code", "departure_scheduled_time"),
+        Index("ix_histsched_arr_iata_time", "arrival_iata_code", "arrival_scheduled_time"),
+        Index("ix_histsched_flight_iata_time", "flight_iata_number", "departure_scheduled_time"),
     )
     # Main
     type: Mapped[Optional[str]] = mapped_column(String, nullable=True)

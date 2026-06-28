@@ -1,36 +1,37 @@
-import asyncio
-
-from sqlalchemy import select, inspect, or_, case, literal, text, func
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
-from Database.Models import Airlines, CiriumAircrafts, ASGAircrafts, Registrations
-from Database import DatabaseClient, AircraftRevision
+from Database.Models import Asg, Registrations
+from Database import DatabaseClient
 from Config import setup_logger
 from Utils import performance_timer
 
 logger = setup_logger("registration_updater")
 
-EXCLUDED_COLUMNS = {
-    "id",
-    "revision_id",
-    "created_at",
-    "updated_at",
-}
-
-EXCLUDED_STATUSES = ["Cancelled", "On order", "Retired", "Written off"]
-
+ASG_VIEW = "cirium.asg"
+DELTA_VIEW = "cirium.delta"
 
 
 async def regs_updater(client: DatabaseClient):
+    """Sync the cirium.asg materialized view into main.registrations (upsert by msn)."""
     async with client.session("cirium") as cirium_session:
-        stmt = (
-            select(ASGAircrafts.Registration, ASGAircrafts.Serial_Number, ASGAircrafts.Manufacturer, ASGAircrafts.Aircraft_Sub_Series)
-        )
-        results = await cirium_session.execute(stmt)
+        rows = (
+            await cirium_session.execute(
+                select(
+                    Asg.Registration,
+                    Asg.Serial_Number,
+                    Asg.Manufacturer,
+                    Asg.Aircraft_Sub_Series,
+                )
+                # asg now also holds older inactive rows (is_active=False); registrations only
+                # track the currently active aircraft.
+                .where(Asg.is_active.is_(True))
+            )
+        ).all()
 
     async with client.session("main") as main_session:
-        for row in results:
-            ac_type = row.Manufacturer + " " + row.Aircraft_Sub_Series
+        for row in rows:
+            ac_type = f"{row.Manufacturer or ''} {row.Aircraft_Sub_Series or ''}".strip()
 
             insert_stmt = insert(Registrations).values(
                 reg=row.Registration,
@@ -48,108 +49,35 @@ async def regs_updater(client: DatabaseClient):
                     "aircraft_type": insert_stmt.excluded.aircraft_type,
                     "indashboard": insert_stmt.excluded.indashboard,
                     "status": insert_stmt.excluded.status,
-                }
+                },
             )
 
             await main_session.execute(stmt)
 
 
-
 @performance_timer
 async def asg_regs_updater():
+    """Refresh cirium.asg, then sync it into main.registrations.
+
+    The airline-filtering / dedup / labelling that used to live here (iterating main.Airlines and
+    building ILIKE filters + a CASE label, then TRUNCATE+INSERT) is now the DEFINITION of the
+    cirium.asg materialized view (joined against api.airlines). So this is just a refresh + sync.
+    """
     client = DatabaseClient()
-
-    logger.info("Starting query")
-
-    async with client.session("main") as main_session:
-        stmt = select(Airlines.airline_name)
-
-        result = await main_session.execute(stmt)
-        airlines = result.scalars().all()
-
-    mapper = inspect(CiriumAircrafts)
-
-    columns = [
-        column
-        for column in mapper.columns
-        if column.key not in EXCLUDED_COLUMNS
-    ]
-
-    filters = []
-    airline_cases = []
-
-    for company in airlines:
-        pattern = f"%{company}%"
-
-        condition = or_(
-            CiriumAircrafts.Operator.ilike(pattern),
-            CiriumAircrafts.Sub_Lessor.ilike(pattern),
-            CiriumAircrafts.Owner.ilike(pattern),
-        )
-
-        filters.append(condition)
-
-        airline_cases.append(
-            (condition, literal(company))
-        )
-
-    airline_case_expr = case(
-        *airline_cases,
-        else_=None
-    ).label("Airline")
-
-    async with client.session("cirium") as cirium_session:
-        await cirium_session.execute(
-            text('TRUNCATE TABLE "asgaircraft" RESTART IDENTITY')
-        )
-
-        select_stmt = (
-            select(
-                airline_case_expr,
-                *columns
-            )
-            .where(
-                or_(*filters),
-
-                CiriumAircrafts.Registration.isnot(None),
-
-                ~CiriumAircrafts.Status.in_(
-                    EXCLUDED_STATUSES
-                )
-            )
-            .distinct(
-                CiriumAircrafts.Registration,
-                CiriumAircrafts.Serial_Number
-            )
-            .order_by(
-                CiriumAircrafts.Registration,
-                CiriumAircrafts.Serial_Number
-            )
-        )
-
-        insert_stmt = (
-            insert(ASGAircrafts)
-            .from_select(
-                ["Airline"] + [col.name for col in columns],
-                select_stmt
-            )
-            .on_conflict_do_nothing(
-                index_elements=[
-                    "Registration",
-                    "Serial Number"
-                ]
-            )
-        )
-
-        await cirium_session.execute(insert_stmt)
-
-        await cirium_session.commit()
-
+    logger.info("Refreshing %s", ASG_VIEW)
+    await client.refresh_materialized_view("cirium", ASG_VIEW)
     await regs_updater(client=client)
-
-    logger.info("Query completed")
-
+    logger.info("ASG refresh + registrations sync complete")
 
 
-if __name__ == "__main__":
-    asyncio.run(asg_regs_updater())
+@performance_timer
+async def refresh_cirium_delta():
+    """Refresh the cirium.delta materialized view.
+
+    Replaces the old fill_cirium_delta TRUNCATE + 2x INSERT rebuild — the latest-revision /
+    changed-rows logic is now the view definition, so rebuilding it is a single REFRESH.
+    """
+    client = DatabaseClient()
+    logger.info("Refreshing %s", DELTA_VIEW)
+    await client.refresh_materialized_view("cirium", DELTA_VIEW)
+    logger.info("%s refreshed", DELTA_VIEW)
