@@ -45,7 +45,17 @@ SCHEDULE_DEFAULTS = [
         "func_name": "cron_asg_regs",
         "interval_seconds": None,
         "cron_expr": "0 9 * * 1",           # Mondays 09:00
-        "description": "Sync ASG registrations (Cirium -> main).",
+        "description": "Refresh cirium.asg + sync ASG registrations (Cirium -> main).",
+    },
+    {
+        "name": "cron_refresh_delta",
+        "queue": EXTERNAL_QUEUE,
+        "func_name": "cron_refresh_delta",
+        "interval_seconds": None,
+        "cron_expr": "30 9 * * 1",          # Mondays 09:30 — AFTER cron_asg_regs (09:00) so the
+                                            # two heavy ciriumaircrafts scans don't run together.
+                                            # Set to "0 9 * * 1" to refresh in parallel instead.
+        "description": "Refresh cirium.delta materialized view (after the ASG refresh).",
     },
 ]
 

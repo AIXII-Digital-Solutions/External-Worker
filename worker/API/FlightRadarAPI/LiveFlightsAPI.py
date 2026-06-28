@@ -6,6 +6,7 @@ from typing import List, Optional, Set
 import aiohttp
 from redis.asyncio import Redis
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from Config import DBSettings
 from settings import FLIGHT_RADAR_HEADERS, \
@@ -173,38 +174,44 @@ async def live_flights_adaptive(storage_mode: str = "db"):
                 )
 
                 if storage_mode in ("db", "both"):
-                    records = [
-                        LivePositions(
-                            fr24_id=f.get("fr24_id"),
-                            flight=f.get("flight"),
-                            callsign=f.get("callsign"),
-                            lat=f.get("lat"),
-                            lon=f.get("lon"),
-                            track=f.get("track"),
-                            alt=f.get("alt"),
-                            gspeed=f.get("gspeed"),
-                            vspeed=f.get("vspeed"),
-                            squawk=f.get("squawk"),
-                            timestamp=ensure_naive_utc(parse_dt(f.get("timestamp"))),
-                            source=f.get("source"),
-                            hex=f.get("hex"),
-                            type=f.get("type"),
-                            reg=f.get("reg"),
-                            painted_as=f.get("painted_as"),
-                            operating_as=f.get("operating_as"),
-                            orig_iata=f.get("orig_iata"),
-                            orig_icao=f.get("orig_icao"),
-                            dest_iata=f.get("dest_iata"),
-                            dest_icao=f.get("dest_icao"),
-                            eta=ensure_naive_utc(parse_dt(f.get("eta"))),
-                            actual_distance=await calculate_distance_metric(reg=f.get("reg"), new_flight=f),
-                            time_delta=await get_time_delta(reg=f.get("reg"), flight_number=f.get("flight"))
-                        )
+                    rows = [
+                        {
+                            "fr24_id": f.get("fr24_id"),
+                            "flight": f.get("flight"),
+                            "callsign": f.get("callsign"),
+                            "lat": f.get("lat"),
+                            "lon": f.get("lon"),
+                            "track": f.get("track"),
+                            "alt": f.get("alt"),
+                            "gspeed": f.get("gspeed"),
+                            "vspeed": f.get("vspeed"),
+                            "squawk": f.get("squawk"),
+                            "timestamp": ensure_naive_utc(parse_dt(f.get("timestamp"))),
+                            "source": f.get("source"),
+                            "hex": f.get("hex"),
+                            "type": f.get("type"),
+                            "reg": f.get("reg"),
+                            "painted_as": f.get("painted_as"),
+                            "operating_as": f.get("operating_as"),
+                            "orig_iata": f.get("orig_iata"),
+                            "orig_icao": f.get("orig_icao"),
+                            "dest_iata": f.get("dest_iata"),
+                            "dest_icao": f.get("dest_icao"),
+                            "eta": ensure_naive_utc(parse_dt(f.get("eta"))),
+                            "actual_distance": await calculate_distance_metric(reg=f.get("reg"), new_flight=f),
+                            "time_delta": await get_time_delta(reg=f.get("reg"), flight_number=f.get("flight")),
+                        }
                         for f in flights_data
                     ]
 
                     async with db_client.session("flightradar") as session:
-                        session.add_all(records)
+                        if rows:
+                            # one position per (fr24_id, timestamp); re-polled snapshots are skipped
+                            await session.execute(
+                                pg_insert(LivePositions)
+                                .values(rows)
+                                .on_conflict_do_nothing(constraint="uq_livepositions_fr24_timestamp")
+                            )
                         await session.commit()
 
     for reg in regs_to_check:

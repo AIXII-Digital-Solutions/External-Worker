@@ -72,7 +72,11 @@ class DBSettings(BaseSettings):
     DB_PASSWORD: str = Field(default="")
     DB_HOST: str = Field(default="localhost")
     DB_PORT: int = Field(default=5432)
-    DB_NAME: str = Field(default="")
+    # Two physical databases after the AIXII consolidation:
+    #   DB_AIXII_NAME   — all aviation domains (cirium/airlabs/flightradar/aviationedge/… as schemas)
+    #   DB_SERVICE_NAME — job_statuses / schedule_registry / api_tokens
+    DB_AIXII_NAME: str = Field(default="aixii")
+    DB_SERVICE_NAME: str = Field(default="service")
 
     REDIS_USER: str = Field(default="")
     REDIS_USER_PASSWORD: str = Field(default="")
@@ -83,23 +87,19 @@ class DBSettings(BaseSettings):
         env_file=PATH, extra='ignore'
     )
 
-    @property
-    def db_list(self) -> list[str]:
-        """Splits a string into a DB list"""
-        return [db.strip() for db in self.DB_NAME.split(",") if db.strip()]
+    def physical_db(self, db_name: str) -> str:
+        """Map a LOGICAL db name to its PHYSICAL database. Every aviation domain
+        (main/cirium/airlabs/flightradar/aviationedge/…) lives in `aixii`; only `service`
+        is its own database. Table routing inside `aixii` is by schema (see Database/config.py)."""
+        return "service" if str(db_name).strip().lower() == "service" else "aixii"
 
     def get_db_url(self, db_name: str) -> str:
-        """Returns DSN for the best matching database (substring match)."""
+        """DSN for the PHYSICAL database behind a logical name."""
         if self.DB_USER == "" or self.DB_PASSWORD == "":
             raise ValueError("Database credentials not provided")
-
-        matches = [db for db in self.db_list if db_name.lower() in db.lower()]
-        if not matches:
-            raise ValueError(f"No database similar to '{db_name}' found in {self.db_list}")
-        if len(matches) > 1:
-            raise ValueError(f"Ambiguous name '{db_name}', matches: {matches}")
+        real = self.DB_SERVICE_NAME if self.physical_db(db_name) == "service" else self.DB_AIXII_NAME
         return (f"postgresql+asyncpg://{self.DB_USER}:{quote_plus(self.DB_PASSWORD)}@"
-                f"{self.DB_HOST}:{self.DB_PORT}/{matches[0]}")
+                f"{self.DB_HOST}:{self.DB_PORT}/{real}")
 
     def get_reddis_credentials(self):
         return self.REDIS_USER, self.REDIS_USER_PASSWORD, self.REDIS_HOST, self.REDIS_PORT

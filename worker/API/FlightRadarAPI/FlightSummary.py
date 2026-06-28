@@ -6,6 +6,7 @@ from uuid import UUID
 
 import aiohttp
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from Config import setup_logger
 from settings import FLIGHT_RADAR_HEADERS, FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS, \
@@ -138,7 +139,7 @@ async def fetch_date_range(
 
                         if row_data["flight_ended"] is True:
                             if storage_mode in ("db", "both"):
-                                new_flights.append(FlightSummary(**row_data))
+                                new_flights.append(row_data)
                             if storage_mode in ("csv", "both"):
                                 csv_rows.append(row_data)
 
@@ -146,7 +147,12 @@ async def fetch_date_range(
                         logger.warning(f"[Flight Summary] Record processing error: {e}")
 
                 if new_flights and storage_mode in ("db", "both"):
-                    session.add_all(new_flights)
+                    # natural-key UNIQUE (uq_flightsummary_natural) makes re-ingests idempotent
+                    await session.execute(
+                        pg_insert(FlightSummary)
+                        .values(new_flights)
+                        .on_conflict_do_nothing(constraint="uq_flightsummary_natural")
+                    )
                     await session.commit()
                     logger.debug(f"[Flight Summary] Saved {len(new_flights)} new records to DB.")
 
