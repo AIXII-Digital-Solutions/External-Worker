@@ -2,8 +2,7 @@ import inspect
 import sys
 from datetime import datetime
 
-import inflect
-from sqlalchemy import func, BigInteger
+from sqlalchemy import func, BigInteger, MetaData
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, declared_attr, Mapped, mapped_column
 
@@ -18,36 +17,53 @@ class BaseMixin:
 
     @declared_attr.directive
     def __tablename__(cls) -> str:
-        return inflect.engine().plural(cls.__name__.lower())
+        # Table name = the class name as-is (lowercased), NO pluralization:
+        # `Airlines` -> `airlines`, `CiriumAircrafts` -> `ciriumaircrafts`. Models that need a
+        # different physical name still override with an explicit `__tablename__`.
+        return cls.__name__.lower()
 
 
-# Base class for others models in Main DB
+# AIXII consolidation: the aviation domains now live as SCHEMAS inside ONE physical database
+# (`aixii`); each Base carries a schema-scoped MetaData so its tables emit `<schema>.<table>`.
+# `service` is a SEPARATE physical database (schema-less / public). `main` (core) is being
+# rewritten — kept schema-less and intentionally NOT migrated yet (see migration/env.py).
+
+
+# Base class for Main/core models (core rewrite pending — no schema, not migrated yet)
 class MainBase(AsyncAttrs, BaseMixin, DeclarativeBase):
     pass
 
 
-# Base class for others models in Service DB
+# Base class for Service-DB models (separate `service` database, public schema)
 class ServiceBase(AsyncAttrs, BaseMixin, DeclarativeBase):
     pass
 
 
-# Base class for others models in Cirium DB
+# Base class for Cirium models -> schema `cirium` in the aixii database
 class CiriumBase(AsyncAttrs, BaseMixin, DeclarativeBase):
-    pass
+    metadata = MetaData(schema="cirium")
 
 
-# Base class for others models in Airlabs DB
+# Base class for Airlabs models -> schema `airlabs`
 class AirlabsBase(AsyncAttrs, BaseMixin, DeclarativeBase):
-    pass
+    metadata = MetaData(schema="airlabs")
 
 
-# Base class for others models in FlightRadar DB
+# Base class for FlightRadar models -> schema `flightradar`
 class FlightRadarBase(AsyncAttrs, BaseMixin, DeclarativeBase):
-    pass
+    metadata = MetaData(schema="flightradar")
 
 
+# Base class for Aviation Edge models -> schema `aviationedge`
 class AviationEdgeBase(AsyncAttrs, BaseMixin, DeclarativeBase):
-    pass
+    metadata = MetaData(schema="aviationedge")
+
+
+# Base for cirium MATERIALIZED VIEWS (read-only): cirium.asg / cirium.delta. No BaseMixin (a view
+# has no id/created_at/updated_at); each model declares its own logical primary key. Owned by
+# core-api's Alembic — this worker only reads/refreshes them.
+class CiriumViewBase(AsyncAttrs, DeclarativeBase):
+    metadata = MetaData(schema="cirium")
 
 
 # NOTE: the portal database is owned by the separate portal service (its own schema +

@@ -15,7 +15,7 @@ from status import publish_status
 from API.FlightRadarAPI.FlightSummary import fetch_all_ranges
 from API.FlightRadarAPI.AirportsAPI import load_airports as _load_airports
 from API.FlightRadarAPI.LiveFlightsAPI import live_flights_adaptive
-from API.Utils import create_or_update_subscription, asg_regs_updater
+from API.Utils import create_or_update_subscription, asg_regs_updater, refresh_cirium_delta
 
 logger = setup_logger("external_worker_tasks")
 
@@ -90,6 +90,11 @@ async def cron_asg_regs(ctx, **_):
     await asg_regs_updater()
 
 
+@status_task
+async def cron_refresh_delta(ctx, **_):
+    await refresh_cirium_delta()
+
+
 # On-demand tasks (enqueued by the API Server).
 ON_DEMAND = [
     fetch_flight_summary,
@@ -102,4 +107,5 @@ ON_DEMAND = [
 SCHEDULED = [
     cron_live_flights,
     cron_asg_regs,
+    cron_refresh_delta,
 ]
