@@ -10,6 +10,12 @@ class AircraftRevision(Base):
     revision_number: Mapped[int] = mapped_column(Integer, nullable=False, index=True, unique=True)
     data_rows_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # Historical back-fill metadata (manual one-off load of 2022-2025 monthly snapshots).
+    # Live revisions written by file-processor keep is_historical=false / period=null / plan_type=null.
+    is_historical: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false", default=False)
+    period: Mapped[str] = mapped_column(String, nullable=True, default=None)  # e.g. "05-2025"
+    plan_type: Mapped[str] = mapped_column(String, nullable=True, default=None)  # "Commercial" | "Business&Helicopters"
+
     aircrafts: Mapped[list["CiriumAircrafts"]] = relationship(
         back_populates="revision",
         cascade="all, delete-orphan"
@@ -43,6 +49,7 @@ class CiriumAircrafts(Base):
     Operator: Mapped[str] = mapped_column(String, nullable=True, name="Operator")
     Manager: Mapped[str] = mapped_column(String, nullable=True, name="Manager")
     Owner: Mapped[str] = mapped_column(String, nullable=True, name="Owner")
+    Ownership_Type: Mapped[str] = mapped_column(String, nullable=True, name="Ownership Type")
 
     # Engines
     Engine_Type: Mapped[str] = mapped_column(String, nullable=True, name="Engine Type")
@@ -428,13 +435,13 @@ class CiriumAircrafts(Base):
 # migration) and refreshed via DatabaseClient.refresh_materialized_view(...). They live on
 # CiriumViewBase (no BaseMixin). Only a useful subset of the view columns is mapped.
 # ---------------------------------------------------------------------------
-class Asg(CiriumViewBase):
-    """cirium.asg — latest-revision aircraft for tracked airlines (read by regs_updater)."""
-    __tablename__ = "asg"
-
-    # source_id = ciriumaircrafts.id (unique key, supports REFRESH ... CONCURRENTLY).
-    # is_active: True for current active aircraft of the latest revision; False for older-revision
-    # rows of the same aircraft whose Status was inactive-like.
+# cirium.asg / cirium.delta were split per plan_type: asg_commercial / asg_business_helicopters /
+# asg_full and delta_commercial / delta_business_helicopters / delta_full (a *_full = UNION of the
+# two plan variants). "Current" = the latest revision of that plan_type; "old" = older revisions of
+# the same plan_type. Shared columns live on the mixins below (add more as querying needs grow).
+class _AsgView:
+    """asg_* columns. Logical PK = source_id (= ciriumaircrafts.id, supports REFRESH CONCURRENTLY).
+    is_active: True for current active aircraft; False for older inactive rows of the same aircraft."""
     source_id: Mapped[int] = mapped_column(BigInteger, name="source_id", primary_key=True)
     Airline: Mapped[str] = mapped_column(String, nullable=True, name="Airline")
     is_active: Mapped[bool] = mapped_column(Boolean, name="is_active")
@@ -448,13 +455,99 @@ class Asg(CiriumViewBase):
     Owner: Mapped[str] = mapped_column(String, nullable=True, name="Owner")
 
 
-class Delta(CiriumViewBase):
-    """cirium.delta — latest revision + changed older rows. Refreshed by cron_refresh_delta."""
-    __tablename__ = "delta"
+class AsgCommercial(_AsgView, CiriumViewBase):
+    """cirium.asg_commercial — asg over the latest Commercial revision (+ older Commercial history)."""
+    __tablename__ = "asg_commercial"
 
+
+class AsgBusinessHelicopters(_AsgView, CiriumViewBase):
+    """cirium.asg_business_helicopters — asg over the latest Business&Helicopters revision (+ history)."""
+    __tablename__ = "asg_business_helicopters"
+
+
+class AsgFull(_AsgView, CiriumViewBase):
+    """cirium.asg_full — UNION of asg_commercial + asg_business_helicopters."""
+    __tablename__ = "asg_full"
+
+
+class _DeltaView:
+    """delta_* columns. is_latest: TRUE for the current revision's rows, FALSE for older rows that
+    changed vs current for the same aircraft. Logical PK = source_id."""
     source_id: Mapped[int] = mapped_column(BigInteger, name="source_id", primary_key=True)
     is_latest: Mapped[bool] = mapped_column(Boolean, name="is_latest")
     revision_id: Mapped[int] = mapped_column(BigInteger, nullable=True, name="revision_id")
     Registration: Mapped[str] = mapped_column(String, nullable=True, name="Registration")
     Serial_Number: Mapped[str] = mapped_column(String, nullable=True, name="Serial Number")
     Status: Mapped[str] = mapped_column(String, nullable=True, name="Status")
+
+
+class DeltaCommercial(_DeltaView, CiriumViewBase):
+    """cirium.delta_commercial — delta over Commercial revisions (latest = current)."""
+    __tablename__ = "delta_commercial"
+
+
+class DeltaBusinessHelicopters(_DeltaView, CiriumViewBase):
+    """cirium.delta_business_helicopters — delta over Business&Helicopters revisions."""
+    __tablename__ = "delta_business_helicopters"
+
+
+class DeltaFull(_DeltaView, CiriumViewBase):
+    """cirium.delta_full — UNION of delta_commercial + delta_business_helicopters."""
+    __tablename__ = "delta_full"
+
+
+class _CiriumRowView:
+    """Aircraft-data views (all_/historical_ matviews, latest_ live views): a useful subset of
+    ciriumaircrafts + the revision's revision_number/period/is_historical. PK = id (= ciriumaircrafts.id).
+    Add columns as querying needs grow."""
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    revision_id: Mapped[int] = mapped_column(BigInteger, nullable=True)
+    plan_type: Mapped[str] = mapped_column(String, nullable=True, name="plan_type")
+    Type: Mapped[str] = mapped_column(String, nullable=True, name="Type")
+    Serial_Number: Mapped[str] = mapped_column(String, nullable=True, name="Serial Number")
+    Registration: Mapped[str] = mapped_column(String, nullable=True, name="Registration")
+    Status: Mapped[str] = mapped_column(String, nullable=True, name="Status")
+    Manufacturer: Mapped[str] = mapped_column(String, nullable=True, name="Manufacturer")
+    Master_Series: Mapped[str] = mapped_column(String, nullable=True, name="Master Series")
+    Operator: Mapped[str] = mapped_column(String, nullable=True, name="Operator")
+    Owner: Mapped[str] = mapped_column(String, nullable=True, name="Owner")
+    Manager: Mapped[str] = mapped_column(String, nullable=True, name="Manager")
+    Number_of_Seats: Mapped[int] = mapped_column(Integer, nullable=True, name="Number of Seats")
+    revision_number: Mapped[int] = mapped_column(Integer, nullable=True)
+    period: Mapped[str] = mapped_column(String, nullable=True)
+    is_historical: Mapped[bool] = mapped_column(Boolean, nullable=True)
+
+
+class AllCommercial(_CiriumRowView, CiriumViewBase):
+    """cirium.all_commercial matview — every ciriumaircrafts row of Commercial revisions."""
+    __tablename__ = "all_commercial"
+
+
+class AllBusinessHelicopters(_CiriumRowView, CiriumViewBase):
+    """cirium.all_business_helicopters matview — every row of Business&Helicopters revisions."""
+    __tablename__ = "all_business_helicopters"
+
+
+class HistoricalCommercial(_CiriumRowView, CiriumViewBase):
+    """cirium.historical_commercial matview — Commercial rows where the revision is_historical."""
+    __tablename__ = "historical_commercial"
+
+
+class HistoricalBusinessHelicopters(_CiriumRowView, CiriumViewBase):
+    """cirium.historical_business_helicopters matview — historical Business&Helicopters rows."""
+    __tablename__ = "historical_business_helicopters"
+
+
+class LatestCommercial(_CiriumRowView, CiriumViewBase):
+    """cirium.latest_commercial view — rows of the newest Commercial revision."""
+    __tablename__ = "latest_commercial"
+
+
+class LatestBusinessHelicopters(_CiriumRowView, CiriumViewBase):
+    """cirium.latest_business_helicopters view — rows of the newest Business&Helicopters revision."""
+    __tablename__ = "latest_business_helicopters"
+
+
+class LatestRevision(_CiriumRowView, CiriumViewBase):
+    """cirium.latest_revision view — rows of the newest revision of EACH plan_type."""
+    __tablename__ = "latest_revision"
