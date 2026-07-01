@@ -65,6 +65,24 @@ SCHEDULE_DEFAULTS = [
         "cron_expr": None,
         "description": "Truncate api.predictive_utilisation after 3h idle (reset ids).",
     },
+    {
+        "name": "cron_collapse_revisions",
+        "queue": EXTERNAL_QUEUE,
+        "func_name": "cron_collapse_revisions",
+        "interval_seconds": None,
+        "cron_expr": "0 6 * * *",           # daily 06:00 — collapse any completed-month live
+                                            # revisions per plan_type (no-op until a month rolls over)
+        "description": "Collapse completed-month live Cirium revisions per plan_type "
+                       "(cirium.collapse_completed_months) + refresh all_* matviews.",
+    },
+    {
+        "name": "cron_refresh_plantype_matviews",
+        "queue": EXTERNAL_QUEUE,
+        "func_name": "cron_refresh_plantype_matviews",
+        "interval_seconds": None,
+        "cron_expr": "0 10 * * 1",          # Mondays 10:00 — after asg (09:00) / delta (09:30)
+        "description": "Weekly refresh of cirium.all_* + historical_* aircraft-data matviews.",
+    },
 ]
 
 
