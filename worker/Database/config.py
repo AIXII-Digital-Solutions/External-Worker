@@ -78,6 +78,13 @@ class CiriumViewBase(AsyncAttrs, DeclarativeBase):
     metadata = MetaData(schema="cirium")
 
 
+# Base for flightradar VIEWS (read-only): flightradar.current_positions. Like CiriumViewBase its
+# MetaData is deliberately NOT in the Alembic aixii target (migration/env.py), so autogenerate never
+# manages the view as a table.
+class FlightRadarViewBase(AsyncAttrs, DeclarativeBase):
+    metadata = MetaData(schema="flightradar")
+
+
 # NOTE: the portal database is owned by the separate portal service (its own schema +
 # alembic); it is intentionally NOT part of this db-contract.
 
