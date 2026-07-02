@@ -179,16 +179,73 @@ class AirportRunways(Base):
 
 
 # ---------------------------------------------------------------------------
-# View (read-only). flightradar.current_positions = the latest livepositions row per aircraft
-# (reg), created by a hand-written op.execute migration and NOT managed by Alembic (lives on
-# FlightRadarViewBase, whose MetaData is out of the aixii target). "Current flight" for aircraft in
-# the air; the last known row for ones long out of coverage. is_grounded = the aircraft is NOT
-# currently airborne (stale telemetry OR low ground speed).
+# Views (read-only), both on FlightRadarViewBase (MetaData out of the aixii Alembic target, so
+# autogenerate ignores them). Created by hand-written op.execute migrations
+# (e2f3a4b5c6d7 + c6d7e8f9a0b1).
+#
+# is_grounded (both views):
+#   (alt < 500 AND gspeed < 50)                            -- physically on the ground
+#   OR (no telemetry for > 2 hours)                        -- stale in any state -> assume landed
+#   OR (no telemetry for > 30 min AND alt < 10000 AND vspeed < -256)  -- went silent on a terminal
+#                                                              descent = landed (don't wait the 2h)
+# Thresholds derived from the livepositions distribution (tight parked cluster at alt<500/gs<50 vs
+# the cruise cluster; ~35% of flights last seen descending <10k then go silent on landing; ~20-min
+# poll cadence, so the 30-min grace won't ground an actively-tracked approach). See migration
+# c6d7e8f9a0b1.
+#
+# * current_positions      — ONE row per aircraft (reg): the latest livepositions row = its current
+#                            position (flying) or last known one (landed / out of coverage).
+# * current_positions_flow — the FULL chronology of each aircraft's current/last flight (one row per
+#                            telemetry point of that fr24_id, time-ordered), each with per-point
+#                            is_grounded, so a tail's track reads ground -> air -> ground.
 # ---------------------------------------------------------------------------
 class CurrentPositions(FlightRadarViewBase):
     __tablename__ = "current_positions"
 
     # every livepositions column + is_grounded. Logical PK = id (= livepositions.id, unique per row).
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    is_grounded: Mapped[bool] = mapped_column(Boolean, nullable=True)
+
+    fr24_id: Mapped[str] = mapped_column(String, nullable=True)
+    flight: Mapped[str] = mapped_column(String, nullable=True)
+    hex: Mapped[str] = mapped_column(String, nullable=True)
+    callsign: Mapped[str] = mapped_column(String, nullable=True)
+
+    lat: Mapped[float] = mapped_column(Float, nullable=True)
+    lon: Mapped[float] = mapped_column(Float, nullable=True)
+    alt: Mapped[float] = mapped_column(Float, nullable=True)
+    gspeed: Mapped[float] = mapped_column(Float, nullable=True)
+    vspeed: Mapped[float] = mapped_column(Float, nullable=True)
+    track: Mapped[int] = mapped_column(Integer, nullable=True)
+    squawk: Mapped[str] = mapped_column(String, nullable=True)
+
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    source: Mapped[str] = mapped_column(String, nullable=True)
+
+    orig_icao: Mapped[str] = mapped_column(String, nullable=True)
+    orig_iata: Mapped[str] = mapped_column(String, nullable=True)
+    dest_icao: Mapped[str] = mapped_column(String, nullable=True)
+    dest_iata: Mapped[str] = mapped_column(String, nullable=True)
+
+    type: Mapped[str] = mapped_column(String, nullable=True)
+    reg: Mapped[str] = mapped_column(String, nullable=True)
+    operating_as: Mapped[str] = mapped_column(String, nullable=True)
+    painted_as: Mapped[str] = mapped_column(String, nullable=True)
+
+    eta: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    actual_distance: Mapped[float] = mapped_column(Float, nullable=True)
+    time_delta: Mapped[timedelta] = mapped_column(Interval, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+
+
+class CurrentPositionsFlow(FlightRadarViewBase):
+    """Full chronology of each aircraft's current (flying) / last (landed) flight — one row per
+    telemetry point of that fr24_id, ordered by time, each with per-point is_grounded. Same columns
+    as CurrentPositions; here id is still unique per row (every livepositions point appears once)."""
+    __tablename__ = "current_positions_flow"
+
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     is_grounded: Mapped[bool] = mapped_column(Boolean, nullable=True)
 
