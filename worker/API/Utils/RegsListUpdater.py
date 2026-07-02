@@ -86,3 +86,16 @@ async def collapse_completed_revisions():
         await client.refresh_materialized_view("cirium", ALL_BUSINESS_VIEW)
         logger.info("refreshed %s + %s after collapse", ALL_COMMERCIAL_VIEW, ALL_BUSINESS_VIEW)
     return collapsed
+
+
+@performance_timer
+async def ensure_livepositions_partitions():
+    """Pre-create the current + next-2 monthly partitions of flightradar.livepositions so incoming
+    positions always land in a real monthly partition (the DEFAULT is only a safety net). Idempotent
+    (IF NOT EXISTS) — a no-op on most runs. Logic is the flightradar.ensure_livepositions_partitions()
+    DB function (owned by core-api's Alembic)."""
+    client = DatabaseClient()
+    async with client.session("cirium") as session:
+        made = (await session.execute(text("SELECT flightradar.ensure_livepositions_partitions()"))).scalar() or 0
+    logger.info("ensure_livepositions_partitions created %d partition(s)", made)
+    return made
