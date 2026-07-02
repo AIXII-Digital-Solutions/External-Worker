@@ -78,6 +78,12 @@ class LivePositions(Base):
         Index("ix_livepositions_eta_brin", "eta", postgresql_using="brin"),
     )
 
+    # Composite PK (id, timestamp) after partitioning: SQLAlchemy defaults EVERY column of a
+    # composite PK to autoincrement=False, so id must be flagged explicitly. This reflects the DB
+    # reality (id keeps its bigserial sequence default, copied via INCLUDING DEFAULTS in the
+    # partition migration) and silences the "PK column may not store NULL" SAWarning on insert.
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
     fr24_id: Mapped[str] = mapped_column(String, nullable=True)
     flight: Mapped[str] = mapped_column(String, nullable=True)
     hex: Mapped[str] = mapped_column(String, nullable=True)
