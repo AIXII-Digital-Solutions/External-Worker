@@ -83,6 +83,16 @@ SCHEDULE_DEFAULTS = [
         "cron_expr": "0 10 * * 1",          # Mondays 10:00 — after asg (09:00) / delta (09:30)
         "description": "Weekly refresh of cirium.all_* + historical_* aircraft-data matviews.",
     },
+    {
+        "name": "cron_ensure_livepositions_partition",
+        "queue": EXTERNAL_QUEUE,
+        "func_name": "cron_ensure_livepositions_partition",
+        "interval_seconds": None,
+        "cron_expr": "0 3 * * *",           # daily 03:00 — pre-create next monthly livepositions
+                                            # partitions (idempotent; a no-op on most days)
+        "description": "Pre-create current+next monthly flightradar.livepositions partitions "
+                       "(flightradar.ensure_livepositions_partitions).",
+    },
 ]
 
 
