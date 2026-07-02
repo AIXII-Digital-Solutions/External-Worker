@@ -77,6 +77,15 @@ FLIGHT_RADAR_REDIS_POLLING_KEY: str = "flights:polling"
 FLIGHT_RADAR_REDIS_META_KEY: str = "flights:meta"
 FLIGHT_RADAR_BOOTSTRAP_KEY: str = "fr:bootstrap_done"
 
+# Adaptive re-check intervals are DERIVED from this job's scheduler cadence at runtime
+# (live_flights_adaptive._resolve_intervals reads schedule_registry.interval_seconds for
+# FLIGHT_RADAR_SCHEDULE_NAME): miss = the scheduler interval (re-poll a missed reg next tick),
+# found = miss * FLIGHT_RADAR_FOUND_INTERVAL_MULTIPLIER (re-poll an active reg every Nth tick).
+# So changing the interval via the /scheduler API instantly retunes the rotation — no redeploy.
+FLIGHT_RADAR_SCHEDULE_NAME: str = require_env("FLIGHT_RADAR_SCHEDULE_NAME", "cron_live_flights")
+FLIGHT_RADAR_FOUND_INTERVAL_MULTIPLIER: int = require_env("FLIGHT_RADAR_FOUND_INTERVAL_MULTIPLIER", 2)
+
+# Fallbacks, used ONLY when the schedule has no interval_seconds (it's cron-driven) or isn't seeded.
 FLIGHT_RADAR_CHECK_INTERVAL_MISS: int = require_env("FLIGHT_RADAR_CHECK_INTERVAL_MISS", 8 * 60)
 FLIGHT_RADAR_CHECK_INTERVAL_FOUND: int = require_env("FLIGHT_RADAR_CHECK_INTERVAL_FOUND", 18 * 60)
 FLIGHT_RADAR_FORCE_RECHECK_MISS: int = require_env("FLIGHT_RADAR_FORCE_RECHECK_MISS", 8 * 60)
