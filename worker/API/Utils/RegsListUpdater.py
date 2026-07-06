@@ -7,6 +7,7 @@ from Utils import performance_timer
 logger = setup_logger("registration_updater")
 
 AIRLINES_VIEW = "cirium.airlines"
+REGISTRATIONS_VIEW = "cirium.registrations"   # latest Operator+Status per unique Registration
 # asg / delta are now per-plan_type variants; *_full = UNION of the two, so refresh the two plan
 # variants FIRST, then the _full view that reads them (order matters for CONCURRENTLY).
 ASG_VIEWS = ["cirium.asg_commercial", "cirium.asg_business_helicopters", "cirium.asg_full"]
@@ -36,8 +37,9 @@ async def asg_regs_updater():
         logger.info("Refreshing %s", v)
         await client.refresh_materialized_view("cirium", v)
     await client.refresh_materialized_view("cirium", AIRLINES_VIEW)
+    await client.refresh_materialized_view("cirium", REGISTRATIONS_VIEW)
     await regs_updater(client=client)
-    logger.info("asg_* + cirium.airlines refresh + api.registration sync complete")
+    logger.info("asg_* + cirium.airlines + cirium.registrations refresh + api.registration sync complete")
 
 
 @performance_timer
