@@ -53,6 +53,7 @@ def _assemble_sql(a5_where: str) -> str:
 INSERT INTO forecast.acys_actuals
     ("Registration","Period","Date","Time Departed","Time Landed",
      "IATA Origin","IATA Destination","IATA Destination Actual",
+     "ICAO Origin","ICAO Destination","ICAO Destination Actual",
      "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
      "Contract Year","Circle Distance","Flight Time",
      "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR")
@@ -76,18 +77,24 @@ WITH array5 AS (
 ),
 array6 AS (
     SELECT f.reg, f.datetime_takeoff, f.datetime_landed,
-           f.orig_iata, f.dest_iata, f.dest_iata_actual, f.circle_distance, f.flight_time,
+           f.orig_iata, f.dest_iata, f.dest_iata_actual,
+           f.orig_icao, f.dest_icao, f.dest_icao_actual,
+           f.circle_distance, f.flight_time,
            coalesce(f.datetime_takeoff, f.first_seen) AS flight_dt
     FROM flightradar.flightsummary f
     WHERE f.reg IN (SELECT registration FROM array5)
       AND coalesce(f.datetime_takeoff, f.first_seen) >= :start_date
       AND coalesce(f.datetime_takeoff, f.first_seen) <  :as_of
+      -- drop a flight with NO origin, or NO destination (neither actual nor planned)
+      AND nullif(f.orig_iata, '') IS NOT NULL
+      AND coalesce(nullif(f.dest_iata_actual, ''), nullif(f.dest_iata, '')) IS NOT NULL
 )
 SELECT
     a5.registration, a5.period,
     CAST(a6.flight_dt AS date),
     a6.datetime_takeoff, a6.datetime_landed,
     a6.orig_iata, a6.dest_iata, a6.dest_iata_actual,
+    a6.orig_icao, a6.dest_icao, a6.dest_icao_actual,
     a5.operator, a5.master_series, a5.manufacturer, a5.sub_series, a5.primary_usage,
     {_CONTRACT_YEAR},
     a6.circle_distance,
@@ -104,44 +111,40 @@ LEFT JOIN array6 a6
 """
 
 
+# Airport lookup CHAIN for one airport: main.airports by IATA -> main.airports by ICAO ->
+# flightradar.airports by IATA. `pri` orders the sources; LIMIT 1 takes the first that matched.
+def _airport_lookup(iata_expr: str, icao_expr: str) -> str:
+    return f"""(
+        SELECT city, country, airport_name, lat, lon FROM (
+            SELECT city, country, name AS airport_name, latitude AS lat, longitude AS lon, 1 AS pri
+              FROM main.airports WHERE iata = {iata_expr}
+            UNION ALL
+            SELECT city, country, name, latitude, longitude, 2
+              FROM main.airports WHERE icao = {icao_expr}
+            UNION ALL
+            SELECT city, country_name, name, lat, lon, 3
+              FROM flightradar.airports WHERE iata = {iata_expr}
+        ) s ORDER BY pri LIMIT 1
+    )"""
+
+
 def _merge_sql(final_scope: str) -> str:
     cols = """"Registration","Period","Date","Time Departed","Time Landed",
            "IATA Origin","IATA Destination","IATA Destination Actual",
+           "ICAO Origin","ICAO Destination","ICAO Destination Actual",
            "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
            "Contract Year","Circle Distance","Flight Time",
            "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR\""""
+    origin = _airport_lookup('p."IATA Origin"', 'p."ICAO Origin"')
+    dest = _airport_lookup('coalesce(p."IATA Destination Actual", p."IATA Destination")',
+                           'coalesce(p."ICAO Destination Actual", p."ICAO Destination")')
     return f"""
 INSERT INTO forecast.acys_summary
     ({cols},
      "Origin Country","Origin City","Origin Airport Name",
      "Destination Country","Destination City","Destination Airport Name",
      origin_lat, origin_lon, dest_lat, dest_lon)
-WITH va AS (   -- main.virtual_airport_list, one row per IATA (prefer the most complete)
-    SELECT DISTINCT ON ("IATA Code")
-           "IATA Code" AS iata, "Country" AS country, "City" AS city,
-           "Airport Name" AS airport_name, "Latitude" AS lat, "Longitude" AS lon
-    FROM main.virtual_airport_list
-    WHERE "IATA Code" IS NOT NULL AND "IATA Code" <> ''
-    ORDER BY "IATA Code", ("City" IS NULL), ("Airport Name" IS NULL)
-),
-fa AS (        -- flightradar.airports fallback (iata already unique)
-    SELECT iata, country_name AS country, city, name AS airport_name, lat, lon
-    FROM flightradar.airports
-    WHERE iata IS NOT NULL AND iata <> ''
-),
-airports AS (
-    -- PER-FIELD merge: prefer virtual (broad coverage + good names/coords), fill gaps from
-    -- flightradar. Crucial for City: virtual_airport_list."City" is NULL for ~97% of rows, so City
-    -- comes from flightradar whenever it has the airport.
-    SELECT coalesce(va.iata, fa.iata)                 AS iata,
-           coalesce(va.country, fa.country)           AS country,
-           coalesce(va.city, fa.city)                 AS city,
-           coalesce(va.airport_name, fa.airport_name) AS airport_name,
-           coalesce(va.lat, fa.lat)                   AS lat,
-           coalesce(va.lon, fa.lon)                   AS lon
-    FROM va FULL OUTER JOIN fa ON va.iata = fa.iata
-),
-panel AS (
+WITH panel AS (
     SELECT {cols} FROM forecast.acys_actuals
     WHERE "Date" IS NOT NULL AND {final_scope}     -- flights only + THIS request's slice
     UNION ALL
@@ -152,9 +155,8 @@ SELECT p.*,
        d.country, d.city, d.airport_name,
        o.lat, o.lon, d.lat, d.lon
 FROM panel p
-LEFT JOIN airports o ON o.iata = p."IATA Origin"
--- destination: prefer the ACTUAL landing airport, fall back to the planned destination
-LEFT JOIN airports d ON d.iata = coalesce(p."IATA Destination Actual", p."IATA Destination")
+LEFT JOIN LATERAL {origin} o ON true
+LEFT JOIN LATERAL {dest} d ON true
 """
 
 
