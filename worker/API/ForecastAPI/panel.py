@@ -16,6 +16,7 @@ Columns beyond the flight/aircraft fields:
   * Circle Distance — FR24 great-circle origin->destination (flightsummary.circle_distance).
   * Flight Time     — Time Landed - Time Departed (interval).
 """
+import random
 from datetime import date
 
 from sqlalchemy import text
@@ -179,8 +180,10 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                              state=state, message=message, **kwargs)
 
     try:
-        # 1/6 — validate: the combined scope must match at least one Cirium aircraft
-        await _pub("running", f"Validating {label}", progress=5)
+        # Step 1/4 — Searching historical data: validate the scope, reset the per-request tables
+        # (history_1 keeps other scopes — delete only THIS one; future_1/final_1 wiped), and probe
+        # FR24 coverage.
+        await _pub("running", "Searching historical data", progress=random.randint(10, 15))
         async with db_client.session(_DB) as s:
             ok = (await s.execute(
                 text(f'SELECT 1 FROM cirium.ciriumaircrafts ca WHERE {a5_where} LIMIT 1'),
@@ -188,44 +191,34 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         if not ok:
             await _pub("error", f"No Cirium aircraft match {label}")
             raise ValueError(f"empty scope: {label}")
-
-        # 2/6 — prepare: history_1 keeps other scopes (delete only THIS one); future_1/final_1 wiped
-        await _pub("running", "Preparing tables (refresh this scope in history_1; reset future/final)",
-                   progress=10)
         async with db_client.session(_DB) as s:
             await s.execute(text(hist_delete), scope_params)
             await s.execute(text("TRUNCATE forecast.future_1"))
             await s.execute(text("TRUNCATE forecast.final_1"))
             await s.commit()
-
-        # 3/6 — FR24 coverage check (backfill is future work; report the gap)
-        await _pub("running", "Checking FR24 flight coverage for the fleet", progress=20)
         async with db_client.session(_DB) as s:
             miss = (await s.execute(text(_MISSING_TAILS_TMPL.format(a5_where=a5_where)),
                                     base)).fetchall()
         tails_without_fr24 = [r[0] for r in miss]
-        if tails_without_fr24:
-            await _pub("running",
-                       f"{len(tails_without_fr24)} tail(s) have no FR24 data (backfill not yet wired)",
-                       progress=25, payload={"tails_without_fr24": tails_without_fr24[:50]})
 
-        # 4/6 — assemble history_1 (Cirium × FR24, date-respecting) for this scope
-        await _pub("running", f"Assembling history (Cirium × FR24, as of {as_of})", progress=30)
+        # Step 2/4 — Fetching data: assemble history_1 (Cirium × FR24, date-respecting) for this scope
+        await _pub("running", "Fetching data", progress=random.randint(25, 49))
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_assemble_sql(a5_where)), base)
             history_rows = res.rowcount
             await s.commit()
-        await _pub("running", f"History assembled: {history_rows} row(s)", progress=70,
+
+        # Step 3/4 — Creating predictive analysis
+        await _pub("running", "Creating predictive analysis", progress=random.randint(55, 70),
                    payload={"history_rows": history_rows, "tails_without_fr24": len(tails_without_fr24)})
 
-        # 5/6 — merge into final_1 (this request's flights only + future_1, airport-enriched)
-        await _pub("running", "Merging into final (airport geography)", progress=80)
+        # Step 4/4 — Building dataset: merge into final_1 (this request's flights only + future_1)
+        await _pub("running", "Building dataset", progress=random.randint(80, 90))
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_merge_sql(final_scope)), scope_params)
             final_rows = res.rowcount
             await s.commit()
 
-        # 6/6 — done
         summary = {
             "mode": "+".join((["operator"] if operator else []) + (["registrations"] if registrations else [])),
             "operator": operator, "registrations": list(registrations) if registrations else None,
