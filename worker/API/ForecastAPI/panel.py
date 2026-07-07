@@ -25,6 +25,7 @@ Columns beyond the flight/aircraft fields (populated in acys_actuals, carried in
 acys_summary ONLY (applied by the merge, not stored in acys_actuals/acys_forecast):
   * Agreed Value = 0    — when Lease Dry Wet = 'Wet'.
   * Age                 — (Date - Delivery Date) in decimal years ((Date - Delivery Date)/365.25).
+  * Data Type           — 'Actuals' (row from acys_actuals) / 'Forecast' (row from acys_forecast).
 """
 import random
 from datetime import date
@@ -167,17 +168,18 @@ def _merge_sql(final_scope: str) -> str:
                            'coalesce(p."ICAO Destination Actual", p."ICAO Destination")')
     return f"""
 INSERT INTO forecast.acys_summary
-    ({cols},"Age",
+    ({cols},"Age","Data Type",
      "Origin Country","Origin City","Origin Airport Name",
      "Destination Country","Destination City","Destination Airport Name",
      origin_lat, origin_lon, dest_lat, dest_lon)
 WITH panel AS (
-    SELECT {cols} FROM forecast.acys_actuals
+    -- each branch tags its source so acys_summary rows carry Data Type = Actuals / Forecast
+    SELECT {cols}, 'Actuals' AS "Data Type" FROM forecast.acys_actuals
     WHERE "Date" IS NOT NULL AND {final_scope}     -- flights only + THIS request's slice
     UNION ALL
-    SELECT {cols} FROM forecast.acys_forecast
+    SELECT {cols}, 'Forecast' AS "Data Type" FROM forecast.acys_forecast
 )
-SELECT {proj},
+SELECT {proj}, p."Data Type",
        o.country, o.city, o.airport_name,
        d.country, d.city, d.airport_name,
        o.lat, o.lon, d.lat, d.lon
