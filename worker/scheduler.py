@@ -93,6 +93,16 @@ SCHEDULE_DEFAULTS = [
         "description": "Pre-create current+next monthly flightradar.livepositions partitions "
                        "(flightradar.ensure_livepositions_partitions).",
     },
+    {
+        "name": "cron_refresh_airports",
+        "queue": EXTERNAL_QUEUE,
+        "func_name": "cron_refresh_airports",
+        "interval_seconds": None,
+        "cron_expr": "0 4 1 * *",           # monthly, 1st at 04:00 — reload main.airports from
+                                            # OurAirports (open data) + re-apply city overrides
+        "description": "Refresh main.airports from OurAirports (download + load + apply "
+                       "main.airport_city_overrides).",
+    },
 ]
 
 
