@@ -1,26 +1,32 @@
 """Forecast data-prep panel — the production run (external-worker), with per-step status.
 
-Two request modes: by **operator** (all its Cirium tails) or by an explicit **registrations** list.
-Assembles forecast.history_1 (Cirium × FR24, date-respecting) then merges into forecast.final_1
+Request modes: by **operator** and/or an explicit **registrations** list (UNION scope). Assembles
+forecast.acys_actuals (Cirium × FR24, date-respecting) then merges into forecast.acys_summary
 (airport-enriched). Mirrors predictive/panel in Core-API (SQL vendored — worker has no Core-API dep).
 
-Table lifecycle (per the spec):
-  * history_1 — PERSISTS across requests; a request DELETEs only ITS scope (Operator= / Registration in)
-    then re-inserts, so other operators/tails accumulate.
-  * future_1  — TRUNCATEd every request (populated later by the forecast model).
-  * final_1   — TRUNCATEd every request; rebuilt from history_1 (THIS request's flights only) + future_1.
+Tables:
+  * acys_actuals  — PERSISTS across requests; a request DELETEs only ITS scope then re-inserts.
+  * acys_forecast — TRUNCATEd every request (populated later by the forecast model).
+  * acys_summary  — TRUNCATEd every request; rebuilt from acys_actuals (THIS request's flights only)
+                    + acys_forecast, enriched with origin/destination airport geography + lat/lon.
 
-Columns beyond the flight/aircraft fields:
-  * Contract Year   — fiscal window (anchored at the REQUEST date's month/day) containing the flight
-                      Date, labelled by its START year.  e.g. anchor 07-01: 2025-08 -> CY2025.
-  * Circle Distance — FR24 great-circle origin->destination (flightsummary.circle_distance).
-  * Flight Time     — Time Landed - Time Departed (interval).
+Columns beyond the flight/aircraft fields (populated in acys_actuals, carried into acys_summary):
+  * Contract Year       — fiscal window (anchored at the REQUEST date's month/day) of the flight Date.
+  * Circle Distance     — flightsummary.circle_distance.
+  * Flight Time         — Time Landed - Time Departed (interval).
+  * Agreed Value        — Cirium "Indicative Market Value (US$m)".
+  * Total Seats         — Cirium "Number of Seats".
+  * Total PAX           — Total Seats * FORECAST_PAX_LOAD_FACTOR (config, default 0.8).
+  * Actual Distance FR  — flightsummary.circle_distance (same source as Circle Distance).
+  * Flight Time FR      — flightsummary.flight_time (seconds) -> interval.
 """
+import random
 from datetime import date
 
 from sqlalchemy import text
 
 from Config import setup_logger
+from settings import FORECAST_PAX_LOAD_FACTOR
 from status import publish_status
 
 logger = setup_logger("forecast_panel")
@@ -38,24 +44,30 @@ _CONTRACT_YEAR = """CASE WHEN a6.flight_dt IS NULL THEN NULL ELSE
         THEN 1 ELSE 0 END)::text
 END"""
 
+# flightsummary.flight_time is integer seconds (with some bad negatives) -> interval, NULL if < 0/null.
+_FLIGHT_TIME_FR = "CASE WHEN a6.flight_time >= 0 THEN a6.flight_time * interval '1 second' ELSE NULL END"
+
 
 def _assemble_sql(a5_where: str) -> str:
     return f"""
-INSERT INTO forecast.history_1
+INSERT INTO forecast.acys_actuals
     ("Registration","Period","Date","Time Departed","Time Landed",
      "IATA Origin","IATA Destination","IATA Destination Actual",
      "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
-     "Contract Year","Circle Distance","Flight Time")
+     "Contract Year","Circle Distance","Flight Time",
+     "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR")
 WITH array5 AS (
     SELECT DISTINCT ON (ca."Registration", to_date(r.period,'MM-YYYY'))
-           ca."Registration"          AS registration,
-           r.period                    AS period,
-           to_date(r.period,'MM-YYYY') AS period_month,
-           ca."Operator"               AS operator,
-           ca."Master Series"          AS master_series,
-           ca."Manufacturer"           AS manufacturer,
-           ca."Aircraft Sub Series"    AS sub_series,
-           ca."Primary Usage"          AS primary_usage
+           ca."Registration"                    AS registration,
+           r.period                              AS period,
+           to_date(r.period,'MM-YYYY')           AS period_month,
+           ca."Operator"                         AS operator,
+           ca."Master Series"                    AS master_series,
+           ca."Manufacturer"                     AS manufacturer,
+           ca."Aircraft Sub Series"              AS sub_series,
+           ca."Primary Usage"                    AS primary_usage,
+           ca."Indicative Market Value (US$m)"   AS agreed_value,
+           ca."Number of Seats"                  AS total_seats
     FROM cirium.ciriumaircrafts ca
     JOIN cirium.aircraftrevision r ON r.id = ca.revision_id
     WHERE {a5_where}
@@ -64,7 +76,7 @@ WITH array5 AS (
 ),
 array6 AS (
     SELECT f.reg, f.datetime_takeoff, f.datetime_landed,
-           f.orig_iata, f.dest_iata, f.dest_iata_actual, f.circle_distance,
+           f.orig_iata, f.dest_iata, f.dest_iata_actual, f.circle_distance, f.flight_time,
            coalesce(f.datetime_takeoff, f.first_seen) AS flight_dt
     FROM flightradar.flightsummary f
     WHERE f.reg IN (SELECT registration FROM array5)
@@ -79,7 +91,12 @@ SELECT
     a5.operator, a5.master_series, a5.manufacturer, a5.sub_series, a5.primary_usage,
     {_CONTRACT_YEAR},
     a6.circle_distance,
-    (a6.datetime_landed - a6.datetime_takeoff)
+    (a6.datetime_landed - a6.datetime_takeoff),
+    a5.agreed_value,
+    a5.total_seats,
+    a5.total_seats * CAST(:pax_factor AS double precision),
+    a6.circle_distance,
+    {_FLIGHT_TIME_FR}
 FROM array5 a5
 LEFT JOIN array6 a6
        ON a6.reg = a5.registration
@@ -91,28 +108,32 @@ def _merge_sql(final_scope: str) -> str:
     cols = """"Registration","Period","Date","Time Departed","Time Landed",
            "IATA Origin","IATA Destination","IATA Destination Actual",
            "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
-           "Contract Year","Circle Distance","Flight Time\""""
+           "Contract Year","Circle Distance","Flight Time",
+           "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR\""""
     return f"""
-INSERT INTO forecast.final_1
+INSERT INTO forecast.acys_summary
     ({cols},
      "Origin Country","Origin City","Origin Airport Name",
-     "Destination Country","Destination City","Destination Airport Name")
+     "Destination Country","Destination City","Destination Airport Name",
+     origin_lat, origin_lon, dest_lat, dest_lon)
 WITH airports AS (
     SELECT DISTINCT ON ("IATA Code")
-           "IATA Code" AS iata, "Country" AS country, "City" AS city, "Airport Name" AS airport_name
+           "IATA Code" AS iata, "Country" AS country, "City" AS city, "Airport Name" AS airport_name,
+           "Latitude" AS lat, "Longitude" AS lon
     FROM main.virtual_airport_list
     WHERE "IATA Code" IS NOT NULL AND "IATA Code" <> ''
     ORDER BY "IATA Code"
 ),
 panel AS (
-    SELECT {cols} FROM forecast.history_1
+    SELECT {cols} FROM forecast.acys_actuals
     WHERE "Date" IS NOT NULL AND {final_scope}     -- flights only + THIS request's slice
     UNION ALL
-    SELECT {cols} FROM forecast.future_1
+    SELECT {cols} FROM forecast.acys_forecast
 )
 SELECT p.*,
        o.country, o.city, o.airport_name,
-       d.country, d.city, d.airport_name
+       d.country, d.city, d.airport_name,
+       o.lat, o.lon, d.lat, d.lon
 FROM panel p
 LEFT JOIN airports o ON o.iata = p."IATA Origin"
 LEFT JOIN airports d ON d.iata = p."IATA Destination"
@@ -134,7 +155,7 @@ def _scope(operator, registrations):
 
     operator and registrations are COMBINABLE (either or both): the scope is the UNION —
     the operator's tenure-scoped tails OR the explicit registrations. `ca."Operator"` uses the
-    array5 alias; the bare form (no alias) is reused for the history DELETE and the final filter.
+    array5 alias; the bare form (no alias) is reused for the acys_actuals DELETE and the final filter.
     """
     a5, bare, params, labels = [], [], {}, []
     if operator:
@@ -150,7 +171,7 @@ def _scope(operator, registrations):
     a5_where = "(" + " OR ".join(a5) + ")"
     bare_where = "(" + " OR ".join(bare) + ")"
     return (a5_where,
-            f"DELETE FROM forecast.history_1 WHERE {bare_where}",
+            f"DELETE FROM forecast.acys_actuals WHERE {bare_where}",
             bare_where,
             params,
             " + ".join(labels))
@@ -159,15 +180,16 @@ def _scope(operator, registrations):
 async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                              operator: str | None = None, registrations: list[str] | None = None,
                              as_of: date | None = None) -> dict:
-    """Run the forecast panel for ONE request (operator XOR registrations), publishing a status per
-    step. history_1 accumulates (this scope refreshed); future_1/final_1 are per-request."""
+    """Run the forecast panel for ONE request (operator and/or registrations), publishing a status
+    per step. acys_actuals accumulates (this scope refreshed); acys_forecast/acys_summary per-request."""
     if not operator and not registrations:
         raise ValueError("provide operator and/or registrations")
     as_of = as_of or date.today()
     a5_where, hist_delete, final_scope, scope_params, label = _scope(operator, registrations)
 
     base = {"start_date": HISTORY_START, "as_of": as_of,
-            "anchor_month": as_of.month, "anchor_day": as_of.day, **scope_params}
+            "anchor_month": as_of.month, "anchor_day": as_of.day,
+            "pax_factor": FORECAST_PAX_LOAD_FACTOR, **scope_params}
 
     async def _pub(state, message, progress=None, payload=None):
         kwargs = {}
@@ -179,8 +201,10 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                              state=state, message=message, **kwargs)
 
     try:
-        # 1/6 — validate: the combined scope must match at least one Cirium aircraft
-        await _pub("running", f"Validating {label}", progress=5)
+        # Step 1/4 — Searching historical data: validate the scope, reset the per-request tables
+        # (acys_actuals keeps other scopes — delete only THIS one; acys_forecast/acys_summary wiped),
+        # and probe FR24 coverage.
+        await _pub("running", "Searching historical data", progress=random.randint(10, 15))
         async with db_client.session(_DB) as s:
             ok = (await s.execute(
                 text(f'SELECT 1 FROM cirium.ciriumaircrafts ca WHERE {a5_where} LIMIT 1'),
@@ -188,44 +212,34 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         if not ok:
             await _pub("error", f"No Cirium aircraft match {label}")
             raise ValueError(f"empty scope: {label}")
-
-        # 2/6 — prepare: history_1 keeps other scopes (delete only THIS one); future_1/final_1 wiped
-        await _pub("running", "Preparing tables (refresh this scope in history_1; reset future/final)",
-                   progress=10)
         async with db_client.session(_DB) as s:
             await s.execute(text(hist_delete), scope_params)
-            await s.execute(text("TRUNCATE forecast.future_1"))
-            await s.execute(text("TRUNCATE forecast.final_1"))
+            await s.execute(text("TRUNCATE forecast.acys_forecast"))
+            await s.execute(text("TRUNCATE forecast.acys_summary"))
             await s.commit()
-
-        # 3/6 — FR24 coverage check (backfill is future work; report the gap)
-        await _pub("running", "Checking FR24 flight coverage for the fleet", progress=20)
         async with db_client.session(_DB) as s:
             miss = (await s.execute(text(_MISSING_TAILS_TMPL.format(a5_where=a5_where)),
                                     base)).fetchall()
         tails_without_fr24 = [r[0] for r in miss]
-        if tails_without_fr24:
-            await _pub("running",
-                       f"{len(tails_without_fr24)} tail(s) have no FR24 data (backfill not yet wired)",
-                       progress=25, payload={"tails_without_fr24": tails_without_fr24[:50]})
 
-        # 4/6 — assemble history_1 (Cirium × FR24, date-respecting) for this scope
-        await _pub("running", f"Assembling history (Cirium × FR24, as of {as_of})", progress=30)
+        # Step 2/4 — Fetching data: assemble acys_actuals (Cirium × FR24, date-respecting)
+        await _pub("running", "Fetching data", progress=random.randint(25, 49))
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_assemble_sql(a5_where)), base)
             history_rows = res.rowcount
             await s.commit()
-        await _pub("running", f"History assembled: {history_rows} row(s)", progress=70,
+
+        # Step 3/4 — Creating predictive analysis
+        await _pub("running", "Creating predictive analysis", progress=random.randint(55, 70),
                    payload={"history_rows": history_rows, "tails_without_fr24": len(tails_without_fr24)})
 
-        # 5/6 — merge into final_1 (this request's flights only + future_1, airport-enriched)
-        await _pub("running", "Merging into final (airport geography)", progress=80)
+        # Step 4/4 — Building dataset: merge into acys_summary (this request's flights only + forecast)
+        await _pub("running", "Building dataset", progress=random.randint(80, 90))
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_merge_sql(final_scope)), scope_params)
             final_rows = res.rowcount
             await s.commit()
 
-        # 6/6 — done
         summary = {
             "mode": "+".join((["operator"] if operator else []) + (["registrations"] if registrations else [])),
             "operator": operator, "registrations": list(registrations) if registrations else None,
@@ -233,7 +247,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             "history_rows": history_rows, "final_rows": final_rows,
             "tails_without_fr24": len(tails_without_fr24),
         }
-        await _pub("success", f"Completed — history {history_rows}, final {final_rows}",
+        await _pub("success", f"Completed — actuals {history_rows}, summary {final_rows}",
                    progress=100, payload=summary)
         logger.info("forecast_panel done: %s", summary)
         return summary
