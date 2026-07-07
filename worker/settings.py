@@ -91,6 +91,11 @@ FLIGHT_RADAR_CHECK_INTERVAL_FOUND: int = require_env("FLIGHT_RADAR_CHECK_INTERVA
 FLIGHT_RADAR_FORCE_RECHECK_MISS: int = require_env("FLIGHT_RADAR_FORCE_RECHECK_MISS", 8 * 60)
 
 
+# Forecast panel
+# Total PAX = Total Seats * this load factor (acys_actuals). Tunable via env; default 0.8.
+FORECAST_PAX_LOAD_FACTOR: float = float(require_env("FORECAST_PAX_LOAD_FACTOR", 0.8))
+
+
 # Aviation Edge
 
 AVIATION_EDGE_API_KEY: str = require_env("AVIATION_EDGE_API_KEY")
