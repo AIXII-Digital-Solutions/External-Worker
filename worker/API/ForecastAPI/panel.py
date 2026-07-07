@@ -19,6 +19,12 @@ Columns beyond the flight/aircraft fields (populated in acys_actuals, carried in
   * Total PAX           — Total Seats * FORECAST_PAX_LOAD_FACTOR (config, default 0.8).
   * Actual Distance FR  — flightsummary.circle_distance (same source as Circle Distance).
   * Flight Time FR      — flightsummary.flight_time (seconds) -> interval.
+  * Delivery Date / Lease Type / Lease Dry Wet / Operational Lessor — Cirium ("Delivery Date" /
+                          "Lease Type" / "Lease Dry / Wet" / "Operational Lessor"); in ALL 3 tables.
+
+acys_summary ONLY (applied by the merge, not stored in acys_actuals/acys_forecast):
+  * Agreed Value = 0    — when Lease Dry Wet = 'Wet'.
+  * Age                 — (Date - Delivery Date) in decimal years ((Date - Delivery Date)/365.25).
 """
 import random
 from datetime import date
@@ -56,7 +62,8 @@ INSERT INTO forecast.acys_actuals
      "ICAO Origin","ICAO Destination","ICAO Destination Actual",
      "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
      "Contract Year","Circle Distance","Flight Time",
-     "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR")
+     "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR",
+     "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor")
 WITH array5 AS (
     SELECT DISTINCT ON (ca."Registration", to_date(r.period,'MM-YYYY'))
            ca."Registration"                    AS registration,
@@ -68,7 +75,11 @@ WITH array5 AS (
            ca."Aircraft Sub Series"              AS sub_series,
            ca."Primary Usage"                    AS primary_usage,
            ca."Indicative Market Value (US$m)"   AS agreed_value,
-           ca."Number of Seats"                  AS total_seats
+           ca."Number of Seats"                  AS total_seats,
+           ca."Delivery Date"                    AS delivery_date,
+           ca."Lease Type"                       AS lease_type,
+           ca."Lease Dry / Wet"                  AS lease_dry_wet,
+           ca."Operational Lessor"               AS operational_lessor
     FROM cirium.ciriumaircrafts ca
     JOIN cirium.aircraftrevision r ON r.id = ca.revision_id
     WHERE {a5_where}
@@ -103,7 +114,8 @@ SELECT
     a5.total_seats,
     a5.total_seats * CAST(:pax_factor AS double precision),
     a6.circle_distance,
-    {_FLIGHT_TIME_FR}
+    {_FLIGHT_TIME_FR},
+    a5.delivery_date, a5.lease_type, a5.lease_dry_wet, a5.operational_lessor
 FROM array5 a5
 LEFT JOIN array6 a6
        ON a6.reg = a5.registration
@@ -129,18 +141,33 @@ def _airport_lookup(iata_expr: str, icao_expr: str) -> str:
 
 
 def _merge_sql(final_scope: str) -> str:
+    # Panel columns carried verbatim from acys_actuals / acys_forecast (incl. the 4 Cirium
+    # lease/delivery fields). acys_summary derives two MORE from these — and ONLY acys_summary:
+    #   * Agreed Value obeys the "Wet" rule (Wet lease -> 0);
+    #   * Age = (Date - Delivery Date) in decimal years.
     cols = """"Registration","Period","Date","Time Departed","Time Landed",
            "IATA Origin","IATA Destination","IATA Destination Actual",
            "ICAO Origin","ICAO Destination","ICAO Destination Actual",
            "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
            "Contract Year","Circle Distance","Flight Time",
-           "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR\""""
+           "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR",
+           "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor\""""
+    # Same column order as `cols`, but Agreed Value = 0 for a Wet lease, then Age appended.
+    proj = """p."Registration", p."Period", p."Date", p."Time Departed", p."Time Landed",
+           p."IATA Origin", p."IATA Destination", p."IATA Destination Actual",
+           p."ICAO Origin", p."ICAO Destination", p."ICAO Destination Actual",
+           p."Operator", p."Master Series", p."Manufacturer", p."Aircraft Sub Series", p."Primary Usage",
+           p."Contract Year", p."Circle Distance", p."Flight Time",
+           CASE WHEN p."Lease Dry Wet" = 'Wet' THEN 0 ELSE p."Agreed Value" END,
+           p."Total Seats", p."Total PAX", p."Actual Distance FR", p."Flight Time FR",
+           p."Delivery Date", p."Lease Type", p."Lease Dry Wet", p."Operational Lessor",
+           round((p."Date" - p."Delivery Date")::numeric / 365.25, 2)"""
     origin = _airport_lookup('p."IATA Origin"', 'p."ICAO Origin"')
     dest = _airport_lookup('coalesce(p."IATA Destination Actual", p."IATA Destination")',
                            'coalesce(p."ICAO Destination Actual", p."ICAO Destination")')
     return f"""
 INSERT INTO forecast.acys_summary
-    ({cols},
+    ({cols},"Age",
      "Origin Country","Origin City","Origin Airport Name",
      "Destination Country","Destination City","Destination Airport Name",
      origin_lat, origin_lon, dest_lat, dest_lon)
@@ -150,7 +177,7 @@ WITH panel AS (
     UNION ALL
     SELECT {cols} FROM forecast.acys_forecast
 )
-SELECT p.*,
+SELECT {proj},
        o.country, o.city, o.airport_name,
        d.country, d.city, d.airport_name,
        o.lat, o.lon, d.lat, d.lon
@@ -197,6 +224,24 @@ def _scope(operator, registrations):
             " + ".join(labels))
 
 
+async def _fr24_backfill(tails: list[str], as_of: date, pub) -> None:
+    """Fetch FR24 flight-summary for tails with NO flightsummary rows yet and insert them into
+    flightradar.flightsummary (so the assemble step then picks them up). Best-effort: a FlightRadar
+    failure (bad key / rate limit / network) is logged and the panel proceeds with existing data."""
+    await pub("running", f"Fetching {len(tails)} tail(s) from FlightRadar", progress=random.randint(16, 24))
+    try:
+        from API.FlightRadarAPI.FlightSummary import fetch_all_ranges   # lazy: avoid import cycle
+        await fetch_all_ranges(
+            start_date=HISTORY_START.isoformat(),
+            end_date=as_of.isoformat(),
+            registrations=list(tails),
+            storage_mode="db",
+        )
+    except Exception as e:
+        logger.warning("FR24 backfill failed for %d tail(s); continuing with existing data: %s",
+                       len(tails), e)
+
+
 async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                              operator: str | None = None, registrations: list[str] | None = None,
                              as_of: date | None = None) -> dict:
@@ -241,6 +286,14 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             miss = (await s.execute(text(_MISSING_TAILS_TMPL.format(a5_where=a5_where)),
                                     base)).fetchall()
         tails_without_fr24 = [r[0] for r in miss]
+
+        # Backfill missing tails from FlightRadar, then re-check what's still absent (best-effort).
+        if tails_without_fr24:
+            await _fr24_backfill(tails_without_fr24, as_of, _pub)
+            async with db_client.session(_DB) as s:
+                miss = (await s.execute(text(_MISSING_TAILS_TMPL.format(a5_where=a5_where)),
+                                        base)).fetchall()
+            tails_without_fr24 = [r[0] for r in miss]
 
         # Step 2/4 — Fetching data: assemble acys_actuals (Cirium × FR24, date-respecting)
         await _pub("running", "Fetching data", progress=random.randint(25, 49))
