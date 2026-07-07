@@ -20,6 +20,7 @@ from API.Utils import (create_or_update_subscription, asg_regs_updater, refresh_
                        ensure_livepositions_partitions)
 from API.Predictive.PredictiveUtilisation import predictive_utilisation_pipeline, predictive_cleanup
 from API.ForecastAPI import run_forecast_panel
+from API.Airports import refresh_airports
 
 logger = setup_logger("external_worker_tasks")
 
@@ -141,6 +142,11 @@ async def cron_ensure_livepositions_partition(ctx, **_):
     await ensure_livepositions_partitions()
 
 
+@status_task
+async def cron_refresh_airports(ctx, **_):
+    await refresh_airports()
+
+
 # On-demand tasks (enqueued by the API Server).
 ON_DEMAND = [
     fetch_flight_summary,
@@ -160,4 +166,5 @@ SCHEDULED = [
     cron_collapse_revisions,
     cron_refresh_plantype_matviews,
     cron_ensure_livepositions_partition,
+    cron_refresh_airports,
 ]

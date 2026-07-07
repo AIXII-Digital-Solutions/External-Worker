@@ -197,6 +197,24 @@ def _scope(operator, registrations):
             " + ".join(labels))
 
 
+async def _fr24_backfill(tails: list[str], as_of: date, pub) -> None:
+    """Fetch FR24 flight-summary for tails with NO flightsummary rows yet and insert them into
+    flightradar.flightsummary (so the assemble step then picks them up). Best-effort: a FlightRadar
+    failure (bad key / rate limit / network) is logged and the panel proceeds with existing data."""
+    await pub("running", f"Fetching {len(tails)} tail(s) from FlightRadar", progress=random.randint(16, 24))
+    try:
+        from API.FlightRadarAPI.FlightSummary import fetch_all_ranges   # lazy: avoid import cycle
+        await fetch_all_ranges(
+            start_date=HISTORY_START.isoformat(),
+            end_date=as_of.isoformat(),
+            registrations=list(tails),
+            storage_mode="db",
+        )
+    except Exception as e:
+        logger.warning("FR24 backfill failed for %d tail(s); continuing with existing data: %s",
+                       len(tails), e)
+
+
 async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                              operator: str | None = None, registrations: list[str] | None = None,
                              as_of: date | None = None) -> dict:
@@ -241,6 +259,14 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             miss = (await s.execute(text(_MISSING_TAILS_TMPL.format(a5_where=a5_where)),
                                     base)).fetchall()
         tails_without_fr24 = [r[0] for r in miss]
+
+        # Backfill missing tails from FlightRadar, then re-check what's still absent (best-effort).
+        if tails_without_fr24:
+            await _fr24_backfill(tails_without_fr24, as_of, _pub)
+            async with db_client.session(_DB) as s:
+                miss = (await s.execute(text(_MISSING_TAILS_TMPL.format(a5_where=a5_where)),
+                                        base)).fetchall()
+            tails_without_fr24 = [r[0] for r in miss]
 
         # Step 2/4 — Fetching data: assemble acys_actuals (Cirium × FR24, date-respecting)
         await _pub("running", "Fetching data", progress=random.randint(25, 49))
