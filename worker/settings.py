@@ -24,6 +24,24 @@ if not os.getenv(_ENV_VAR):
 
 from Config import require_env, ROOT
 
+
+def _rate(name: str, default: float) -> float:
+    """Parse a seconds/rate env value: a plain float ('0.3') OR an 'a/b' expression ('60/200' -> 0.3,
+    i.e. 200 requests per minute). Missing or unparseable -> `default`. (require_env returns the raw
+    env STRING, so a bare 'float =' annotation would not convert it — this does.)"""
+    raw = require_env(name, None)
+    if raw is None:
+        return float(default)
+    try:
+        raw = str(raw).strip()
+        if "/" in raw:
+            a, b = raw.split("/", 1)
+            return float(a) / float(b)
+        return float(raw)
+    except (ValueError, ZeroDivisionError):
+        return float(default)
+
+
 # This segment owns the webhook URLs, so it needs to know where the API is
 # reachable. Kept in sync with api_server via the same env keys.
 SELF_HOST: str = require_env("SELF_HOST", "api.aixii.com")
@@ -64,7 +82,7 @@ AIRLABS_API_URL: str = "https://airlabs.co/api/v9/"
 
 FLIGHT_RADAR_URL: str = require_env("FLIGHT_RADAR_URL", "https://fr24api.flightradar24.com/api")
 FLIGHT_RADAR_API_KEY: str = require_env("FLIGHT_RADAR_API_KEY")
-FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS: float = require_env("FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS", 60 / 90)
+FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS: float = _rate("FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS", 60 / 90)
 FLIGHT_RADAR_RANGE_DAYS: int = require_env("FLIGHT_RADAR_RANGE_DAYS", 14)
 FLIGHT_RADAR_MAX_REG_PER_BATCH: int = require_env("FLIGHT_RADAR_MAX_REG_PER_BATCH", 15)
 # Forecast coverage ledger: a per-tail no-fly gap of >= this many days is treated as a MISSING range
