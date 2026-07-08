@@ -18,7 +18,6 @@ from API.FlightRadarAPI.LiveFlightsAPI import live_flights_adaptive
 from API.Utils import (create_or_update_subscription, asg_regs_updater, refresh_cirium_delta,
                        collapse_completed_revisions, refresh_plantype_matviews,
                        ensure_livepositions_partitions)
-from API.Predictive.PredictiveUtilisation import predictive_utilisation_pipeline, predictive_cleanup
 from API.ForecastAPI import run_forecast_panel
 from API.Airports import refresh_airports
 
@@ -62,11 +61,6 @@ def status_task(func):
 @status_task
 async def fetch_flight_summary(ctx, **kwargs):
     await fetch_all_ranges(**kwargs)
-
-
-@status_task
-async def predictive_utilisation(ctx, icao, iata, date, deep_research=False, **_):
-    await predictive_utilisation_pipeline(icao=icao, iata=iata, date=date, deep_research=deep_research)
 
 
 @status_task
@@ -123,11 +117,6 @@ async def cron_refresh_delta(ctx, **_):
 
 
 @status_task
-async def cron_predictive_cleanup(ctx, **_):
-    await predictive_cleanup()
-
-
-@status_task
 async def cron_collapse_revisions(ctx, **_):
     await collapse_completed_revisions()
 
@@ -150,7 +139,6 @@ async def cron_refresh_airports(ctx, **_):
 # On-demand tasks (enqueued by the API Server).
 ON_DEMAND = [
     fetch_flight_summary,
-    predictive_utilisation,
     load_airports,
     refresh_subscription,
     forecast_panel,
@@ -162,7 +150,6 @@ SCHEDULED = [
     cron_live_flights,
     cron_asg_regs,
     cron_refresh_delta,
-    cron_predictive_cleanup,
     cron_collapse_revisions,
     cron_refresh_plantype_matviews,
     cron_ensure_livepositions_partition,
