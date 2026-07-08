@@ -72,6 +72,9 @@ async def publish_status(
         event = {
             "job_id": job_id, "kind": kind, "ref": ref, "state": state,
             "progress": values.get("progress"), "message": values.get("message"),
+            # payload rides along so live SSE consumers get the same extras as GET /status
+            # (e.g. the forecast panel's `eta` seconds-remaining).
+            "payload": values.get("payload"),
         }
         try:
             await redis.publish(STATUS_CHANNEL, json.dumps(event))
