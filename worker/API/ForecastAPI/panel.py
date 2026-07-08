@@ -23,6 +23,8 @@ Assemble (acys_actuals) — per FLIGHT:
     its START year); Circle Distance = GREAT-CIRCLE (haversine, km) between origin & destination coords;
     Flight Time = Time Landed - Time Departed; Total PAX = Total Seats * FORECAST_PAX_LOAD_FACTOR (0.8).
   * DROP a flight whose ICAO Origin is empty OR whose ICAO Destination (actual or planned) is empty.
+  * The flight LOWER BOUND is always the start of CY2022 (make_date(2022, anchor_month, anchor_day)) —
+    flights that would land in CY2021 are excluded.
 
 Airport coordinates / geography (2.4 distance + 2.6 enrichment) — by priority, first source that has
 the code wins: main.virtual_airport_list by IATA -> flightradar.airports by IATA -> main.airports by
@@ -37,6 +39,7 @@ acys_summary (2.6) — merge acys_actuals + acys_forecast, add Age / geography /
   * SUMMED across the group: Actual Distance FR, Circle Distance, Flight Time FR, Flight Time.
 """
 import random
+import time
 from datetime import date
 
 from sqlalchemy import text
@@ -148,7 +151,9 @@ array6 AS (
            f.actual_distance, f.flight_time
     FROM flightradar.flightsummary f
     WHERE f.reg IN (SELECT registration FROM array5)
-      AND f.first_seen >= :start_date
+      -- lower bound is ALWAYS the start of CY2022 (anchor month/day in 2022): flights that would
+      -- fall in CY2021 are dropped. Upper bound is the request date.
+      AND f.first_seen >= make_date(2022, :anchor_month, :anchor_day)
       AND f.first_seen <  :as_of
       -- DROP a flight with NO ICAO origin, or NO ICAO destination (neither actual nor planned)
       AND nullif(f.orig_icao, '') IS NOT NULL
@@ -294,11 +299,11 @@ def _scope(operator, registrations):
             " + ".join(labels))
 
 
-async def _fr24_backfill(tails: list[str], as_of: date, pub) -> None:
-    """Fetch FR24 flight-summary for tails with NO flightsummary rows yet and insert them into
-    flightradar.flightsummary (so the assemble step then picks them up). Best-effort: a FlightRadar
-    failure (bad key / rate limit / network) is logged and the panel proceeds with existing data."""
-    await pub("running", f"Fetching {len(tails)} tail(s) from FlightRadar", progress=random.randint(16, 24))
+async def _fr24_backfill(tails: list[str], as_of: date) -> None:
+    """Fetch missing flight-summary for tails with NO rows yet and insert them (so the assemble step
+    then picks them up). SILENT — publishes NO status of its own: the visible flow stays exactly the
+    four canonical steps. Best-effort: a fetch failure (bad key / rate limit / network) is logged and
+    the panel proceeds with existing data."""
     try:
         from API.FlightRadarAPI.FlightSummary import fetch_all_ranges   # lazy: avoid import cycle
         await fetch_all_ranges(
@@ -308,7 +313,7 @@ async def _fr24_backfill(tails: list[str], as_of: date, pub) -> None:
             storage_mode="db",
         )
     except Exception as e:
-        logger.warning("FR24 backfill failed for %d tail(s); continuing with existing data: %s",
+        logger.warning("backfill failed for %d tail(s); continuing with existing data: %s",
                        len(tails), e)
 
 
@@ -326,12 +331,22 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             "anchor_month": as_of.month, "anchor_day": as_of.day,
             "pax_factor": FORECAST_PAX_LOAD_FACTOR, **scope_params}
 
+    t0 = time.monotonic()   # ETA baseline: seconds-remaining is extrapolated from elapsed vs progress
+
     async def _pub(state, message, progress=None, payload=None):
+        # ETA (seconds remaining) rides in `payload.eta`: linear extrapolation elapsed*(100-p)/p.
+        # It is exposed by GET /status (payload) and the live SSE event (which now carries payload).
+        data = dict(payload) if payload else {}
+        if state == "success":
+            data["eta"] = 0
+        elif state != "error" and progress and 0 < progress < 100:
+            elapsed = time.monotonic() - t0
+            data["eta"] = max(0, round(elapsed * (100 - progress) / progress))
         kwargs = {}
         if progress is not None:
             kwargs["progress"] = progress
-        if payload is not None:
-            kwargs["payload"] = payload
+        if data:
+            kwargs["payload"] = data
         await publish_status(db_client, redis, job_id=job_id, kind="external", ref=ref,
                              state=state, message=message, **kwargs)
 
@@ -357,9 +372,9 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                                     base)).fetchall()
         tails_without_fr24 = [r[0] for r in miss]
 
-        # Backfill missing tails from FlightRadar, then re-check what's still absent (best-effort).
+        # Backfill missing tails, then re-check what's still absent (best-effort, no status of its own).
         if tails_without_fr24:
-            await _fr24_backfill(tails_without_fr24, as_of, _pub)
+            await _fr24_backfill(tails_without_fr24, as_of)
             async with db_client.session(_DB) as s:
                 miss = (await s.execute(text(_MISSING_TAILS_TMPL.format(a5_where=a5_where)),
                                         base)).fetchall()
