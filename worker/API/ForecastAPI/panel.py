@@ -44,6 +44,7 @@ acys_summary_grouped (VIEW, not written here) rolls by_day up to one row per (ai
                           Flight Time FR / Flight Time; drops Date / Time Departed / Time Landed.
 """
 import asyncio
+import json
 import random
 from datetime import date, timedelta
 
@@ -58,6 +59,7 @@ logger = setup_logger("forecast_panel")
 
 HISTORY_START = date(2022, 7, 1)   # Period >= 07-2022 (2.2) and flightsummary first_seen >= this
 _DB = "cirium"   # any aviation logical name -> the physical aixii DB (cirium/flightradar/main/forecast)
+_REQUEST_TYPE = "ACYS"   # this Cirium×FR24 panel algorithm — stamped on the forecast_last_requests row
 
 # Contract Year for a flight's first_seen vs the request anchor (:anchor_month/:anchor_day): the
 # 12-month window [anchor, anchor+1y) containing the date, labelled by its START year.
@@ -397,6 +399,22 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             res = await s.execute(text(_merge_sql(final_scope)), scope_params)
             final_rows = res.rowcount
             await s.commit()
+
+        # Record this run for GET /forecast/last — written ONLY here, once the WHOLE panel finished
+        # successfully (moved out of the POST /forecast trigger). Best-effort: never fail a good run.
+        try:
+            async with db_client.session("service") as s:
+                await s.execute(
+                    text("INSERT INTO forecast_last_requests (request_type, request_params) "
+                         "VALUES (:rt, CAST(:params AS jsonb))"),
+                    {"rt": _REQUEST_TYPE, "params": json.dumps({
+                        "operator": operator,
+                        "registrations": list(registrations) if registrations else None,
+                        "date": as_of.isoformat(),
+                    })})
+                await s.commit()
+        except Exception as e:
+            logger.warning("failed to record forecast_last_requests: %s", e)
 
         summary = {
             "mode": "+".join((["operator"] if operator else []) + (["registrations"] if registrations else [])),
