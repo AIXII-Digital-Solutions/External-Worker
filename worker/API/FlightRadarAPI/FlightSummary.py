@@ -26,7 +26,8 @@ async def fetch_date_range(
         range_to: datetime,
         http: aiohttp.ClientSession,
         storage_mode: str = "db",
-        csv_path: Optional[str] = None
+        csv_path: Optional[str] = None,
+        on_request=None,
 ) -> List[dict] | None:
     client: DatabaseClient = DatabaseClient()
 
@@ -62,6 +63,8 @@ async def fetch_date_range(
                     break
 
                 flights = await resp.json()
+                if on_request is not None:
+                    await on_request()   # one API request done — drives live ETA / budget
                 if not flights or not flights.get("data"):
                     logger.debug("[Flight Summary] No data for the current interval.")
                     break
@@ -194,7 +197,8 @@ async def fetch_all_ranges(
         registrations: Optional[List[str]] = None,
         callsigns: Optional[List[str]] = None,
         storage_mode: str = "db",
-        csv_path: Optional[Path] = FLIGHT_RADAR_PATH / f"flights_{datetime.strftime(datetime.now(), '%Y%m%d_%H%M')}.csv"
+        csv_path: Optional[Path] = FLIGHT_RADAR_PATH / f"flights_{datetime.strftime(datetime.now(), '%Y%m%d_%H%M')}.csv",
+        on_request=None,
 ):
     client: DatabaseClient = DatabaseClient()
     if registrations is None and icao is None and callsigns is None:
@@ -252,7 +256,8 @@ async def fetch_all_ranges(
                     http=http,
                     storage_mode=storage_mode,
                     csv_path=csv_path,
-                    callsigns=callsign_batch
+                    callsigns=callsign_batch,
+                    on_request=on_request,
                 ))
 
         logger.info("[Flight Summary] Query Fetch All Ranges completed")
