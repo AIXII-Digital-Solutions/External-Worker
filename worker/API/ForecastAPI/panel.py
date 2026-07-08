@@ -45,7 +45,7 @@ acys_summary_grouped (VIEW, not written here) rolls by_day up to one row per (ai
 """
 import random
 import time
-from datetime import date
+from datetime import date, timedelta
 
 from sqlalchemy import text
 
@@ -247,14 +247,22 @@ LEFT JOIN LATERAL {d_geo} d ON true
 """
 
 
-_MISSING_TAILS_TMPL = """
+_SCOPE_REGS_TMPL = """
 SELECT DISTINCT ca."Registration" AS reg
 FROM cirium.ciriumaircrafts ca
 JOIN cirium.aircraftrevision r ON r.id = ca.revision_id
 WHERE {a5_where}
   AND to_date(r.period,'MM-YYYY') >= :start_date
-  AND NOT EXISTS (SELECT 1 FROM flightradar.flightsummary f WHERE f.reg = ca."Registration")
 """
+
+
+def _cy2022_floor(as_of: date) -> date:
+    """Start of CY2022 relative to the request anchor (make_date(2022, month, day)); the FR24 fetch
+    lower bound. Guards the Feb-29 case (2022 is not a leap year)."""
+    try:
+        return date(2022, as_of.month, as_of.day)
+    except ValueError:
+        return date(2022, as_of.month, 28)
 
 
 def _scope(operator, registrations):
@@ -282,24 +290,6 @@ def _scope(operator, registrations):
             bare_where,
             params,
             " + ".join(labels))
-
-
-async def _fr24_backfill(tails: list[str], as_of: date) -> None:
-    """Fetch missing flight-summary for tails with NO rows yet and insert them (so the assemble step
-    then picks them up). SILENT — publishes NO status of its own: the visible flow stays exactly the
-    four canonical steps. Best-effort: a fetch failure (bad key / rate limit / network) is logged and
-    the panel proceeds with existing data."""
-    try:
-        from API.FlightRadarAPI.FlightSummary import fetch_all_ranges   # lazy: avoid import cycle
-        await fetch_all_ranges(
-            start_date=HISTORY_START.isoformat(),
-            end_date=as_of.isoformat(),
-            registrations=list(tails),
-            storage_mode="db",
-        )
-    except Exception as e:
-        logger.warning("backfill failed for %d tail(s); continuing with existing data: %s",
-                       len(tails), e)
 
 
 async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
@@ -338,7 +328,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
     try:
         # Step 1/4 — Searching historical data: validate the scope, reset the per-request tables
         # (acys_actuals keeps other scopes — delete only THIS one; acys_forecast/acys_summary wiped),
-        # and probe FR24 coverage.
+        # and fetch only the MISSING FR24 date ranges per tail (coverage ledger).
         await _pub("running", "Searching historical data", progress=random.randint(10, 15))
         async with db_client.session(_DB) as s:
             ok = (await s.execute(
@@ -353,17 +343,15 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             await s.execute(text("TRUNCATE forecast.acys_summary_by_day"))
             await s.commit()
         async with db_client.session(_DB) as s:
-            miss = (await s.execute(text(_MISSING_TAILS_TMPL.format(a5_where=a5_where)),
-                                    base)).fetchall()
-        tails_without_fr24 = [r[0] for r in miss]
+            scope_regs = (await s.execute(text(_SCOPE_REGS_TMPL.format(a5_where=a5_where)),
+                                          base)).scalars().all()
 
-        # Backfill missing tails, then re-check what's still absent (best-effort, no status of its own).
-        if tails_without_fr24:
-            await _fr24_backfill(tails_without_fr24, as_of)
-            async with db_client.session(_DB) as s:
-                miss = (await s.execute(text(_MISSING_TAILS_TMPL.format(a5_where=a5_where)),
-                                        base)).fetchall()
-            tails_without_fr24 = [r[0] for r in miss]
+        # Fetch ONLY the MISSING FR24 date ranges per tail (coverage ledger) — from CY2022 start to
+        # yesterday. Silent (no status of its own): the visible flow stays the four canonical steps.
+        from API.FlightRadarAPI.coverage import fetch_missing_ranges   # lazy: avoid import cycle
+        coverage = await fetch_missing_ranges(
+            db_client, list(scope_regs),
+            w_start=_cy2022_floor(as_of), w_end=date.today() - timedelta(days=1))
 
         # Step 2/4 — Fetching data: assemble acys_actuals (Cirium × FR24, date-respecting, flights only)
         await _pub("running", "Fetching data", progress=random.randint(25, 49))
@@ -374,7 +362,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
 
         # Step 3/4 — Creating predictive analysis
         await _pub("running", "Creating predictive analysis", progress=random.randint(55, 70),
-                   payload={"history_rows": history_rows, "tails_without_fr24": len(tails_without_fr24)})
+                   payload={"history_rows": history_rows, "coverage": coverage})
 
         # Step 4/4 — Building dataset: merge into acys_summary (this request's flights only + forecast)
         await _pub("running", "Building dataset", progress=random.randint(80, 90))
@@ -388,7 +376,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             "operator": operator, "registrations": list(registrations) if registrations else None,
             "as_of": as_of.isoformat(),
             "history_rows": history_rows, "final_rows": final_rows,
-            "tails_without_fr24": len(tails_without_fr24),
+            "coverage": coverage,
         }
         await _pub("success", f"Completed — actuals {history_rows}, summary {final_rows}",
                    progress=100, payload=summary)
