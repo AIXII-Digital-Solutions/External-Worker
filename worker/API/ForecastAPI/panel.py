@@ -43,6 +43,7 @@ acys_summary_grouped (VIEW, not written here) rolls by_day up to one row per (ai
   * # Of Flights        — count of grouped flights; SUMS Actual Distance FR / Circle Distance /
                           Flight Time FR / Flight Time; drops Date / Time Departed / Time Landed.
 """
+import asyncio
 import random
 from datetime import date, timedelta
 
@@ -332,6 +333,21 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         await _pub("running", "Searching historical data", progress=15,
                    eta=fetch_seconds_remaining + _db_eta)
 
+    # Cooperative cancellation: core-api's POST /status/{job_id}/cancel sets this Redis flag; we check
+    # it between steps AND per FR24 request (via should_cancel) so the run stops promptly and cleanly.
+    from API.FlightRadarAPI.coverage import fetch_missing_ranges, JobCancelled   # lazy: avoid import cycle
+    _cancel_key = f"job:cancel:{job_id}"
+
+    async def _cancelled() -> bool:
+        try:
+            return bool(redis is not None and await redis.exists(_cancel_key))
+        except Exception:
+            return False
+
+    async def _ck():
+        if await _cancelled():
+            raise JobCancelled()
+
     try:
         # Step 1/4 — Searching historical data: validate the scope, reset the per-request tables
         # (acys_actuals keeps other scopes — delete only THIS one; acys_forecast/acys_summary wiped),
@@ -355,13 +371,13 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
 
         # Fetch ONLY the MISSING FR24 date ranges per tail (coverage ledger) — from CY2022 start to
         # yesterday. Silent (no status of its own): the visible flow stays the four canonical steps.
-        from API.FlightRadarAPI.coverage import fetch_missing_ranges   # lazy: avoid import cycle
         coverage = await fetch_missing_ranges(
             db_client, list(scope_regs),
             w_start=_cy2022_floor(as_of), w_end=date.today() - timedelta(days=1),
-            time_budget_s=FORECAST_FETCH_BUDGET_SECONDS, on_progress=_on_fetch)
+            time_budget_s=FORECAST_FETCH_BUDGET_SECONDS, on_progress=_on_fetch, should_cancel=_cancelled)
 
         # Step 2/4 — Fetching data: assemble acys_actuals (Cirium × FR24, date-respecting, flights only)
+        await _ck()
         await _pub("running", "Fetching data", progress=random.randint(25, 49), eta=_db_eta)
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_assemble_sql(a5_where)), base)
@@ -374,6 +390,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                    payload={"history_rows": history_rows, "coverage": coverage})
 
         # Step 4/4 — Building dataset: merge into acys_summary (this request's flights only + forecast)
+        await _ck()
         await _pub("running", "Building dataset", progress=random.randint(80, 90),
                    eta=FORECAST_MERGE_ETA_SECONDS)
         async with db_client.session(_DB) as s:
@@ -393,6 +410,23 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         logger.info("forecast_panel done: %s", summary)
         return summary
 
+    except JobCancelled:
+        # User cancelled (cooperative flag): publish the terminal 'cancelled' status LAST (so no
+        # in-flight 'running' publish overwrites it), clear the flag, and finish normally.
+        await _pub("cancelled", "Cancelled by user")
+        try:
+            await redis.delete(_cancel_key)
+        except Exception:
+            pass
+        logger.info("forecast_panel cancelled (%s)", label)
+        return {"cancelled": True, "operator": operator,
+                "registrations": list(registrations) if registrations else None}
+    except asyncio.CancelledError:
+        # ARQ abort / worker shutdown: publish 'cancelled' on a DETACHED task (survives this task's
+        # cancellation), then re-raise so ARQ records the job as aborted.
+        asyncio.ensure_future(_pub("cancelled", "Cancelled by user"))
+        logger.info("forecast_panel aborted (%s)", label)
+        raise
     except Exception as e:
         if not isinstance(e, ValueError):
             await _pub("error", f"Forecast panel failed: {e}")

@@ -30,6 +30,10 @@ class _BudgetReached(Exception):
     """Raised from the per-request callback to stop the fetch once the time budget is spent."""
 
 
+class JobCancelled(Exception):
+    """Raised from the per-request callback when the user requested cancellation of this job."""
+
+
 def _estimate_requests(gf: date, gt: date) -> int:
     """Estimate the FR24 requests a gap costs: one per FLIGHT_RADAR_RANGE_DAYS-day chunk (>= 1)."""
     return max(1, ceil(((gt - gf).days + 1) / FLIGHT_RADAR_RANGE_DAYS))
@@ -98,7 +102,7 @@ async def _record(session, reg, f, t):
 
 
 async def fetch_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_days: int = None,
-                               time_budget_s: float = None, on_progress=None) -> dict:
+                               time_budget_s: float = None, on_progress=None, should_cancel=None) -> dict:
     """Fetch ONLY the missing FR24 date ranges for `regs` within [w_start, w_end].
 
     Pre-pass: seed the ledger if absent, compute each reg's missing ranges, and GROUP tails by an
@@ -152,6 +156,8 @@ async def fetch_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_
     async def _on_request():
         nonlocal done_requests
         done_requests += 1
+        if should_cancel is not None and await should_cancel():
+            raise JobCancelled()
         if time_budget_s is not None and (time.monotonic() - started) >= time_budget_s:
             raise _BudgetReached()
         await _report()
@@ -160,6 +166,8 @@ async def fetch_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_
 
     ranges_fetched, tail_days, incomplete = 0, 0, False
     for (gf, gt), grp_regs in plan:
+        if should_cancel is not None and await should_cancel():
+            raise JobCancelled()
         if time_budget_s is not None and (time.monotonic() - started) >= time_budget_s:
             incomplete = True
             break
@@ -173,6 +181,8 @@ async def fetch_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_
             incomplete = True
             logger.info("FR24 coverage: %ss budget reached mid-fetch; rest next run", int(time_budget_s or 0))
             break
+        except JobCancelled:
+            raise   # propagate to run_forecast_panel — user cancelled
         except Exception as e:
             logger.warning("FR24 fetch %s [%s..%s] failed: %s", grp_regs, gf, gt, e)
             continue  # leave un-recorded so it retries next run
