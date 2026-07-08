@@ -67,6 +67,9 @@ FLIGHT_RADAR_API_KEY: str = require_env("FLIGHT_RADAR_API_KEY")
 FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS: float = require_env("FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS", 60 / 90)
 FLIGHT_RADAR_RANGE_DAYS: int = require_env("FLIGHT_RADAR_RANGE_DAYS", 14)
 FLIGHT_RADAR_MAX_REG_PER_BATCH: int = require_env("FLIGHT_RADAR_MAX_REG_PER_BATCH", 15)
+# Forecast coverage ledger: a per-tail no-fly gap of >= this many days is treated as a MISSING range
+# (fetched from FR24), shorter gaps are folded into the covered span. Bootstrap threshold.
+FLIGHT_RADAR_COVERAGE_GAP_DAYS: int = require_env("FLIGHT_RADAR_COVERAGE_GAP_DAYS", 7)
 FLIGHT_RADAR_HEADERS: dict = {
     "Authorization": f"Bearer {FLIGHT_RADAR_API_KEY}",
     "Accept-Version": "v1",
