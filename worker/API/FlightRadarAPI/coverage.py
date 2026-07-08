@@ -34,9 +34,30 @@ class JobCancelled(Exception):
     """Raised from the per-request callback when the user requested cancellation of this job."""
 
 
+_MERGE_TOL_DAYS = 1   # gap-keys whose endpoints are within this many days are fetched as ONE batch
+
+
 def _estimate_requests(gf: date, gt: date) -> int:
     """Estimate the FR24 requests a gap costs: one per FLIGHT_RADAR_RANGE_DAYS-day chunk (>= 1)."""
     return max(1, ceil(((gt - gf).days + 1) / FLIGHT_RADAR_RANGE_DAYS))
+
+
+def _cluster_groups(groups: dict, tol_days: int):
+    """Merge (from, to) gap-keys whose BOTH endpoints are within `tol_days` of a cluster anchor into
+    one batched cluster. Returns [(gf_union, gt_union, [regs]), ...]: the union range is fetched once
+    for ALL the cluster's tails (e.g. trailing gaps [01-31..] and [02-01..] become a single request).
+    Recording the union per tail is correct — the batched request covers that union for every tail."""
+    clusters = []   # [anchor_gf, anchor_gt, gf_min, gt_max, set(regs)]
+    for gf, gt in sorted(groups):
+        regs = groups[(gf, gt)]
+        for cl in clusters:
+            if abs((gf - cl[0]).days) <= tol_days and abs((gt - cl[1]).days) <= tol_days:
+                cl[2], cl[3] = min(cl[2], gf), max(cl[3], gt)
+                cl[4].update(regs)
+                break
+        else:
+            clusters.append([gf, gt, gf, gt, set(regs)])
+    return [(cl[2], cl[3], sorted(cl[4])) for cl in clusters]
 
 
 def _coalesce(ranges, max_gap_days):
@@ -128,13 +149,13 @@ async def fetch_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_
                 groups.setdefault((gf, gt), []).append(reg)
         except Exception as e:
             logger.warning("coverage plan failed for %s: %s", reg, e)
-    # newest gaps first (fresh data prioritised if the budget runs out)
-    plan = sorted(groups.items(), key=lambda kv: kv[0][1], reverse=True)
+    # merge near-identical gap ranges (±_MERGE_TOL_DAYS) into batched clusters; newest first (so fresh
+    # data is prioritised if the budget runs out).
+    plan = _cluster_groups(groups, _MERGE_TOL_DAYS)
+    plan.sort(key=lambda c: c[1], reverse=True)
 
-    def _group_requests(gf, gt, n_regs):
-        return _estimate_requests(gf, gt) * ceil(n_regs / FLIGHT_RADAR_MAX_REG_PER_BATCH)
-
-    total_requests = sum(_group_requests(gf, gt, len(rs)) for (gf, gt), rs in plan)
+    total_requests = sum(_estimate_requests(gf, gt) * ceil(len(rs) / FLIGHT_RADAR_MAX_REG_PER_BATCH)
+                         for gf, gt, rs in plan)
     started = time.monotonic()
     done_requests = 0
     last_report = -1e9
@@ -165,7 +186,7 @@ async def fetch_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_
     await _report(force=True)   # initial ETA (total_requests * per-request estimate)
 
     ranges_fetched, tail_days, incomplete = 0, 0, False
-    for (gf, gt), grp_regs in plan:
+    for gf, gt, grp_regs in plan:
         if should_cancel is not None and await should_cancel():
             raise JobCancelled()
         if time_budget_s is not None and (time.monotonic() - started) >= time_budget_s:

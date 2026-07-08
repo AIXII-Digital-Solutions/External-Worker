@@ -75,8 +75,10 @@ class WorkerSettings:
     # ON_DEMAND: enqueued by core-api. SCHEDULED: enqueued by the dispatcher / run-now —
     # both must be registered here so ARQ can resolve them by name. forecast_panel does a bounded
     # FR24 fetch that can exceed arq's default 300s job timeout, so it gets its own longer timeout.
+    # max_tries=1: it is user-triggered and cancellable — never auto-retry on interruption/cancel
+    # (that is what turned a cancelled run back on), the user re-triggers if they want it again.
     functions = [
-        func(f, name="forecast_panel", timeout=settings.FORECAST_JOB_TIMEOUT_SECONDS)
+        func(f, name="forecast_panel", timeout=settings.FORECAST_JOB_TIMEOUT_SECONDS, max_tries=1)
         if f is tasks.forecast_panel else f
         for f in (list(tasks.ON_DEMAND) + list(tasks.SCHEDULED))
     ]
