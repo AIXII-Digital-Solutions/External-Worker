@@ -18,12 +18,16 @@ from sqlalchemy import text
 
 from Config import setup_logger
 from settings import (FLIGHT_RADAR_COVERAGE_GAP_DAYS, FLIGHT_RADAR_RANGE_DAYS,
-                      FR24_SECONDS_PER_REQUEST_EST)
+                      FLIGHT_RADAR_MAX_REG_PER_BATCH, FR24_SECONDS_PER_REQUEST_EST)
 from API.FlightRadarAPI.FlightSummary import fetch_all_ranges
 
 logger = setup_logger("fr24_coverage")
 
 _TBL = "flightradar.flightsummary_coverage"
+
+
+class _BudgetReached(Exception):
+    """Raised from the per-request callback to stop the fetch once the time budget is spent."""
 
 
 def _estimate_requests(gf: date, gt: date) -> int:
@@ -97,16 +101,19 @@ async def fetch_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_
                                time_budget_s: float = None, on_progress=None) -> dict:
     """Fetch ONLY the missing FR24 date ranges for `regs` within [w_start, w_end].
 
-    Pre-pass: seed the ledger if absent, compute each reg's missing ranges, and estimate the total
-    FR24 request count. Then fetch each range (best-effort, recording it after so it is never
-    re-fetched) UNTIL `time_budget_s` elapses — any not-yet-fetched ranges are left for the next run
-    (their absence from the ledger makes them retry). `on_progress(fetch_seconds_remaining)` is called
-    with a live estimate (measured per-request time, capped by the remaining budget). Never raises."""
+    Pre-pass: seed the ledger if absent, compute each reg's missing ranges, and GROUP tails by an
+    identical (from, to) gap so tails sharing a range (typically the common trailing gap) are fetched
+    in ONE batched FR24 request instead of one-per-tail (which multiplied requests + rate-limit sleeps
+    and stalled between them). Groups are fetched newest-first, each recorded after so it is never
+    re-fetched, UNTIL `time_budget_s` elapses (checked per API request) — unfetched groups retry next
+    run. `on_progress(fetch_seconds_remaining)` is called live (measured per-request time, throttled to
+    ~2s, capped by the remaining budget). Never raises (except the internal budget stop, handled here).
+    """
     gap_days = FLIGHT_RADAR_COVERAGE_GAP_DAYS if gap_days is None else gap_days
     regs = list(regs)
 
-    # PRE-PASS: seed + compute missing ranges + estimate the total FR24 requests up front.
-    plan = []  # (reg, gf, gt, est_requests)
+    # PRE-PASS: seed + compute each reg's missing ranges, group tails by identical (from, to).
+    groups: dict = {}   # (gf, gt) -> [regs]
     for reg in regs:
         try:
             async with db_client.session("flightradar") as s:
@@ -114,54 +121,70 @@ async def fetch_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_
                 await s.commit()
                 covered = await _covered(s, reg)
             for gf, gt in _complement(covered, w_start, w_end):
-                plan.append((reg, gf, gt, _estimate_requests(gf, gt)))
+                groups.setdefault((gf, gt), []).append(reg)
         except Exception as e:
             logger.warning("coverage plan failed for %s: %s", reg, e)
-    total_requests = sum(p[3] for p in plan)
+    # newest gaps first (fresh data prioritised if the budget runs out)
+    plan = sorted(groups.items(), key=lambda kv: kv[0][1], reverse=True)
 
-    async def _report(done, avg, started):
+    def _group_requests(gf, gt, n_regs):
+        return _estimate_requests(gf, gt) * ceil(n_regs / FLIGHT_RADAR_MAX_REG_PER_BATCH)
+
+    total_requests = sum(_group_requests(gf, gt, len(rs)) for (gf, gt), rs in plan)
+    started = time.monotonic()
+    done_requests = 0
+    last_report = -1e9
+
+    async def _report(force=False):
+        nonlocal last_report
         if on_progress is None:
             return
-        remaining = max(0, total_requests - done) * avg
-        if time_budget_s is not None and started is not None:
-            remaining = min(remaining, max(0.0, time_budget_s - (time.monotonic() - started)))
+        elapsed = time.monotonic() - started
+        if not force and elapsed - last_report < 2.0:
+            return
+        last_report = elapsed
+        avg = elapsed / done_requests if done_requests else FR24_SECONDS_PER_REQUEST_EST
+        remaining = max(0, total_requests - done_requests) * avg
+        if time_budget_s is not None:
+            remaining = min(remaining, max(0.0, time_budget_s - elapsed))
         await on_progress(remaining)
 
-    await _report(0, FR24_SECONDS_PER_REQUEST_EST, None)   # initial ETA before fetching starts
+    async def _on_request():
+        nonlocal done_requests
+        done_requests += 1
+        if time_budget_s is not None and (time.monotonic() - started) >= time_budget_s:
+            raise _BudgetReached()
+        await _report()
 
-    started = time.monotonic()
-    avg_per_req = FR24_SECONDS_PER_REQUEST_EST
-    measured_time, measured_reqs = 0.0, 0
-    done_requests, ranges_fetched, tail_days = 0, 0, 0
-    incomplete = False
-    for reg, gf, gt, est in plan:
+    await _report(force=True)   # initial ETA (total_requests * per-request estimate)
+
+    ranges_fetched, tail_days, incomplete = 0, 0, False
+    for (gf, gt), grp_regs in plan:
         if time_budget_s is not None and (time.monotonic() - started) >= time_budget_s:
             incomplete = True
-            logger.info("FR24 coverage: %ss budget reached; %d/%d ranges fetched, rest next run",
-                        int(time_budget_s), ranges_fetched, len(plan))
             break
-        t = time.monotonic()
         try:
-            await fetch_all_ranges(start_date=gf.isoformat(), end_date=gt.isoformat(),
-                                   registrations=[reg], storage_mode="db")
+            # end_date is EXCLUSIVE-of-next-day so a single-day gap has from < to (FR24 else 400s).
+            await fetch_all_ranges(start_date=gf.isoformat(),
+                                   end_date=(gt + timedelta(days=1)).isoformat(),
+                                   registrations=list(grp_regs), storage_mode="db",
+                                   on_request=_on_request)
+        except _BudgetReached:
+            incomplete = True
+            logger.info("FR24 coverage: %ss budget reached mid-fetch; rest next run", int(time_budget_s or 0))
+            break
         except Exception as e:
-            logger.warning("FR24 fetch %s [%s..%s] failed: %s", reg, gf, gt, e)
-            done_requests += est
-            await _report(done_requests, avg_per_req, started)
+            logger.warning("FR24 fetch %s [%s..%s] failed: %s", grp_regs, gf, gt, e)
             continue  # leave un-recorded so it retries next run
-        measured_time += time.monotonic() - t
-        measured_reqs += est
-        if measured_reqs:
-            avg_per_req = measured_time / measured_reqs
         async with db_client.session("flightradar") as s:
-            await _record(s, reg, gf, gt)
+            for reg in grp_regs:
+                await _record(s, reg, gf, gt)
             await s.commit()
-        done_requests += est
         ranges_fetched += 1
-        tail_days += (gt - gf).days + 1
-        await _report(done_requests, avg_per_req, started)
+        tail_days += ((gt - gf).days + 1) * len(grp_regs)
+        await _report(force=True)
 
-    summary = {"regs": len(regs), "planned_ranges": len(plan), "ranges_fetched": ranges_fetched,
+    summary = {"regs": len(regs), "groups": len(plan), "ranges_fetched": ranges_fetched,
                "tail_days": tail_days, "requests_est": total_requests, "incomplete": incomplete}
     logger.info("FR24 coverage refresh: %s", summary)
     return summary
