@@ -2,30 +2,39 @@
 
 Request modes: by **operator** and/or an explicit **registrations** list (UNION scope). Assembles
 forecast.acys_actuals (Cirium × FR24, date-respecting) then merges into forecast.acys_summary
-(airport-enriched). Mirrors predictive/panel in Core-API (SQL vendored — worker has no Core-API dep).
+(airport-enriched + route-grouped). Mirrors predictive/panel in Core-API (SQL vendored).
 
 Tables:
-  * acys_actuals  — PERSISTS across requests; a request DELETEs only ITS scope then re-inserts.
+  * acys_actuals  — one row per FLIGHT (Cirium aircraft × its flightsummary flight). A request
+                    DELETEs only ITS scope then re-inserts. Flights only (no aircraft-without-flight).
   * acys_forecast — TRUNCATEd every request (populated later by the forecast model).
-  * acys_summary  — TRUNCATEd every request; rebuilt from acys_actuals (THIS request's flights only)
-                    + acys_forecast, enriched with origin/destination airport geography + lat/lon.
+  * acys_summary  — TRUNCATEd every request; rebuilt from acys_actuals (THIS request's flights)
+                    + acys_forecast, airport-enriched, then GROUPED by aircraft+month+route.
 
-Columns beyond the flight/aircraft fields (populated in acys_actuals, carried into acys_summary):
-  * Contract Year       — fiscal window (anchored at the REQUEST date's month/day) of the flight Date.
-  * Circle Distance     — flightsummary.circle_distance.
-  * Flight Time         — Time Landed - Time Departed (interval).
-  * Agreed Value        — Cirium "Indicative Market Value (US$m)".
-  * Total Seats         — Cirium "Number of Seats".
-  * Total PAX           — Total Seats * FORECAST_PAX_LOAD_FACTOR (config, default 0.8).
-  * Actual Distance FR  — flightsummary.circle_distance (same source as Circle Distance).
-  * Flight Time FR      — flightsummary.flight_time (seconds) -> interval.
-  * Delivery Date / Lease Type / Lease Dry Wet / Operational Lessor — Cirium ("Delivery Date" /
-                          "Lease Type" / "Lease Dry / Wet" / "Operational Lessor"); in ALL 3 tables.
+Assemble (acys_actuals) — per FLIGHT:
+  * aircraft (2.2) from cirium.ciriumaircrafts: latest revision per (Registration, Period-month) for
+    every month with Period >= 07-2022. Fields: Operator, Master Series, Manufacturer, Aircraft Sub
+    Series, Primary Usage, Agreed Value (Indicative Market Value US$m), Total Seats (Number of Seats),
+    Delivery Date, Lease Type, Lease Dry Wet (Lease Dry / Wet), Operational Lessor.
+  * flight (2.3) from flightradar.flightsummary matched by reg AND first_seen's month == Period month.
+    Date = first_seen; Time Departed/Landed = datetime_takeoff/landed; Actual Distance FR =
+    actual_distance; Flight Time FR = flight_time (sec -> interval); IATA/ICAO Origin & Destination(+Actual).
+  * derived (2.4): Contract Year (fiscal window anchored at the REQUEST date's month/day, labelled by
+    its START year); Circle Distance = GREAT-CIRCLE (haversine, km) between origin & destination coords;
+    Flight Time = Time Landed - Time Departed; Total PAX = Total Seats * FORECAST_PAX_LOAD_FACTOR (0.8).
+  * DROP a flight whose ICAO Origin is empty OR whose ICAO Destination (actual or planned) is empty.
 
-acys_summary ONLY (applied by the merge, not stored in acys_actuals/acys_forecast):
+Airport coordinates / geography (2.4 distance + 2.6 enrichment) — by priority, first source that has
+the code wins: main.virtual_airport_list by IATA -> flightradar.airports by IATA -> main.airports by
+IATA -> main.airports by ICAO.
+
+acys_summary (2.6) — merge acys_actuals + acys_forecast, add Age / geography / Origin&Dest lat-lon /
+# Of Flights / Data Type, then GROUP identical (aircraft, month, route):
   * Agreed Value = 0    — when Lease Dry Wet = 'Wet'.
   * Age                 — (Date - Delivery Date) in decimal years ((Date - Delivery Date)/365.25).
-  * Data Type           — 'Actuals' (row from acys_actuals) / 'Forecast' (row from acys_forecast).
+  * Data Type           — 'Actuals' (from acys_actuals) / 'Forecast' (from acys_forecast).
+  * # Of Flights        — count of grouped flights (same aircraft, month, route).
+  * SUMMED across the group: Actual Distance FR, Circle Distance, Flight Time FR, Flight Time.
 """
 import random
 from datetime import date
@@ -38,24 +47,69 @@ from status import publish_status
 
 logger = setup_logger("forecast_panel")
 
-HISTORY_START = date(2023, 7, 1)
+HISTORY_START = date(2022, 7, 1)   # Period >= 07-2022 (2.2) and flightsummary first_seen >= this
 _DB = "cirium"   # any aviation logical name -> the physical aixii DB (cirium/flightradar/main/forecast)
 
-# Contract Year for a flight date `d` vs the request anchor (:anchor_month/:anchor_day): the 12-month
-# window [anchor, anchor+1y) containing d, labelled by its START year. Null when there's no flight.
-_CONTRACT_YEAR = """CASE WHEN a6.flight_dt IS NULL THEN NULL ELSE
-    'CY' || (extract(year from a6.flight_dt)::int - CASE
-        WHEN extract(month from a6.flight_dt)::int < :anchor_month
-          OR (extract(month from a6.flight_dt)::int = :anchor_month
-              AND extract(day from a6.flight_dt)::int < :anchor_day)
-        THEN 1 ELSE 0 END)::text
-END"""
+# Contract Year for a flight's first_seen vs the request anchor (:anchor_month/:anchor_day): the
+# 12-month window [anchor, anchor+1y) containing the date, labelled by its START year.
+_CONTRACT_YEAR = """'CY' || (extract(year from a6.first_seen)::int - CASE
+        WHEN extract(month from a6.first_seen)::int < :anchor_month
+          OR (extract(month from a6.first_seen)::int = :anchor_month
+              AND extract(day from a6.first_seen)::int < :anchor_day)
+        THEN 1 ELSE 0 END)::text"""
 
 # flightsummary.flight_time is integer seconds (with some bad negatives) -> interval, NULL if < 0/null.
 _FLIGHT_TIME_FR = "CASE WHEN a6.flight_time >= 0 THEN a6.flight_time * interval '1 second' ELSE NULL END"
 
 
+def _ne(expr: str) -> str:
+    """nullif(expr, '') — treat an empty string code as absent so it never matches a lookup."""
+    return f"nullif({expr}, '')"
+
+
+def _geo_lookup(iata_expr: str, icao_expr: str) -> str:
+    """One airport's geography by PRIORITY, per-field: for each of city / country / airport_name /
+    lat / lon, take the value from the lowest-priority source that has it non-empty. Priority:
+    main.virtual_airport_list by IATA (1) -> flightradar.airports by IATA (2) -> main.airports by
+    IATA (3) -> main.airports by ICAO (4). Per-field (not per-row) so a high-priority source that
+    has coordinates but an empty city does not shadow a populated city from the next source."""
+    return f"""(
+        SELECT
+            (array_agg(city         ORDER BY pri) FILTER (WHERE city         IS NOT NULL))[1] AS city,
+            (array_agg(country      ORDER BY pri) FILTER (WHERE country      IS NOT NULL))[1] AS country,
+            (array_agg(airport_name ORDER BY pri) FILTER (WHERE airport_name IS NOT NULL))[1] AS airport_name,
+            (array_agg(lat          ORDER BY pri) FILTER (WHERE lat          IS NOT NULL))[1] AS lat,
+            (array_agg(lon          ORDER BY pri) FILTER (WHERE lon          IS NOT NULL))[1] AS lon
+        FROM (
+            SELECT nullif("City",'') AS city, nullif("Country",'') AS country,
+                   nullif("Airport Name",'') AS airport_name, "Latitude" AS lat, "Longitude" AS lon, 1 AS pri
+              FROM main.virtual_airport_list WHERE "IATA Code" = {iata_expr}
+            UNION ALL
+            SELECT nullif(city,''), nullif(country_name,''), nullif(name,''), lat, lon, 2
+              FROM flightradar.airports WHERE iata = {iata_expr}
+            UNION ALL
+            SELECT nullif(city,''), nullif(country,''), nullif(name,''), latitude, longitude, 3
+              FROM main.airports WHERE iata = {iata_expr}
+            UNION ALL
+            SELECT nullif(city,''), nullif(country,''), nullif(name,''), latitude, longitude, 4
+              FROM main.airports WHERE icao = {icao_expr}
+        ) s
+    )"""
+
+
+def _great_circle(o: str, d: str) -> str:
+    """Haversine great-circle distance in KM (matches flightsummary.circle_distance's unit) between
+    aliases `o` and `d` (each exposing .lat/.lon); NULL if either coordinate pair is absent."""
+    return (f"2 * 6371 * asin(sqrt( power(sin(radians(({d}.lat - {o}.lat) / 2)), 2) + "
+            f"cos(radians({o}.lat)) * cos(radians({d}.lat)) * "
+            f"power(sin(radians(({d}.lon - {o}.lon) / 2)), 2) ))")
+
+
 def _assemble_sql(a5_where: str) -> str:
+    # origin/destination coordinate lookups for the Circle Distance (2.4): IATA-first, ICAO fallback.
+    o_geo = _geo_lookup(_ne("a6.orig_iata"), _ne("a6.orig_icao"))
+    d_geo = _geo_lookup(f'coalesce({_ne("a6.dest_iata_actual")}, {_ne("a6.dest_iata")})',
+                        f'coalesce({_ne("a6.dest_icao_actual")}, {_ne("a6.dest_icao")})')
     return f"""
 INSERT INTO forecast.acys_actuals
     ("Registration","Period","Date","Time Departed","Time Landed",
@@ -88,104 +142,118 @@ WITH array5 AS (
     ORDER BY ca."Registration", to_date(r.period,'MM-YYYY'), ca.revision_id DESC
 ),
 array6 AS (
-    SELECT f.reg, f.datetime_takeoff, f.datetime_landed,
+    SELECT f.reg, f.first_seen, f.datetime_takeoff, f.datetime_landed,
            f.orig_iata, f.dest_iata, f.dest_iata_actual,
            f.orig_icao, f.dest_icao, f.dest_icao_actual,
-           f.circle_distance, f.flight_time,
-           coalesce(f.datetime_takeoff, f.first_seen) AS flight_dt
+           f.actual_distance, f.flight_time
     FROM flightradar.flightsummary f
     WHERE f.reg IN (SELECT registration FROM array5)
-      AND coalesce(f.datetime_takeoff, f.first_seen) >= :start_date
-      AND coalesce(f.datetime_takeoff, f.first_seen) <  :as_of
-      -- drop a flight with NO origin, or NO destination (neither actual nor planned)
-      AND nullif(f.orig_iata, '') IS NOT NULL
-      AND coalesce(nullif(f.dest_iata_actual, ''), nullif(f.dest_iata, '')) IS NOT NULL
+      AND f.first_seen >= :start_date
+      AND f.first_seen <  :as_of
+      -- DROP a flight with NO ICAO origin, or NO ICAO destination (neither actual nor planned)
+      AND nullif(f.orig_icao, '') IS NOT NULL
+      AND coalesce(nullif(f.dest_icao_actual, ''), nullif(f.dest_icao, '')) IS NOT NULL
 )
 SELECT
     a5.registration, a5.period,
-    CAST(a6.flight_dt AS date),
+    CAST(a6.first_seen AS date),
     a6.datetime_takeoff, a6.datetime_landed,
     a6.orig_iata, a6.dest_iata, a6.dest_iata_actual,
     a6.orig_icao, a6.dest_icao, a6.dest_icao_actual,
     a5.operator, a5.master_series, a5.manufacturer, a5.sub_series, a5.primary_usage,
     {_CONTRACT_YEAR},
-    a6.circle_distance,
+    {_great_circle('o', 'd')},
     (a6.datetime_landed - a6.datetime_takeoff),
     a5.agreed_value,
     a5.total_seats,
     a5.total_seats * CAST(:pax_factor AS double precision),
-    a6.circle_distance,
+    a6.actual_distance,
     {_FLIGHT_TIME_FR},
     a5.delivery_date, a5.lease_type, a5.lease_dry_wet, a5.operational_lessor
 FROM array5 a5
-LEFT JOIN array6 a6
+JOIN array6 a6
        ON a6.reg = a5.registration
-      AND date_trunc('month', a6.flight_dt) = a5.period_month
+      AND date_trunc('month', a6.first_seen) = a5.period_month
+LEFT JOIN LATERAL {o_geo} o ON true
+LEFT JOIN LATERAL {d_geo} d ON true
 """
 
 
-# Airport lookup CHAIN for one airport: main.airports by IATA -> main.airports by ICAO ->
-# flightradar.airports by IATA. `pri` orders the sources; LIMIT 1 takes the first that matched.
-def _airport_lookup(iata_expr: str, icao_expr: str) -> str:
-    return f"""(
-        SELECT city, country, airport_name, lat, lon FROM (
-            SELECT city, country, name AS airport_name, latitude AS lat, longitude AS lon, 1 AS pri
-              FROM main.airports WHERE iata = {iata_expr}
-            UNION ALL
-            SELECT city, country, name, latitude, longitude, 2
-              FROM main.airports WHERE icao = {icao_expr}
-            UNION ALL
-            SELECT city, country_name, name, lat, lon, 3
-              FROM flightradar.airports WHERE iata = {iata_expr}
-        ) s ORDER BY pri LIMIT 1
-    )"""
+# Columns carried verbatim from acys_actuals / acys_forecast into the merge panel.
+_PANEL_COLS = """"Registration","Period","Date","Time Departed","Time Landed",
+       "IATA Origin","IATA Destination","IATA Destination Actual",
+       "ICAO Origin","ICAO Destination","ICAO Destination Actual",
+       "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
+       "Contract Year","Circle Distance","Flight Time",
+       "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR",
+       "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor\""""
 
 
 def _merge_sql(final_scope: str) -> str:
-    # Panel columns carried verbatim from acys_actuals / acys_forecast (incl. the 4 Cirium
-    # lease/delivery fields). acys_summary derives two MORE from these — and ONLY acys_summary:
-    #   * Agreed Value obeys the "Wet" rule (Wet lease -> 0);
-    #   * Age = (Date - Delivery Date) in decimal years.
-    cols = """"Registration","Period","Date","Time Departed","Time Landed",
-           "IATA Origin","IATA Destination","IATA Destination Actual",
-           "ICAO Origin","ICAO Destination","ICAO Destination Actual",
-           "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
-           "Contract Year","Circle Distance","Flight Time",
-           "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR",
-           "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor\""""
-    # Same column order as `cols`, but Agreed Value = 0 for a Wet lease, then Age appended.
-    proj = """p."Registration", p."Period", p."Date", p."Time Departed", p."Time Landed",
-           p."IATA Origin", p."IATA Destination", p."IATA Destination Actual",
-           p."ICAO Origin", p."ICAO Destination", p."ICAO Destination Actual",
-           p."Operator", p."Master Series", p."Manufacturer", p."Aircraft Sub Series", p."Primary Usage",
-           p."Contract Year", p."Circle Distance", p."Flight Time",
-           CASE WHEN p."Lease Dry Wet" = 'Wet' THEN 0 ELSE p."Agreed Value" END,
-           p."Total Seats", p."Total PAX", p."Actual Distance FR", p."Flight Time FR",
-           p."Delivery Date", p."Lease Type", p."Lease Dry Wet", p."Operational Lessor",
-           round((p."Date" - p."Delivery Date")::numeric / 365.25, 2)"""
-    origin = _airport_lookup('p."IATA Origin"', 'p."ICAO Origin"')
-    dest = _airport_lookup('coalesce(p."IATA Destination Actual", p."IATA Destination")',
-                           'coalesce(p."ICAO Destination Actual", p."ICAO Destination")')
+    o_geo = _geo_lookup(_ne('p."IATA Origin"'), _ne('p."ICAO Origin"'))
+    dia, di = _ne('p."IATA Destination Actual"'), _ne('p."IATA Destination"')
+    dica, dic = _ne('p."ICAO Destination Actual"'), _ne('p."ICAO Destination"')
+    d_geo = _geo_lookup(f"coalesce({dia}, {di})", f"coalesce({dica}, {dic})")
     return f"""
 INSERT INTO forecast.acys_summary
-    ({cols},"Age","Data Type",
+    ("Registration","Period","Date","Time Departed","Time Landed",
+     "IATA Origin","IATA Destination","IATA Destination Actual",
+     "ICAO Origin","ICAO Destination","ICAO Destination Actual",
+     "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
+     "Contract Year","Circle Distance","Flight Time",
+     "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR",
+     "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor",
+     "Age","Data Type","# Of Flights",
      "Origin Country","Origin City","Origin Airport Name",
      "Destination Country","Destination City","Destination Airport Name",
      origin_lat, origin_lon, dest_lat, dest_lon)
 WITH panel AS (
     -- each branch tags its source so acys_summary rows carry Data Type = Actuals / Forecast
-    SELECT {cols}, 'Actuals' AS "Data Type" FROM forecast.acys_actuals
+    SELECT {_PANEL_COLS}, 'Actuals' AS "Data Type" FROM forecast.acys_actuals
     WHERE "Date" IS NOT NULL AND {final_scope}     -- flights only + THIS request's slice
     UNION ALL
-    SELECT {cols}, 'Forecast' AS "Data Type" FROM forecast.acys_forecast
+    SELECT {_PANEL_COLS}, 'Forecast' AS "Data Type" FROM forecast.acys_forecast
+),
+enriched AS (
+    SELECT p.*,
+           o.city AS o_city, o.country AS o_country, o.airport_name AS o_name, o.lat AS o_lat, o.lon AS o_lon,
+           d.city AS d_city, d.country AS d_country, d.airport_name AS d_name, d.lat AS d_lat, d.lon AS d_lon
+    FROM panel p
+    LEFT JOIN LATERAL {o_geo} o ON true
+    LEFT JOIN LATERAL {d_geo} d ON true
 )
-SELECT {proj}, p."Data Type",
-       o.country, o.city, o.airport_name,
-       d.country, d.city, d.airport_name,
-       o.lat, o.lon, d.lat, d.lon
-FROM panel p
-LEFT JOIN LATERAL {origin} o ON true
-LEFT JOIN LATERAL {dest} d ON true
+SELECT
+    "Registration","Period",
+    min("Date"), min("Time Departed"), max("Time Landed"),
+    "IATA Origin","IATA Destination","IATA Destination Actual",
+    "ICAO Origin","ICAO Destination","ICAO Destination Actual",
+    "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
+    "Contract Year",
+    sum("Circle Distance"),
+    sum("Flight Time"),
+    CASE WHEN "Lease Dry Wet" = 'Wet' THEN 0 ELSE "Agreed Value" END,
+    "Total Seats","Total PAX",
+    sum("Actual Distance FR"),
+    sum("Flight Time FR"),
+    "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor",
+    round((min("Date") - "Delivery Date")::numeric / 365.25, 2),
+    "Data Type",
+    count(*),
+    o_country, o_city, o_name,
+    d_country, d_city, d_name,
+    o_lat, o_lon, d_lat, d_lon
+FROM enriched
+GROUP BY
+    "Registration","Period",
+    "IATA Origin","IATA Destination","IATA Destination Actual",
+    "ICAO Origin","ICAO Destination","ICAO Destination Actual",
+    "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
+    "Contract Year",
+    "Agreed Value","Total Seats","Total PAX",
+    "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor",
+    "Data Type",
+    o_country, o_city, o_name, o_lat, o_lon,
+    d_country, d_city, d_name, d_lat, d_lon
 """
 
 
@@ -297,7 +365,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                                         base)).fetchall()
             tails_without_fr24 = [r[0] for r in miss]
 
-        # Step 2/4 — Fetching data: assemble acys_actuals (Cirium × FR24, date-respecting)
+        # Step 2/4 — Fetching data: assemble acys_actuals (Cirium × FR24, date-respecting, flights only)
         await _pub("running", "Fetching data", progress=random.randint(25, 49))
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_assemble_sql(a5_where)), base)
