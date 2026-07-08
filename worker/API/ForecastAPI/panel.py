@@ -5,11 +5,15 @@ forecast.acys_actuals (Cirium × FR24, date-respecting) then merges into forecas
 (airport-enriched + route-grouped). Mirrors predictive/panel in Core-API (SQL vendored).
 
 Tables:
-  * acys_actuals  — one row per FLIGHT (Cirium aircraft × its flightsummary flight). A request
+  * acys_actuals         — one row per FLIGHT (Cirium aircraft × its flightsummary flight). A request
                     DELETEs only ITS scope then re-inserts. Flights only (no aircraft-without-flight).
-  * acys_forecast — TRUNCATEd every request (populated later by the forecast model).
-  * acys_summary  — TRUNCATEd every request; rebuilt from acys_actuals (THIS request's flights)
-                    + acys_forecast, airport-enriched, then GROUPED by aircraft+month+route.
+  * acys_forecast        — TRUNCATEd every request (populated later by the forecast model).
+  * acys_summary_by_day  — TRUNCATEd + rebuilt every request from acys_actuals (THIS request's flights)
+                    + acys_forecast, airport-enriched. ONE ROW PER FLIGHT (no grouping); keeps Date /
+                    Time Departed / Time Landed.
+  * acys_summary_grouped — a DB VIEW over acys_summary_by_day (not written here): one row per
+                    (aircraft, month, route) with "# Of Flights" = count and the four metric columns
+                    summed, WITHOUT Date / Time Departed / Time Landed. For PBI Direct Query.
 
 Assemble (acys_actuals) — per FLIGHT:
   * aircraft (2.2) from cirium.ciriumaircrafts: latest revision per (Registration, Period-month) for
@@ -30,13 +34,14 @@ Airport coordinates / geography (2.4 distance + 2.6 enrichment) — by priority,
 the code wins: main.virtual_airport_list by IATA -> flightradar.airports by IATA -> main.airports by
 IATA -> main.airports by ICAO.
 
-acys_summary (2.6) — merge acys_actuals + acys_forecast, add Age / geography / Origin&Dest lat-lon /
-# Of Flights / Data Type, then GROUP identical (aircraft, month, route):
+acys_summary_by_day (2.6) — merge acys_actuals + acys_forecast into ONE ROW PER FLIGHT, adding Age /
+geography / Origin&Dest lat-lon / Data Type:
   * Agreed Value = 0    — when Lease Dry Wet = 'Wet'.
   * Age                 — (Date - Delivery Date) in decimal years ((Date - Delivery Date)/365.25).
   * Data Type           — 'Actuals' (from acys_actuals) / 'Forecast' (from acys_forecast).
-  * # Of Flights        — count of grouped flights (same aircraft, month, route).
-  * SUMMED across the group: Actual Distance FR, Circle Distance, Flight Time FR, Flight Time.
+acys_summary_grouped (VIEW, not written here) rolls by_day up to one row per (aircraft, month, route):
+  * # Of Flights        — count of grouped flights; SUMS Actual Distance FR / Circle Distance /
+                          Flight Time FR / Flight Time; drops Date / Time Departed / Time Landed.
 """
 import random
 import time
@@ -195,70 +200,50 @@ _PANEL_COLS = """"Registration","Period","Date","Time Departed","Time Landed",
 
 
 def _merge_sql(final_scope: str) -> str:
+    # acys_summary_by_day: ONE ROW PER FLIGHT — panel + per-field geo enrichment + Wet rule + Age.
+    # NO grouping / NO "# Of Flights" (that lives in the acys_summary_grouped VIEW). Keeps Date /
+    # Time Departed / Time Landed.
     o_geo = _geo_lookup(_ne('p."IATA Origin"'), _ne('p."ICAO Origin"'))
     dia, di = _ne('p."IATA Destination Actual"'), _ne('p."IATA Destination"')
     dica, dic = _ne('p."ICAO Destination Actual"'), _ne('p."ICAO Destination"')
     d_geo = _geo_lookup(f"coalesce({dia}, {di})", f"coalesce({dica}, {dic})")
     return f"""
-INSERT INTO forecast.acys_summary
-    ("Registration","Period","Time Departed","Time Landed",
+INSERT INTO forecast.acys_summary_by_day
+    ("Registration","Period","Date","Time Departed","Time Landed",
      "IATA Origin","IATA Destination","IATA Destination Actual",
      "ICAO Origin","ICAO Destination","ICAO Destination Actual",
      "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
      "Contract Year","Circle Distance","Flight Time",
      "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR",
      "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor",
-     "Age","Data Type","# Of Flights",
+     "Age","Data Type",
      "Origin Country","Origin City","Origin Airport Name",
      "Destination Country","Destination City","Destination Airport Name",
      origin_lat, origin_lon, dest_lat, dest_lon)
 WITH panel AS (
-    -- each branch tags its source so acys_summary rows carry Data Type = Actuals / Forecast
+    -- each branch tags its source so rows carry Data Type = Actuals / Forecast
     SELECT {_PANEL_COLS}, 'Actuals' AS "Data Type" FROM forecast.acys_actuals
     WHERE "Date" IS NOT NULL AND {final_scope}     -- flights only + THIS request's slice
     UNION ALL
     SELECT {_PANEL_COLS}, 'Forecast' AS "Data Type" FROM forecast.acys_forecast
-),
-enriched AS (
-    SELECT p.*,
-           o.city AS o_city, o.country AS o_country, o.airport_name AS o_name, o.lat AS o_lat, o.lon AS o_lon,
-           d.city AS d_city, d.country AS d_country, d.airport_name AS d_name, d.lat AS d_lat, d.lon AS d_lon
-    FROM panel p
-    LEFT JOIN LATERAL {o_geo} o ON true
-    LEFT JOIN LATERAL {d_geo} d ON true
 )
 SELECT
-    "Registration","Period",
-    min("Time Departed"), max("Time Landed"),
-    "IATA Origin","IATA Destination","IATA Destination Actual",
-    "ICAO Origin","ICAO Destination","ICAO Destination Actual",
-    "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
-    "Contract Year",
-    sum("Circle Distance"),
-    sum("Flight Time"),
-    CASE WHEN "Lease Dry Wet" = 'Wet' THEN 0 ELSE "Agreed Value" END,
-    "Total Seats","Total PAX",
-    sum("Actual Distance FR"),
-    sum("Flight Time FR"),
-    "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor",
-    round((min("Date") - "Delivery Date")::numeric / 365.25, 2),
-    "Data Type",
-    count(*),
-    o_country, o_city, o_name,
-    d_country, d_city, d_name,
-    o_lat, o_lon, d_lat, d_lon
-FROM enriched
-GROUP BY
-    "Registration","Period",
-    "IATA Origin","IATA Destination","IATA Destination Actual",
-    "ICAO Origin","ICAO Destination","ICAO Destination Actual",
-    "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
-    "Contract Year",
-    "Agreed Value","Total Seats","Total PAX",
-    "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor",
-    "Data Type",
-    o_country, o_city, o_name, o_lat, o_lon,
-    d_country, d_city, d_name, d_lat, d_lon
+    p."Registration", p."Period", p."Date", p."Time Departed", p."Time Landed",
+    p."IATA Origin", p."IATA Destination", p."IATA Destination Actual",
+    p."ICAO Origin", p."ICAO Destination", p."ICAO Destination Actual",
+    p."Operator", p."Master Series", p."Manufacturer", p."Aircraft Sub Series", p."Primary Usage",
+    p."Contract Year", p."Circle Distance", p."Flight Time",
+    CASE WHEN p."Lease Dry Wet" = 'Wet' THEN 0 ELSE p."Agreed Value" END,
+    p."Total Seats", p."Total PAX", p."Actual Distance FR", p."Flight Time FR",
+    p."Delivery Date", p."Lease Type", p."Lease Dry Wet", p."Operational Lessor",
+    round((p."Date" - p."Delivery Date")::numeric / 365.25, 2),
+    p."Data Type",
+    o.country, o.city, o.airport_name,
+    d.country, d.city, d.airport_name,
+    o.lat, o.lon, d.lat, d.lon
+FROM panel p
+LEFT JOIN LATERAL {o_geo} o ON true
+LEFT JOIN LATERAL {d_geo} d ON true
 """
 
 
@@ -365,7 +350,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         async with db_client.session(_DB) as s:
             await s.execute(text(hist_delete), scope_params)
             await s.execute(text("TRUNCATE forecast.acys_forecast"))
-            await s.execute(text("TRUNCATE forecast.acys_summary"))
+            await s.execute(text("TRUNCATE forecast.acys_summary_by_day"))
             await s.commit()
         async with db_client.session(_DB) as s:
             miss = (await s.execute(text(_MISSING_TAILS_TMPL.format(a5_where=a5_where)),
