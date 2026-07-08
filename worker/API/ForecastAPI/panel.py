@@ -201,7 +201,7 @@ def _merge_sql(final_scope: str) -> str:
     d_geo = _geo_lookup(f"coalesce({dia}, {di})", f"coalesce({dica}, {dic})")
     return f"""
 INSERT INTO forecast.acys_summary
-    ("Registration","Period","Date","Time Departed","Time Landed",
+    ("Registration","Period","Time Departed","Time Landed",
      "IATA Origin","IATA Destination","IATA Destination Actual",
      "ICAO Origin","ICAO Destination","ICAO Destination Actual",
      "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
@@ -229,7 +229,7 @@ enriched AS (
 )
 SELECT
     "Registration","Period",
-    min("Date"), min("Time Departed"), max("Time Landed"),
+    min("Time Departed"), max("Time Landed"),
     "IATA Origin","IATA Destination","IATA Destination Actual",
     "ICAO Origin","ICAO Destination","ICAO Destination Actual",
     "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
