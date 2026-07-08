@@ -39,6 +39,7 @@ acys_summary (2.6) — merge acys_actuals + acys_forecast, add Age / geography /
   * SUMMED across the group: Actual Distance FR, Circle Distance, Flight Time FR, Flight Time.
 """
 import random
+import time
 from datetime import date
 
 from sqlalchemy import text
@@ -330,12 +331,22 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             "anchor_month": as_of.month, "anchor_day": as_of.day,
             "pax_factor": FORECAST_PAX_LOAD_FACTOR, **scope_params}
 
+    t0 = time.monotonic()   # ETA baseline: seconds-remaining is extrapolated from elapsed vs progress
+
     async def _pub(state, message, progress=None, payload=None):
+        # ETA (seconds remaining) rides in `payload.eta`: linear extrapolation elapsed*(100-p)/p.
+        # It is exposed by GET /status (payload) and the live SSE event (which now carries payload).
+        data = dict(payload) if payload else {}
+        if state == "success":
+            data["eta"] = 0
+        elif state != "error" and progress and 0 < progress < 100:
+            elapsed = time.monotonic() - t0
+            data["eta"] = max(0, round(elapsed * (100 - progress) / progress))
         kwargs = {}
         if progress is not None:
             kwargs["progress"] = progress
-        if payload is not None:
-            kwargs["payload"] = payload
+        if data:
+            kwargs["payload"] = data
         await publish_status(db_client, redis, job_id=job_id, kind="external", ref=ref,
                              state=state, message=message, **kwargs)
 
