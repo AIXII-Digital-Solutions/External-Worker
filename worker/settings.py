@@ -70,6 +70,17 @@ FLIGHT_RADAR_MAX_REG_PER_BATCH: int = require_env("FLIGHT_RADAR_MAX_REG_PER_BATC
 # Forecast coverage ledger: a per-tail no-fly gap of >= this many days is treated as a MISSING range
 # (fetched from FR24), shorter gaps are folded into the covered span. Bootstrap threshold.
 FLIGHT_RADAR_COVERAGE_GAP_DAYS: int = require_env("FLIGHT_RADAR_COVERAGE_GAP_DAYS", 7)
+# Forecast ETA estimation (seconds). One FR24 flight-summary request takes ~0.5-15s; used as the
+# initial per-request estimate (then refined by measured wall time during the run). The two DB-step
+# estimates cover the assemble + merge phases.
+FR24_SECONDS_PER_REQUEST_EST: float = float(require_env("FR24_SECONDS_PER_REQUEST_EST", 8))
+FORECAST_ASSEMBLE_ETA_SECONDS: float = float(require_env("FORECAST_ASSEMBLE_ETA_SECONDS", 12))
+FORECAST_MERGE_ETA_SECONDS: float = float(require_env("FORECAST_MERGE_ETA_SECONDS", 8))
+# The FR24 fetch is BOUNDED per forecast run: after this many seconds the panel stops fetching and
+# proceeds with what it has (the coverage ledger keeps the fetched ranges; the rest are fetched on the
+# next run). The ARQ job timeout must exceed this budget + the assemble/merge time.
+FORECAST_FETCH_BUDGET_SECONDS: float = float(require_env("FORECAST_FETCH_BUDGET_SECONDS", 1500))
+FORECAST_JOB_TIMEOUT_SECONDS: int = int(require_env("FORECAST_JOB_TIMEOUT_SECONDS", 1800))
 FLIGHT_RADAR_HEADERS: dict = {
     "Authorization": f"Bearer {FLIGHT_RADAR_API_KEY}",
     "Accept-Version": "v1",

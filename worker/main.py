@@ -13,7 +13,7 @@ import os
 # shared Config (and anything importing it) is initialised.
 import settings  # noqa: F401
 
-from arq import cron
+from arq import cron, func
 from redis.asyncio import Redis
 
 from Config import setup_logger, DBSettings
@@ -73,8 +73,13 @@ class WorkerSettings:
     redis_settings = get_redis_settings()
     queue_name = EXTERNAL_QUEUE
     # ON_DEMAND: enqueued by core-api. SCHEDULED: enqueued by the dispatcher / run-now —
-    # both must be registered here so ARQ can resolve them by name.
-    functions = list(tasks.ON_DEMAND) + list(tasks.SCHEDULED)
+    # both must be registered here so ARQ can resolve them by name. forecast_panel does a bounded
+    # FR24 fetch that can exceed arq's default 300s job timeout, so it gets its own longer timeout.
+    functions = [
+        func(f, name="forecast_panel", timeout=settings.FORECAST_JOB_TIMEOUT_SECONDS)
+        if f is tasks.forecast_panel else f
+        for f in (list(tasks.ON_DEMAND) + list(tasks.SCHEDULED))
+    ]
     cron_jobs = _CRON_JOBS if SCHEDULER_ENABLED else []
     max_jobs = MAX_JOBS                       # concurrent jobs per process (env MAX_JOBS)
     on_startup = startup

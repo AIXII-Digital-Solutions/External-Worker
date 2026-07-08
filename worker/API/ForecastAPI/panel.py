@@ -44,13 +44,13 @@ acys_summary_grouped (VIEW, not written here) rolls by_day up to one row per (ai
                           Flight Time FR / Flight Time; drops Date / Time Departed / Time Landed.
 """
 import random
-import time
 from datetime import date, timedelta
 
 from sqlalchemy import text
 
 from Config import setup_logger
-from settings import FORECAST_PAX_LOAD_FACTOR
+from settings import (FORECAST_PAX_LOAD_FACTOR, FORECAST_ASSEMBLE_ETA_SECONDS,
+                      FORECAST_MERGE_ETA_SECONDS, FORECAST_FETCH_BUDGET_SECONDS)
 from status import publish_status
 
 logger = setup_logger("forecast_panel")
@@ -306,17 +306,18 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             "anchor_month": as_of.month, "anchor_day": as_of.day,
             "pax_factor": FORECAST_PAX_LOAD_FACTOR, **scope_params}
 
-    t0 = time.monotonic()   # ETA baseline: seconds-remaining is extrapolated from elapsed vs progress
+    # ETA model: the dominant, variable cost is the FR24 fetch (each request ~0.5-15s); the panel
+    # estimates it from the number of missing ranges and the MEASURED per-request time, plus small
+    # fixed estimates for the assemble + merge DB steps. `eta` (seconds) is passed explicitly per
+    # publish and rides in payload.eta (exposed by GET /status and the live SSE event).
+    _db_eta = FORECAST_ASSEMBLE_ETA_SECONDS + FORECAST_MERGE_ETA_SECONDS
 
-    async def _pub(state, message, progress=None, payload=None):
-        # ETA (seconds remaining) rides in `payload.eta`: linear extrapolation elapsed*(100-p)/p.
-        # It is exposed by GET /status (payload) and the live SSE event (which now carries payload).
+    async def _pub(state, message, progress=None, eta=None, payload=None):
         data = dict(payload) if payload else {}
         if state == "success":
             data["eta"] = 0
-        elif state != "error" and progress and 0 < progress < 100:
-            elapsed = time.monotonic() - t0
-            data["eta"] = max(0, round(elapsed * (100 - progress) / progress))
+        elif eta is not None:
+            data["eta"] = max(0, round(eta))
         kwargs = {}
         if progress is not None:
             kwargs["progress"] = progress
@@ -324,6 +325,12 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             kwargs["payload"] = data
         await publish_status(db_client, redis, job_id=job_id, kind="external", ref=ref,
                              state=state, message=message, **kwargs)
+
+    async def _on_fetch(fetch_seconds_remaining):
+        # live ETA during the (silent) FR24 fetch: remaining fetch time + the DB steps still to come.
+        # Progress is held at the top of the "Searching historical data" band; message is unchanged.
+        await _pub("running", "Searching historical data", progress=15,
+                   eta=fetch_seconds_remaining + _db_eta)
 
     try:
         # Step 1/4 — Searching historical data: validate the scope, reset the per-request tables
@@ -351,10 +358,11 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         from API.FlightRadarAPI.coverage import fetch_missing_ranges   # lazy: avoid import cycle
         coverage = await fetch_missing_ranges(
             db_client, list(scope_regs),
-            w_start=_cy2022_floor(as_of), w_end=date.today() - timedelta(days=1))
+            w_start=_cy2022_floor(as_of), w_end=date.today() - timedelta(days=1),
+            time_budget_s=FORECAST_FETCH_BUDGET_SECONDS, on_progress=_on_fetch)
 
         # Step 2/4 — Fetching data: assemble acys_actuals (Cirium × FR24, date-respecting, flights only)
-        await _pub("running", "Fetching data", progress=random.randint(25, 49))
+        await _pub("running", "Fetching data", progress=random.randint(25, 49), eta=_db_eta)
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_assemble_sql(a5_where)), base)
             history_rows = res.rowcount
@@ -362,10 +370,12 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
 
         # Step 3/4 — Creating predictive analysis
         await _pub("running", "Creating predictive analysis", progress=random.randint(55, 70),
+                   eta=FORECAST_MERGE_ETA_SECONDS,
                    payload={"history_rows": history_rows, "coverage": coverage})
 
         # Step 4/4 — Building dataset: merge into acys_summary (this request's flights only + forecast)
-        await _pub("running", "Building dataset", progress=random.randint(80, 90))
+        await _pub("running", "Building dataset", progress=random.randint(80, 90),
+                   eta=FORECAST_MERGE_ETA_SECONDS)
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_merge_sql(final_scope)), scope_params)
             final_rows = res.rowcount
