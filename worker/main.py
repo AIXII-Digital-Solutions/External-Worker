@@ -82,5 +82,6 @@ class WorkerSettings:
     ]
     cron_jobs = _CRON_JOBS if SCHEDULER_ENABLED else []
     max_jobs = MAX_JOBS                       # concurrent jobs per process (env MAX_JOBS)
+    allow_abort_jobs = True                   # lets core-api POST /status/{job_id}/cancel abort a run
     on_startup = startup
     on_shutdown = shutdown

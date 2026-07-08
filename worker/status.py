@@ -19,7 +19,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from Database import JobStatus
 
 STATUS_CHANNEL = "status:events"
-TERMINAL_STATES = {"success", "error", "skipped"}
+TERMINAL_STATES = {"success", "error", "skipped", "cancelled"}
 
 # Sentinel so "not passed" is distinguishable from an explicit None.
 _UNSET = object()
