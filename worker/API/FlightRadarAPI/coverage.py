@@ -135,7 +135,7 @@ async def fetch_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_
     ~2s, capped by the remaining budget). Never raises (except the internal budget stop, handled here).
     """
     gap_days = FLIGHT_RADAR_COVERAGE_GAP_DAYS if gap_days is None else gap_days
-    regs = list(regs)
+    regs = [r for r in regs if r]   # drop NULL/empty registrations — cannot be fetched from FR24
 
     # PRE-PASS: seed + compute each reg's missing ranges, group tails by identical (from, to).
     groups: dict = {}   # (gf, gt) -> [regs]
