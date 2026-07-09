@@ -126,6 +126,8 @@ FLIGHT_RADAR_FORCE_RECHECK_MISS: int = require_env("FLIGHT_RADAR_FORCE_RECHECK_M
 # Forecast panel
 # Total PAX = Total Seats * this load factor (acys_actuals). Tunable via env; default 0.8.
 FORECAST_PAX_LOAD_FACTOR: float = float(require_env("FORECAST_PAX_LOAD_FACTOR", 0.8))
+# Forward forecast horizon: from the coverage frontier to (request date + this many years).
+FORECAST_HORIZON_YEARS: int = int(require_env("FORECAST_HORIZON_YEARS", 2))
 
 
 # Aviation Edge
