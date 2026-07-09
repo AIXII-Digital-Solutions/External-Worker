@@ -311,6 +311,7 @@ FROM cirium.ciriumaircrafts ca
 JOIN cirium.aircraftrevision r ON r.id = ca.revision_id
 WHERE {a5_where}
   AND to_date(r.period,'MM-YYYY') >= :start_date
+  AND ca."Registration" IS NOT NULL AND ca."Registration" <> ''
 """
 
 
