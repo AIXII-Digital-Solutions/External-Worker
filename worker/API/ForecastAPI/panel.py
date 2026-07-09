@@ -150,7 +150,18 @@ WITH array5 AS (
     JOIN cirium.aircraftrevision r ON r.id = ca.revision_id
     WHERE {a5_where}
       AND to_date(r.period,'MM-YYYY') >= :start_date
-    ORDER BY ca."Registration", to_date(r.period,'MM-YYYY'), ca.revision_id DESC
+      -- ONE authoritative operator per (Registration, month): Cirium lists a wet-leased/ACMI tail under
+      -- MULTIPLE operators for the same month, and acys_actuals accumulates per-operator, so the same
+      -- flight would be stored under each. Keep only the tail whose (revision, id) is the newest (closest
+      -- to today) for that month; a non-authoritative operator's request assembles nothing for it.
+      AND NOT EXISTS (
+          SELECT 1 FROM cirium.ciriumaircrafts ca2
+          JOIN cirium.aircraftrevision r2 ON r2.id = ca2.revision_id
+          WHERE ca2."Registration" = ca."Registration"
+            AND to_date(r2.period,'MM-YYYY') = to_date(r.period,'MM-YYYY')
+            AND (ca2.revision_id, ca2.id) > (ca.revision_id, ca.id)
+      )
+    ORDER BY ca."Registration", to_date(r.period,'MM-YYYY'), ca.revision_id DESC, ca.id DESC
 ),
 array6 AS (
     SELECT f.reg, f.first_seen, f.datetime_takeoff, f.datetime_landed,
@@ -189,6 +200,50 @@ JOIN array6 a6
       AND date_trunc('month', a6.first_seen) = a5.period_month
 LEFT JOIN LATERAL {o_geo} o ON true
 LEFT JOIN LATERAL {d_geo} d ON true
+"""
+
+
+def _future_aircraft_sql(a5_where: str) -> str:
+    """Future-delivery aircraft (Delivery Date > the request date) inserted into acys_actuals as FLIGHTLESS
+    stubs (Date + all flight fields NULL) so the forecast model can see the FORWARD fleet. They are NOT
+    fetched from / checked against FlightRadar and NOT dropped for having no flights. The delivery date is
+    read from the LATEST revision of EACH plan (Commercial AND Business&Helicopters — an aircraft sits in one
+    plan; taking the latest of both covers both), deduped per Registration."""
+    return f"""
+INSERT INTO forecast.acys_actuals
+    ("Registration","Period","Date","Time Departed","Time Landed",
+     "IATA Origin","IATA Destination","IATA Destination Actual",
+     "ICAO Origin","ICAO Destination","ICAO Destination Actual",
+     "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
+     "Contract Year","Circle Distance","Flight Time",
+     "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR",
+     "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor")
+WITH latest_rev AS (   -- the latest revision of EACH plan_type (Commercial, Business&Helicopters)
+    SELECT DISTINCT ON (plan_type) id
+    FROM cirium.aircraftrevision
+    ORDER BY plan_type, to_date(period,'MM-YYYY') DESC, id DESC
+)
+SELECT DISTINCT ON (ca."Registration")
+    ca."Registration",
+    to_char(ca."Delivery Date", 'MM-YYYY'),                 -- Period = arrival month
+    NULL::date, NULL, NULL,                                 -- Date, Time Departed/Landed
+    NULL, NULL, NULL, NULL, NULL, NULL,                     -- IATA/ICAO origin & destination(+actual)
+    ca."Operator", ca."Master Series", ca."Manufacturer", ca."Aircraft Sub Series", ca."Primary Usage",
+    NULL,                                                   -- Contract Year (no flight)
+    NULL::double precision, NULL::interval,                 -- Circle Distance, Flight Time
+    ca."Indicative Market Value (US$m)", ca."Number of Seats",
+    NULL::double precision,                                 -- Total PAX (no flight)
+    NULL::double precision, NULL::interval,                 -- Actual Distance FR, Flight Time FR
+    ca."Delivery Date", ca."Lease Type", ca."Lease Dry / Wet", ca."Operational Lessor"
+FROM cirium.ciriumaircrafts ca
+JOIN latest_rev lr ON lr.id = ca.revision_id
+WHERE {a5_where} AND ca."Delivery Date" > :as_of
+  -- one authoritative operator per future tail (newest revision/id wins), same as the flight assemble
+  AND NOT EXISTS (
+      SELECT 1 FROM cirium.ciriumaircrafts ca2 JOIN latest_rev lr2 ON lr2.id = ca2.revision_id
+      WHERE ca2."Registration" = ca."Registration" AND (ca2.revision_id, ca2.id) > (ca.revision_id, ca.id)
+  )
+ORDER BY ca."Registration", ca.revision_id DESC, ca.id DESC
 """
 
 
@@ -384,12 +439,34 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_assemble_sql(a5_where)), base)
             history_rows = res.rowcount
+            # future-delivery aircraft (forward fleet) as flightless stubs — no FR24, never dropped
+            fut = await s.execute(text(_future_aircraft_sql(a5_where)), base)
+            future_aircraft = fut.rowcount
             await s.commit()
 
-        # Step 3/4 — Creating predictive analysis
+        # Step 3/4 — Creating predictive analysis: forecast forward (acys_actuals ONLY) → acys_forecast_by_day
+        await _ck()
         await _pub("running", "Creating predictive analysis", progress=random.randint(55, 70),
                    eta=FORECAST_MERGE_ETA_SECONDS,
                    payload={"history_rows": history_rows, "coverage": coverage})
+        from API.ForecastAPI.model import run_forecast_model   # lazy: model imports panel helpers
+        # forecast per operator in scope: the explicit operator, else the operators of the scoped tails
+        async with db_client.session(_DB) as s:
+            if operator:
+                fc_ops = [operator]
+            else:
+                fc_ops = (await s.execute(
+                    text(f'SELECT DISTINCT "Operator" FROM forecast.acys_actuals WHERE {final_scope} '
+                         'AND "Operator" IS NOT NULL'), scope_params)).scalars().all()
+        forecast_rows = 0
+        for op in fc_ops:
+            await _ck()
+            async with db_client.session(_DB) as s:
+                # scope the forecast source to THIS request's tails (acys_actuals accumulates across
+                # requests) so a registrations-scoped run does not forecast sibling tails
+                fr = await run_forecast_model(session=s, operator=op, as_of=as_of,
+                                              scope_where=final_scope, scope_params=scope_params)
+            forecast_rows += fr.get("forecast_rows", 0)
 
         # Step 4/4 — Building dataset: merge into acys_summary (this request's flights only + forecast)
         await _ck()
@@ -420,10 +497,12 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             "mode": "+".join((["operator"] if operator else []) + (["registrations"] if registrations else [])),
             "operator": operator, "registrations": list(registrations) if registrations else None,
             "as_of": as_of.isoformat(),
-            "history_rows": history_rows, "final_rows": final_rows,
+            "history_rows": history_rows, "future_aircraft": future_aircraft,
+            "forecast_rows": forecast_rows, "final_rows": final_rows,
             "coverage": coverage,
         }
-        await _pub("success", f"Completed — actuals {history_rows}, summary {final_rows}",
+        await _pub("success",
+                   f"Completed — actuals {history_rows}, future {future_aircraft}, forecast {forecast_rows}, summary {final_rows}",
                    progress=100, payload=summary)
         logger.info("forecast_panel done: %s", summary)
         return summary
