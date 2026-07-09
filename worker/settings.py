@@ -88,12 +88,20 @@ FLIGHT_RADAR_MAX_REG_PER_BATCH: int = require_env("FLIGHT_RADAR_MAX_REG_PER_BATC
 # Forecast coverage ledger: a per-tail no-fly gap of >= this many days is treated as a MISSING range
 # (fetched from FR24), shorter gaps are folded into the covered span. Bootstrap threshold.
 FLIGHT_RADAR_COVERAGE_GAP_DAYS: int = require_env("FLIGHT_RADAR_COVERAGE_GAP_DAYS", 7)
-# Forecast ETA estimation (seconds). One FR24 flight-summary request takes ~0.5-15s; used as the
-# initial per-request estimate (then refined by measured wall time during the run). The two DB-step
-# estimates cover the assemble + merge phases.
+# Forecast progress/ETA — self-calibrating (forecast_step_timings moving average). These are BOOTSTRAP
+# SEEDS only: used for a step that has no ledger history yet (first runs), then never again once that
+# step records a real timing. One data request takes ~0.5-15s (per-request seed); the two DB-step seeds
+# cover the assemble + merge phases.
 FR24_SECONDS_PER_REQUEST_EST: float = float(require_env("FR24_SECONDS_PER_REQUEST_EST", 8))
 FORECAST_ASSEMBLE_ETA_SECONDS: float = float(require_env("FORECAST_ASSEMBLE_ETA_SECONDS", 12))
 FORECAST_MERGE_ETA_SECONDS: float = float(require_env("FORECAST_MERGE_ETA_SECONDS", 8))
+# Heartbeat: how often the panel republishes progress + ETA WHILE a step runs (constant live push).
+FORECAST_PROGRESS_HEARTBEAT_SECONDS: float = float(require_env("FORECAST_PROGRESS_HEARTBEAT_SECONDS", 2))
+# Moving-average window (days) for reading the forecast_step_timings calibration ledger.
+FORECAST_CALIB_WINDOW_DAYS: int = int(require_env("FORECAST_CALIB_WINDOW_DAYS", 30))
+# Bootstrap seeds for the two steps without a per-request/per-operator seed above (first runs only).
+FORECAST_BOOT_SEARCH_SECONDS: float = float(require_env("FORECAST_BOOT_SEARCH_SECONDS", 3))
+FORECAST_BOOT_FORECAST_PER_OP_SECONDS: float = float(require_env("FORECAST_BOOT_FORECAST_PER_OP_SECONDS", 2))
 # The FR24 fetch is BOUNDED per forecast run: after this many seconds the panel stops fetching and
 # proceeds with what it has (the coverage ledger keeps the fetched ranges; the rest are fetched on the
 # next run). The ARQ job timeout must exceed this budget + the assemble/merge time.
