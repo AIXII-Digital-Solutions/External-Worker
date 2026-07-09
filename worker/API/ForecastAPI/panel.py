@@ -53,8 +53,8 @@ from Config import setup_logger
 from settings import (FORECAST_PAX_LOAD_FACTOR, FORECAST_ASSEMBLE_ETA_SECONDS,
                       FORECAST_MERGE_ETA_SECONDS, FORECAST_FETCH_BUDGET_SECONDS,
                       FR24_SECONDS_PER_REQUEST_EST, FORECAST_PROGRESS_HEARTBEAT_SECONDS,
-                      FORECAST_CALIB_WINDOW_DAYS, FORECAST_BOOT_SEARCH_SECONDS,
-                      FORECAST_BOOT_FORECAST_PER_OP_SECONDS)
+                      FORECAST_PROGRESS_MIN_INTERVAL_SECONDS, FORECAST_CALIB_WINDOW_DAYS,
+                      FORECAST_BOOT_SEARCH_SECONDS, FORECAST_BOOT_FORECAST_PER_OP_SECONDS)
 from status import publish_status
 
 logger = setup_logger("forecast_panel")
@@ -424,7 +424,8 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         cal.estimate("merge",    boot_flat=FORECAST_MERGE_ETA_SECONDS),
     ]
     reporter = ProgressReporter(publish=_pub, steps=steps, estimates=estimates,
-                                heartbeat_s=FORECAST_PROGRESS_HEARTBEAT_SECONDS)
+                                heartbeat_s=FORECAST_PROGRESS_HEARTBEAT_SECONDS,
+                                min_interval=FORECAST_PROGRESS_MIN_INTERVAL_SECONDS)
 
     try:
         await reporter.start()
@@ -459,7 +460,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         reporter.set_units(0, n_regs)
 
         async def _plan_progress(done, total):
-            reporter.set_units(done, total)
+            await reporter.tick(done, total)
 
         plan_info = await plan_missing_ranges(
             db_client, list(scope_regs),
@@ -477,7 +478,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         await reporter.enter("fetch", unit_total=total_requests)
 
         async def _fetch_progress(done, total):
-            reporter.set_units(done, total)
+            await reporter.tick(done, total)
 
         coverage = await fetch_planned_ranges(
             db_client, plan_info["plan"], total_requests,
@@ -531,7 +532,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                 fr = await run_forecast_model(session=s, operator=op, as_of=as_of,
                                               scope_where=final_scope, scope_params=scope_params)
             forecast_rows += fr.get("forecast_rows", 0)
-            reporter.set_units(idx + 1, n_ops)
+            await reporter.tick(idx + 1, n_ops)
         d = await reporter.complete()
         await cal.record("forecast", d, n_ops,
                          {"operators": len(fc_ops), "forecast_rows": forecast_rows})
