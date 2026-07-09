@@ -1,15 +1,21 @@
-"""Thin vertical slice (handoff_v2 §5.2) — the observable anchor panel for ONE schedule-bucket carrier.
+"""Observable anchor panel — built from forecast.acys_actuals ONLY (hard constraint: the forecast reads
+no other table; rows never duplicate, so the growing dump is safe to re-fit on = self-training).
 
-Anchor decomposition (top-down, fleet-anchored), read straight off the data per (sub-fleet, month):
-    cycles = N_insvc × availability × active_days_per_tail × cyc_per_active_day
+Anchor decomposition per (sub-fleet, month), read straight off acys_actuals:
+    flights = flown_tails × active_days_per_tail × cyc_per_active_day
 where
-  * N_insvc            = in-service tails per month (Cirium, clean per-month operator attribution),
-  * availability       = flown tails / in-service tails,
-  * active_days_per_tail = mean days a flown tail actually flew that month (carries seasonality),
-  * cyc_per_active_day = cycles per flown-tail-day (the binding intensity for SHORT-haul; use bh/day
-                         for LONG-haul — see leg class from med_haul).
-The forward forecast (next module) = replicate the plateau (last ~12 mo, held flat) × N(t) × the
-seasonal active-days shape. This module only BUILDS + READS the observable panel; no forecast yet.
+  * flown_tails         = distinct Registration that flew  (the observable active fleet — there is NO
+                          in-service register here, so availability drops out; only flown tails are seen),
+  * active_days_per_tail = mean days a flown tail actually flew that month  (carries seasonality),
+  * cyc_per_active_day  = cycles per flown-tail-day  (binding intensity; bh/day for long-haul).
+Sub-fleet grain = Cirium `Master Series` string as stored IN acys_actuals (stable; no Cirium lookup).
+
+Forward forecast (next module): project the flown-fleet + intensity plateau (recent months, held flat) ×
+the typical-year seasonal shape — all from acys. There is no forward fleet register to lean on, so the
+fleet itself is projected from recent activity (this is the honest cost of the acys-only constraint).
+
+Window (dynamic): floor = HISTORY_START (2022-07-01); the usable frontier is auto-detected because the
+most recent months are always under-covered by FR24 lag and back-fill on later extractions.
 
 Run: python -m predictive.slice --carrier "SCAT Airlines"
 """
@@ -20,65 +26,74 @@ import asyncio
 
 from predictive.db import DB
 
-HISTORY_START = "2023-07-01"   # clean Cirium monthly attribution starts here (handoff_v2 §1)
-GRAIN = "Master Series"        # anchor unit: type × generation, STABLE month-to-month (not the churny
-                               # "Aircraft Sub Series" — ACF/P2F/XLR relabelling broke per-unit availability)
+HISTORY_START = "2022-07-01"   # CY2022 floor (fixed by spec); acys has no rows before this
 
-# per (sub-fleet, month) observable panel. $1 = carrier (Cirium Operator = acys_actuals Operator).
-# BOTH sides derive the sub-fleet grain from Cirium by (reg, month) so the in-service and flown keys
-# ALWAYS align — acys_actuals' own stored sub-series is NOT trusted (it drifts vs the current revision).
+# per (sub-fleet, month) observable panel, forecast.acys_actuals ONLY. $1 = Operator.
 _PANEL_SQL = """
-WITH cm AS (   -- per (reg, month) latest Cirium revision -> status + grain + seats
-    SELECT DISTINCT ON (ca."Registration", to_date(r.period,'MM-YYYY'))
-        ca."Registration"          AS reg,
-        to_date(r.period,'MM-YYYY') AS mon,
-        ca."Status"                AS status,
-        coalesce(nullif(ca."{grain}",''), 'NA') AS sf,
-        ca."Number of Seats"       AS seats
-    FROM cirium.ciriumaircrafts ca
-    JOIN cirium.aircraftrevision r ON r.id = ca.revision_id
-    WHERE ca."Operator" = $1 AND to_date(r.period,'MM-YYYY') >= date '{start}'
-    ORDER BY ca."Registration", to_date(r.period,'MM-YYYY'), ca.revision_id DESC
-),
-insvc AS (   -- in-service fleet N and representative seats per (grain, month)
-    SELECT sf, mon, count(*) AS n_insvc,
-           percentile_cont(0.5) WITHIN GROUP (ORDER BY seats) AS seats_med
-    FROM cm WHERE status = 'In Service' GROUP BY sf, mon
-),
-fa AS (   -- acys flights re-keyed to the SAME Cirium grain via (reg, month)
-    SELECT cm.sf AS sf, a.mon, a.reg, a.fdate, a.ft, a.km
-    FROM (SELECT "Registration" AS reg, to_date("Period",'MM-YYYY') AS mon,
-                 "Date" AS fdate, "Flight Time" AS ft, "Circle Distance" AS km
-          FROM forecast.acys_actuals WHERE "Operator" = $1) a
-    JOIN cm ON cm.reg = a.reg AND cm.mon = a.mon
-),
-fl AS (   -- monthly flight aggregates per (grain, month)
-    SELECT sf, mon,
-           count(*)                              AS cycles,
-           count(DISTINCT reg)                   AS flown,
-           count(DISTINCT (reg, fdate))          AS active_tail_days,
-           sum(extract(epoch FROM ft))/3600.0    AS block_hours,
-           percentile_cont(0.5) WITHIN GROUP (ORDER BY km) AS med_haul,
-           sum(km)                               AS sum_km
-    FROM fa GROUP BY sf, mon
-)
-SELECT to_char(i.mon,'YYYY-MM')                              AS ym,
-       i.mon, i.sf, i.n_insvc, i.seats_med,
-       fl.flown, fl.cycles, fl.active_tail_days, fl.block_hours, fl.med_haul, fl.sum_km,
-       (fl.flown::float / nullif(i.n_insvc,0))               AS availability,
-       (fl.active_tail_days::float / nullif(fl.flown,0))     AS active_days_per_tail,
-       (fl.cycles::float / nullif(fl.active_tail_days,0))    AS cyc_per_active_day,
-       (fl.block_hours   / nullif(fl.active_tail_days,0))    AS bh_per_active_day
-FROM insvc i
-LEFT JOIN fl ON fl.sf = i.sf AND fl.mon = i.mon
-ORDER BY i.sf, i.mon
+SELECT to_char(date_trunc('month',"Date"),'YYYY-MM')                 AS ym,
+       date_trunc('month',"Date")::date                             AS mon,
+       coalesce(nullif("Master Series",''),'NA')                    AS sf,
+       count(DISTINCT "Registration")                               AS flown,
+       count(DISTINCT ("Registration","Date"))                      AS active_tail_days,
+       count(*)                                                     AS cycles,
+       sum(extract(epoch FROM "Flight Time"))/3600.0                AS block_hours,
+       sum("Circle Distance")                                       AS sum_km,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY "Circle Distance") AS med_haul,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY "Total Seats")    AS seats_med,
+       (count(DISTINCT ("Registration","Date"))::float
+          / nullif(count(DISTINCT "Registration"),0))               AS active_days_per_tail,
+       (count(*)::float
+          / nullif(count(DISTINCT ("Registration","Date")),0))      AS cyc_per_active_day,
+       (sum(extract(epoch FROM "Flight Time"))/3600.0
+          / nullif(count(DISTINCT ("Registration","Date")),0))      AS bh_per_active_day
+FROM forecast.acys_actuals
+WHERE "Operator" = $1 AND "Date" >= date '{start}'
+GROUP BY 1, 2, 3
+ORDER BY 3, 2
+"""
+
+# global coverage frontier: the last month whose flights are still ≥ FRONTIER_FRAC of the trailing plateau
+# (recent months are under-covered by FR24 lag; this is where a fit should stop trusting the tail).
+FRONTIER_FRAC = 0.6
+_FRONTIER_SQL = """
+WITH m AS (
+  SELECT date_trunc('month',"Date")::date mon, count(*) fl
+  FROM forecast.acys_actuals WHERE "Date" >= date '{start}' GROUP BY 1),
+med AS (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY fl) v FROM m)
+SELECT max(m.mon) FROM m, med WHERE m.fl >= med.v * {frac}
 """
 
 
-async def subfleet_month_panel(carrier: str, start: str = HISTORY_START, grain: str = GRAIN):
-    """Return the per (sub-fleet, month) observable anchor panel rows for `carrier`."""
+async def subfleet_month_panel(carrier: str, start: str = HISTORY_START):
+    """Per (sub-fleet, month) observable anchor panel rows for `carrier`, from acys_actuals only."""
     async with DB(statement_timeout_ms=0) as db:
-        return await db.fetch(_PANEL_SQL.replace("{start}", start).replace("{grain}", grain), carrier)
+        return await db.fetch(_PANEL_SQL.replace("{start}", start), carrier)
+
+
+_FORWARD_SQL = """
+SELECT coalesce(nullif("Master Series",''),'NA')     AS sf,
+       date_trunc('month',"Delivery Date")::date     AS deliv,
+       count(DISTINCT "Registration")                AS n
+FROM forecast.acys_actuals
+WHERE "Operator" = $1 AND "Delivery Date" IS NOT NULL AND "Delivery Date" > $2
+GROUP BY 1, 2
+"""
+
+
+async def forward_fleet(carrier: str, after):
+    """Per (sub-fleet, delivery month) tail count for aircraft delivered AFTER `after` (the forward fleet
+    known from Cirium's order book — here the acys_actuals Delivery Date). Drives the growth correction."""
+    async with DB(statement_timeout_ms=0) as db:
+        return await db.fetch(_FORWARD_SQL, carrier, after)
+
+
+async def coverage_frontier(start: str = HISTORY_START) -> str:
+    """Auto-detected last well-covered month 'YYYY-MM' (the usable history end; the sparse FR24-lag tail
+    beyond it back-fills on later extractions). Dynamic — advances as the dump grows."""
+    async with DB(statement_timeout_ms=0) as db:
+        rows = await db.fetch(_FRONTIER_SQL.replace("{start}", start).replace("{frac}", str(FRONTIER_FRAC)))
+    d = rows[0][0]
+    return f"{d:%Y-%m}" if d else None
 
 
 def _fmt(v, nd=2):
@@ -86,36 +101,30 @@ def _fmt(v, nd=2):
 
 
 async def _main(carrier: str):
+    frontier = await coverage_frontier()
     rows = await subfleet_month_panel(carrier)
-    # group by sub-fleet, print a compact monthly view + the trailing-12 plateau
     subfleets: dict = {}
     for r in rows:
         subfleets.setdefault(r["sf"], []).append(r)
-    print(f"=== {carrier}: sub-fleet monthly anchor panel ({len(subfleets)} sub-fleet(s)) ===")
+    print(f"=== {carrier}: acys-only anchor panel ({len(subfleets)} sub-fleet(s)) · frontier={frontier} ===")
     for sf, rs in subfleets.items():
-        flown_rs = [x for x in rs if x["cycles"] is not None]
-        print(f"\n--- sub-fleet: {sf}  ({len(rs)} months, {len(flown_rs)} with flights) ---")
+        print(f"\n--- {sf}  ({len(rs)} months) ---")
         for r in rs[-14:]:
-            print(f"  {r['ym']}  N={r['n_insvc']:>3} avail={_fmt(r['availability'])} "
-                  f"cyc={str(r['cycles'] or '.'):>5} cyc/d={_fmt(r['cyc_per_active_day'])} "
-                  f"bh/d={_fmt(r['bh_per_active_day'])} adays={_fmt(r['active_days_per_tail'],1)} "
-                  f"medkm={_fmt(r['med_haul'],0)} seats={_fmt(r['seats_med'],0)}")
-        # plateau = last 12 months WITH flights
-        plateau = [x for x in flown_rs][-12:]
-        if plateau:
-            avail = [x["availability"] for x in plateau if x["availability"]]
-            cycd = [x["cyc_per_active_day"] for x in plateau if x["cyc_per_active_day"]]
-            bhd = [x["bh_per_active_day"] for x in plateau if x["bh_per_active_day"]]
-            med = [x["med_haul"] for x in plateau if x["med_haul"]]
-            m = lambda xs: sum(xs) / len(xs) if xs else float("nan")
-            leg = "short(cyc/day binding)" if m(med) < 2500 else "long(bh/day binding)"
-            print(f"  PLATEAU(12mo): availability={m(avail):.3f}  cyc/day={m(cycd):.2f}  "
-                  f"bh/day={m(bhd):.2f}  med_haul={m(med):.0f}km -> {leg}")
+            print(f"  {r['ym']}  flown={r['flown']:>3} cyc={str(r['cycles']):>6} "
+                  f"cyc/d={_fmt(r['cyc_per_active_day'])} bh/d={_fmt(r['bh_per_active_day'])} "
+                  f"adays={_fmt(r['active_days_per_tail'],1)} medkm={_fmt(r['med_haul'],0)} "
+                  f"seats={_fmt(r['seats_med'],0)}")
+        plateau = rs[-12:]
+        m = lambda k: (lambda xs: sum(xs) / len(xs) if xs else float("nan"))([x[k] for x in plateau if x[k]])
+        leg = "short(cyc/day)" if (m("med_haul") or 0) < 2500 else "long(bh/day)"
+        print(f"  PLATEAU(12mo): flown={m('flown'):.1f}  cyc/day={m('cyc_per_active_day'):.2f}  "
+              f"bh/day={m('bh_per_active_day'):.2f}  adays={m('active_days_per_tail'):.1f}  "
+              f"med_haul={m('med_haul'):.0f}km → {leg}")
 
 
 def main(argv=None) -> None:
-    p = argparse.ArgumentParser(description="Thin-slice observable anchor panel for one carrier.")
-    p.add_argument("--carrier", required=True, help='Cirium/acys_actuals "Operator" value, e.g. "SCAT Airlines"')
+    p = argparse.ArgumentParser(description="acys-only observable anchor panel for one carrier.")
+    p.add_argument("--carrier", required=True, help='acys_actuals "Operator" value, e.g. "SCAT Airlines"')
     a = p.parse_args(argv)
     asyncio.run(_main(a.carrier))
 

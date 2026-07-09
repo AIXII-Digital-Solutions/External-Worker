@@ -25,7 +25,7 @@ import argparse
 import asyncio
 from collections import defaultdict
 
-from predictive.backtest import (COV_FRAC, _fit_subfleet, _hat_cycles, _mean, _n_eff_map, _q)
+from predictive.backtest import (COV_FRAC, _fit_subfleet, _hat, _mean, _q)
 from predictive.slice import subfleet_month_panel
 
 BLOCK_OVERHEAD_H = 0.411   # measured: fixed ground+climb+descent overhead per flight
@@ -45,7 +45,6 @@ async def carrier_metric_forecast(carrier: str, cutoff: str = "2025-06", lf: flo
     rows = await subfleet_month_panel(carrier)
     train = [r for r in rows if r["mon"] <= cut]
     fit = _fit_subfleet(train)
-    n_eff = _n_eff_map(rows)
     months = sorted({r["mon"] for r in rows})
     by_mon = defaultdict(list)
     for r in rows:
@@ -78,23 +77,20 @@ async def carrier_metric_forecast(carrier: str, cutoff: str = "2025-06", lf: flo
         vals = [r[key] for r in by_mon[mon] if r[key] is not None]
         return sum(vals) if vals else None
 
-    def cyc_per_tail(mon):
-        a, n = actual(mon, "cycles"), sum(r["n_insvc"] for r in by_mon[mon] if r["n_insvc"])
-        return (a / n) if (a and n) else None
-
-    cov_base = _q([c for m in months if m <= cut and (c := cyc_per_tail(m))], 0.5)
+    # coverage gate on flights (drops the FR24-lag tail), matching backtest.compute_backtest
+    cov_base = _q([a for m in months if m <= cut and (a := actual(m, "cycles"))], 0.5)
     cov_min = (cov_base * COV_FRAC) if cov_base else None
 
     detail = []
     for m in months:
         if m <= cut:
             continue
-        cpt = cyc_per_tail(m)
-        if cov_min and (cpt is None or cpt < cov_min):
+        af = actual(m, "cycles")
+        if cov_min and (af is None or af < cov_min):
             continue  # coverage-collapsed month — no valid actual to compare
         fh = kmh = kmh_flat = bhh = paxh = 0.0
         for r in by_mon[m]:
-            f = _hat_cycles(fit, r["sf"], m, n_eff.get((r["sf"], m), r["n_insvc"]))
+            f = _hat(fit, r["sf"], m)
             if not f:
                 continue
             flat = (fit[r["sf"]].get("kmpf") if r["sf"] in fit else None) or 0.0
