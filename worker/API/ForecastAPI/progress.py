@@ -101,13 +101,18 @@ class ProgressReporter:
     terminal publish does not wipe the stored bar). Estimates may be refined mid-run via `set_estimate`
     as unit counts become known."""
 
-    def __init__(self, *, publish, steps, estimates, heartbeat_s=2.0, clock=time.monotonic):
+    def __init__(self, *, publish, steps, estimates, heartbeat_s=0.5, min_interval=0.15,
+                 clock=time.monotonic):
         self._publish = publish
         self._steps = steps
         self._est = [max(0.5, float(e)) for e in estimates]
         self._n = len(steps)
         self._clock = clock
-        self._hb = max(0.25, float(heartbeat_s))
+        self._hb = max(0.1, float(heartbeat_s))
+        # rate cap: coalesce publishes closer than this (so per-unit ticks + heartbeat can't firehose the
+        # DB/Redis). Real progress still pushes the MOMENT it happens, just never more than ~1/min_interval.
+        self._min_interval = max(0.0, float(min_interval))
+        self._last_pub = -1e9
         self._actual = [None] * self._n
         self._cur = -1
         self._t0 = None
@@ -170,16 +175,20 @@ class ProgressReporter:
         return round(pct), max(0, round(eta))
 
     # ---- emit -----------------------------------------------------------------
-    async def _emit(self, state="running") -> None:
+    async def _emit(self, state="running", force=False) -> None:
         async with self._lock:
             if self._stopped:
                 return
+            now = self._clock()
+            if not force and (now - self._last_pub) < self._min_interval:
+                return   # coalesce a burst (e.g. a tick landing right after a heartbeat)
             pct, eta = self._snapshot()
             idx = self._cur if self._cur >= 0 else 0
             st = self._steps[idx]
             payload = {"eta": eta, "detail": st.detail, "step": idx + 1,
                        "step_total": self._n, "step_key": st.key}
             await self._publish(state, st.title, pct, payload)
+            self._last_pub = now
 
     # ---- lifecycle ------------------------------------------------------------
     async def start(self) -> None:
@@ -212,19 +221,29 @@ class ProgressReporter:
         self._t0 = self._clock()
         self._ud = 0.0
         self._ut = float(unit_total or 0.0)
-        await self._emit()
+        await self._emit(force=True)   # a step boundary always publishes
 
     def set_units(self, done: float, total=None) -> None:
         self._ud = float(done)
         if total is not None:
             self._ut = float(total)
 
+    async def tick(self, done=None, total=None) -> None:
+        """Push progress the MOMENT real work advances (a unit completed — a fetched range, an operator
+        forecast). Publishes immediately, rate-capped by min_interval so a fast burst can't firehose.
+        Use this (not set_units) for live per-unit progress so the frontend updates instantly."""
+        if done is not None:
+            self._ud = float(done)
+        if total is not None:
+            self._ut = float(total)
+        await self._emit()
+
     async def complete(self) -> float:
         """Freeze the current step's measured duration; return it (for the calibration record)."""
         dur = self._elapsed()
         if self._cur >= 0:
             self._actual[self._cur] = dur
-        await self._emit()
+        await self._emit(force=True)   # a step boundary always publishes
         return dur
 
     async def success(self, message: str, payload_extra=None) -> None:

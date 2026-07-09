@@ -95,8 +95,13 @@ FLIGHT_RADAR_COVERAGE_GAP_DAYS: int = require_env("FLIGHT_RADAR_COVERAGE_GAP_DAY
 FR24_SECONDS_PER_REQUEST_EST: float = float(require_env("FR24_SECONDS_PER_REQUEST_EST", 8))
 FORECAST_ASSEMBLE_ETA_SECONDS: float = float(require_env("FORECAST_ASSEMBLE_ETA_SECONDS", 12))
 FORECAST_MERGE_ETA_SECONDS: float = float(require_env("FORECAST_MERGE_ETA_SECONDS", 8))
-# Heartbeat: how often the panel republishes progress + ETA WHILE a step runs (constant live push).
-FORECAST_PROGRESS_HEARTBEAT_SECONDS: float = float(require_env("FORECAST_PROGRESS_HEARTBEAT_SECONDS", 2))
+# Heartbeat: how often the panel republishes progress + ETA WHILE a step with no discrete units runs
+# (search-plan / assemble / merge), so the bar keeps moving during a blocking SQL. Unit steps (fetch /
+# forecast) additionally push the MOMENT each unit finishes (see FORECAST_PROGRESS_MIN_INTERVAL_SECONDS).
+FORECAST_PROGRESS_HEARTBEAT_SECONDS: float = float(require_env("FORECAST_PROGRESS_HEARTBEAT_SECONDS", 0.5))
+# Rate cap between status pushes: real progress publishes instantly, but never closer together than this
+# (coalesces per-unit ticks + heartbeat so the DB/Redis aren't firehosed). 0 = no cap.
+FORECAST_PROGRESS_MIN_INTERVAL_SECONDS: float = float(require_env("FORECAST_PROGRESS_MIN_INTERVAL_SECONDS", 0.15))
 # Moving-average window (days) for reading the forecast_step_timings calibration ledger.
 FORECAST_CALIB_WINDOW_DAYS: int = int(require_env("FORECAST_CALIB_WINDOW_DAYS", 30))
 # Bootstrap seeds for the two steps without a per-request/per-operator seed above (first runs only).
