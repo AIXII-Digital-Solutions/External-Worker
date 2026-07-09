@@ -83,15 +83,19 @@ class Calibrator:
 
 class Step:
     """One panel step. `unit_based` steps report a live done/total fraction; the rest ramp by time.
-    `max_s` caps a step's estimated duration (e.g. the fetch step's time budget)."""
-    __slots__ = ("key", "title", "detail", "unit_based", "max_s")
+    `max_s` caps a step's estimated duration (e.g. the fetch step's time budget). `weight` is the step's
+    FIXED share of the visual progress bar (bands are cumulative weights normalized to 100) — this keeps
+    each step's slice bounded regardless of how long it actually takes, so a long step can't push the bar
+    to ~100% while earlier steps remain. The ETA (seconds) stays time-based and is independent of weight."""
+    __slots__ = ("key", "title", "detail", "unit_based", "max_s", "weight")
 
-    def __init__(self, key, title, detail, unit_based=False, max_s=None):
+    def __init__(self, key, title, detail, unit_based=False, max_s=None, weight=1.0):
         self.key = key
         self.title = title
         self.detail = detail
         self.unit_based = unit_based
         self.max_s = max_s
+        self.weight = float(weight)
 
 
 class ProgressReporter:
@@ -113,6 +117,16 @@ class ProgressReporter:
         # DB/Redis). Real progress still pushes the MOMENT it happens, just never more than ~1/min_interval.
         self._min_interval = max(0.0, float(min_interval))
         self._last_pub = -1e9
+        # Visual bar bands: each step owns a FIXED [lo, hi] slice from its weight (cumulative, normalized
+        # to 100). Decoupled from time, so a long step fills only its own band — no "98% while on step 2".
+        _w = [max(1e-6, getattr(s, "weight", 1.0)) for s in steps]
+        _tot = sum(_w)
+        self._bands = []
+        _acc = 0.0
+        for w in _w:
+            lo = _acc / _tot * 100.0
+            _acc += w
+            self._bands.append((lo, _acc / _tot * 100.0))
         self._actual = [None] * self._n
         self._cur = -1
         self._t0 = None
@@ -151,28 +165,29 @@ class ProgressReporter:
         return min(0.95, self._elapsed() / e) if e > 0 else 0.0
 
     def _snapshot(self):
-        """(progress:int 0..99, eta:int seconds) from measured + estimated step durations."""
-        ct = self._cur_total()
+        """(progress:int 0..99, eta:int seconds).
+
+        BAR: fixed per-step bands (from weights) so each step's slice is bounded regardless of its
+        duration — the bar can't reach ~100% while an early step is still running. Within a step it
+        interpolates lo->hi by the step's own fraction; a completed step fills its band.
+        ETA: honest seconds-remaining (measured completed + estimated pending), floored at 1 while running
+        so the counter never shows 0 before the run actually finishes (success publishes eta=0 itself)."""
         fr = self._cur_frac()
-        total = 0.0
-        done = 0.0
-        for i in range(self._n):
-            if self._actual[i] is not None:
-                total += self._actual[i]
-                done += self._actual[i]
-            elif i == self._cur:
-                total += ct
-                done += ct * fr
-            else:
-                total += self._est[i]
-        pct = 0.0 if total <= 0 else done / total * 100.0
+        # ---- visual bar from fixed bands ----
+        if self._cur < 0:
+            pct = 0.0
+        else:
+            lo, hi = self._bands[self._cur]
+            pct = hi if self._actual[self._cur] is not None else (lo + (hi - lo) * fr)
         pct = min(99.0, max(self._last_pct, pct))   # monotonic, never 100 pre-success
         self._last_pct = pct
+        # ---- honest time-based ETA ----
+        ct = self._cur_total()
         eta = ct * (1.0 - fr) if (self._cur >= 0 and self._actual[self._cur] is None) else 0.0
         for i in range(self._n):
             if self._actual[i] is None and i != self._cur:
                 eta += self._est[i]
-        return round(pct), max(0, round(eta))
+        return round(pct), max(1, round(eta))
 
     # ---- emit -----------------------------------------------------------------
     async def _emit(self, state="running", force=False) -> None:

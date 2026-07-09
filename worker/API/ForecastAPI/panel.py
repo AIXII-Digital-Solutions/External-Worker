@@ -376,18 +376,20 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
     from API.FlightRadarAPI.coverage import (plan_missing_ranges, fetch_planned_ranges,
                                              JobCancelled)   # lazy: avoid import cycle
 
+    # `weight` = each step's FIXED share of the visual bar (steps 1+2 = 55%, so a long fetch can't drive
+    # the bar near 100% while still on step 2; the later steps keep a visible 45%). ETA stays time-based.
     steps = [
         Step("search",   "Searching historical data",
-             "Locating the relevant records for the requested aircraft.", unit_based=True),
+             "Locating the relevant records for the requested aircraft.", unit_based=True, weight=5),
         Step("fetch",    "Fetching data",
              "Retrieving flight history for the requested aircraft.", unit_based=True,
-             max_s=FORECAST_FETCH_BUDGET_SECONDS),
+             max_s=FORECAST_FETCH_BUDGET_SECONDS, weight=50),
         Step("assemble", "Creating actuals dataset",
-             "Compiling the historical activity into the working dataset.", unit_based=False),
+             "Compiling the historical activity into the working dataset.", unit_based=False, weight=12),
         Step("forecast", "Creating predictive analysis",
-             "Projecting future activity from the historical patterns.", unit_based=True),
+             "Projecting future activity from the historical patterns.", unit_based=True, weight=23),
         Step("merge",    "Building dataset",
-             "Finalising and aggregating the results for reporting.", unit_based=False),
+             "Finalising and aggregating the results for reporting.", unit_based=False, weight=10),
     ]
 
     async def _pub(state, message, progress=None, payload=None):
