@@ -45,14 +45,16 @@ acys_summary_grouped (VIEW, not written here) rolls by_day up to one row per (ai
 """
 import asyncio
 import json
-import random
 from datetime import date, timedelta
 
 from sqlalchemy import text
 
 from Config import setup_logger
 from settings import (FORECAST_PAX_LOAD_FACTOR, FORECAST_ASSEMBLE_ETA_SECONDS,
-                      FORECAST_MERGE_ETA_SECONDS, FORECAST_FETCH_BUDGET_SECONDS)
+                      FORECAST_MERGE_ETA_SECONDS, FORECAST_FETCH_BUDGET_SECONDS,
+                      FR24_SECONDS_PER_REQUEST_EST, FORECAST_PROGRESS_HEARTBEAT_SECONDS,
+                      FORECAST_CALIB_WINDOW_DAYS, FORECAST_BOOT_SEARCH_SECONDS,
+                      FORECAST_BOOT_FORECAST_PER_OP_SECONDS)
 from status import publish_status
 
 logger = setup_logger("forecast_panel")
@@ -365,35 +367,41 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             "anchor_month": as_of.month, "anchor_day": as_of.day,
             "pax_factor": FORECAST_PAX_LOAD_FACTOR, **scope_params}
 
-    # ETA model: the dominant, variable cost is the FR24 fetch (each request ~0.5-15s); the panel
-    # estimates it from the number of missing ranges and the MEASURED per-request time, plus small
-    # fixed estimates for the assemble + merge DB steps. `eta` (seconds) is passed explicitly per
-    # publish and rides in payload.eta (exposed by GET /status and the live SSE event).
-    _db_eta = FORECAST_ASSEMBLE_ETA_SECONDS + FORECAST_MERGE_ETA_SECONDS
+    # ── Progress + ETA: an honest, self-calibrating FIVE-step model (no hardcoded step weights) ──────
+    # Pending steps are estimated from a moving average of past runs (forecast_step_timings) scaled by
+    # this run's unit count; completed steps use their measured wall time; a background heartbeat keeps
+    # the bar and the countdown live even during a blocking SQL. Step titles + `detail` NEVER name a data
+    # source. The frontend reads `message` + payload.{eta, detail, step, step_total, step_key}.
+    from API.ForecastAPI.progress import Calibrator, ProgressReporter, Step
+    from API.FlightRadarAPI.coverage import (plan_missing_ranges, fetch_planned_ranges,
+                                             JobCancelled)   # lazy: avoid import cycle
 
-    async def _pub(state, message, progress=None, eta=None, payload=None):
-        data = dict(payload) if payload else {}
-        if state == "success":
-            data["eta"] = 0
-        elif eta is not None:
-            data["eta"] = max(0, round(eta))
+    steps = [
+        Step("search",   "Searching historical data",
+             "Locating the relevant records for the requested aircraft.", unit_based=True),
+        Step("fetch",    "Fetching data",
+             "Retrieving flight history for the requested aircraft.", unit_based=True,
+             max_s=FORECAST_FETCH_BUDGET_SECONDS),
+        Step("assemble", "Creating actuals dataset",
+             "Compiling the historical activity into the working dataset.", unit_based=False),
+        Step("forecast", "Creating predictive analysis",
+             "Projecting future activity from the historical patterns.", unit_based=True),
+        Step("merge",    "Building dataset",
+             "Finalising and aggregating the results for reporting.", unit_based=False),
+    ]
+
+    async def _pub(state, message, progress=None, payload=None):
+        # progress=None => omit (so a terminal publish never wipes the stored bar).
         kwargs = {}
         if progress is not None:
             kwargs["progress"] = progress
-        if data:
-            kwargs["payload"] = data
+        if payload is not None:
+            kwargs["payload"] = payload
         await publish_status(db_client, redis, job_id=job_id, kind="external", ref=ref,
                              state=state, message=message, **kwargs)
 
-    async def _on_fetch(fetch_seconds_remaining):
-        # live ETA during the (silent) FR24 fetch: remaining fetch time + the DB steps still to come.
-        # Progress is held at the top of the "Searching historical data" band; message is unchanged.
-        await _pub("running", "Searching historical data", progress=15,
-                   eta=fetch_seconds_remaining + _db_eta)
-
-    # Cooperative cancellation: core-api's POST /status/{job_id}/cancel sets this Redis flag; we check
-    # it between steps AND per FR24 request (via should_cancel) so the run stops promptly and cleanly.
-    from API.FlightRadarAPI.coverage import fetch_missing_ranges, JobCancelled   # lazy: avoid import cycle
+    # Cooperative cancellation: core-api's POST /status/{job_id}/cancel sets this Redis flag; checked
+    # between steps AND per fetch request (should_cancel) so the run stops promptly and cleanly.
     _cancel_key = f"job:cancel:{job_id}"
 
     async def _cancelled() -> bool:
@@ -406,17 +414,31 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         if await _cancelled():
             raise JobCancelled()
 
+    cal = Calibrator(db_client, window_days=FORECAST_CALIB_WINDOW_DAYS)
+    await cal.load()
+    estimates = [
+        cal.estimate("search",   boot_flat=FORECAST_BOOT_SEARCH_SECONDS),
+        cal.estimate("fetch",    boot_flat=FR24_SECONDS_PER_REQUEST_EST * 4),
+        cal.estimate("assemble", boot_flat=FORECAST_ASSEMBLE_ETA_SECONDS),
+        cal.estimate("forecast", boot_flat=FORECAST_BOOT_FORECAST_PER_OP_SECONDS * 4),
+        cal.estimate("merge",    boot_flat=FORECAST_MERGE_ETA_SECONDS),
+    ]
+    reporter = ProgressReporter(publish=_pub, steps=steps, estimates=estimates,
+                                heartbeat_s=FORECAST_PROGRESS_HEARTBEAT_SECONDS)
+
     try:
-        # Step 1/4 — Searching historical data: validate the scope, reset the per-request tables
+        await reporter.start()
+
+        # ── Step 1/5 — Searching historical data: validate the scope, reset the per-request tables
         # (acys_actuals keeps other scopes — delete only THIS one; acys_forecast/acys_summary wiped),
-        # and fetch only the MISSING FR24 date ranges per tail (coverage ledger).
-        await _pub("running", "Searching historical data", progress=random.randint(10, 15))
+        # and PLAN the missing date ranges per tail (pure DB search — spends no external budget). ─────
+        await reporter.enter("search", unit_total=1)
         async with db_client.session(_DB) as s:
             ok = (await s.execute(
                 text(f'SELECT 1 FROM cirium.ciriumaircrafts ca WHERE {a5_where} LIMIT 1'),
                 scope_params)).first()
         if not ok:
-            await _pub("error", f"No Cirium aircraft match {label}")
+            await reporter.terminal("error", "No aircraft match the request")
             raise ValueError(f"empty scope: {label}")
         async with db_client.session(_DB) as s:
             await s.execute(text(hist_delete), scope_params)
@@ -427,29 +449,65 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             scope_regs = (await s.execute(text(_SCOPE_REGS_TMPL.format(a5_where=a5_where)),
                                           base)).scalars().all()
 
-        # Fetch ONLY the MISSING FR24 date ranges per tail (coverage ledger) — from CY2022 start to
-        # yesterday. Silent (no status of its own): the visible flow stays the four canonical steps.
-        coverage = await fetch_missing_ranges(
+        n_regs = max(1, len(scope_regs))
+        reporter.set_estimate("search",   cal.estimate("search", n_regs, boot_per_unit=0.03,
+                                                        boot_flat=FORECAST_BOOT_SEARCH_SECONDS))
+        reporter.set_estimate("assemble", cal.estimate("assemble", n_regs, boot_per_unit=0.02,
+                                                        boot_flat=FORECAST_ASSEMBLE_ETA_SECONDS))
+        reporter.set_estimate("merge",    cal.estimate("merge", n_regs, boot_per_unit=0.02,
+                                                        boot_flat=FORECAST_MERGE_ETA_SECONDS))
+        reporter.set_units(0, n_regs)
+
+        async def _plan_progress(done, total):
+            reporter.set_units(done, total)
+
+        plan_info = await plan_missing_ranges(
             db_client, list(scope_regs),
             w_start=_cy2022_floor(as_of), w_end=date.today() - timedelta(days=1),
-            time_budget_s=FORECAST_FETCH_BUDGET_SECONDS, on_progress=_on_fetch, should_cancel=_cancelled)
+            on_progress=_plan_progress, should_cancel=_cancelled)
+        d = await reporter.complete()
+        await cal.record("search", d, n_regs, {"regs": n_regs, "groups": plan_info["groups"]})
 
-        # Step 2/4 — Fetching data: assemble acys_actuals (Cirium × FR24, date-respecting, flights only)
+        # ── Step 2/5 — Fetching data: fetch ONLY the missing ranges per tail (spends the budget). ────
         await _ck()
-        await _pub("running", "Fetching data", progress=random.randint(25, 49), eta=_db_eta)
+        total_requests = max(1, plan_info["total_requests"])
+        reporter.set_estimate("fetch", cal.estimate("fetch", total_requests,
+                                                    boot_per_unit=FR24_SECONDS_PER_REQUEST_EST,
+                                                    boot_flat=FR24_SECONDS_PER_REQUEST_EST))
+        await reporter.enter("fetch", unit_total=total_requests)
+
+        async def _fetch_progress(done, total):
+            reporter.set_units(done, total)
+
+        coverage = await fetch_planned_ranges(
+            db_client, plan_info["plan"], total_requests,
+            time_budget_s=FORECAST_FETCH_BUDGET_SECONDS,
+            on_progress=_fetch_progress, should_cancel=_cancelled)
+        coverage["regs"] = plan_info["regs"]
+        d = await reporter.complete()
+        # calibrate fetch by the SAME unit the estimate scales on (planned requests). Skip a budget-capped
+        # fetch: its wall time reflects the budget, not the full work, so it would skew the per-unit rate.
+        if not coverage["incomplete"]:
+            await cal.record("fetch", d, total_requests,
+                             {"groups": coverage["groups"], "ranges_fetched": coverage["ranges_fetched"],
+                              "requests_est": total_requests, "incomplete": coverage["incomplete"]})
+
+        # ── Step 3/5 — Creating actuals dataset: assemble acys_actuals (flights) + future stubs. ─────
+        await _ck()
+        await reporter.enter("assemble")
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_assemble_sql(a5_where)), base)
             history_rows = res.rowcount
-            # future-delivery aircraft (forward fleet) as flightless stubs — no FR24, never dropped
+            # future-delivery aircraft (forward fleet) as flightless stubs — no external data, never dropped
             fut = await s.execute(text(_future_aircraft_sql(a5_where)), base)
             future_aircraft = fut.rowcount
             await s.commit()
+        d = await reporter.complete()
+        await cal.record("assemble", d, n_regs,
+                         {"regs": n_regs, "history_rows": history_rows, "future": future_aircraft})
 
-        # Step 3/4 — Creating predictive analysis: forecast forward (acys_actuals ONLY) → acys_forecast_by_day
+        # ── Step 4/5 — Creating predictive analysis: forecast forward per operator. ──────────────────
         await _ck()
-        await _pub("running", "Creating predictive analysis", progress=random.randint(55, 70),
-                   eta=FORECAST_MERGE_ETA_SECONDS,
-                   payload={"history_rows": history_rows, "coverage": coverage})
         from API.ForecastAPI.model import run_forecast_model   # lazy: model imports panel helpers
         # forecast per operator in scope: the explicit operator, else the operators of the scoped tails
         async with db_client.session(_DB) as s:
@@ -459,8 +517,13 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                 fc_ops = (await s.execute(
                     text(f'SELECT DISTINCT "Operator" FROM forecast.acys_actuals WHERE {final_scope} '
                          'AND "Operator" IS NOT NULL'), scope_params)).scalars().all()
+        n_ops = max(1, len(fc_ops))
+        reporter.set_estimate("forecast", cal.estimate("forecast", n_ops,
+                                                       boot_per_unit=FORECAST_BOOT_FORECAST_PER_OP_SECONDS,
+                                                       boot_flat=FORECAST_BOOT_FORECAST_PER_OP_SECONDS))
+        await reporter.enter("forecast", unit_total=n_ops)
         forecast_rows = 0
-        for op in fc_ops:
+        for idx, op in enumerate(fc_ops):
             await _ck()
             async with db_client.session(_DB) as s:
                 # scope the forecast source to THIS request's tails (acys_actuals accumulates across
@@ -468,15 +531,22 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                 fr = await run_forecast_model(session=s, operator=op, as_of=as_of,
                                               scope_where=final_scope, scope_params=scope_params)
             forecast_rows += fr.get("forecast_rows", 0)
+            reporter.set_units(idx + 1, n_ops)
+        d = await reporter.complete()
+        await cal.record("forecast", d, n_ops,
+                         {"operators": len(fc_ops), "forecast_rows": forecast_rows})
 
-        # Step 4/4 — Building dataset: merge into acys_summary (this request's flights only + forecast)
+        # ── Step 5/5 — Building dataset: merge into acys_summary (this request's flights + forecast). ─
         await _ck()
-        await _pub("running", "Building dataset", progress=random.randint(80, 90),
-                   eta=FORECAST_MERGE_ETA_SECONDS)
+        await reporter.enter("merge")
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_merge_sql(final_scope)), scope_params)
             final_rows = res.rowcount
             await s.commit()
+        d = await reporter.complete()
+        await cal.record("merge", d, max(1, history_rows + forecast_rows),
+                         {"history_rows": history_rows, "forecast_rows": forecast_rows,
+                          "final_rows": final_rows})
 
         # Record this run for GET /forecast/last — written ONLY here, once the WHOLE panel finished
         # successfully (moved out of the POST /forecast trigger). Best-effort: never fail a good run.
@@ -502,16 +572,16 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             "forecast_rows": forecast_rows, "final_rows": final_rows,
             "coverage": coverage,
         }
-        await _pub("success",
-                   f"Completed — actuals {history_rows}, future {future_aircraft}, forecast {forecast_rows}, summary {final_rows}",
-                   progress=100, payload=summary)
+        await reporter.success(
+            f"Completed — actuals {history_rows}, future {future_aircraft}, "
+            f"forecast {forecast_rows}, summary {final_rows}", summary)
         logger.info("forecast_panel done: %s", summary)
         return summary
 
     except JobCancelled:
-        # User cancelled (cooperative flag): publish the terminal 'cancelled' status LAST (so no
-        # in-flight 'running' publish overwrites it), clear the flag, and finish normally.
-        await _pub("cancelled", "Cancelled by user")
+        # User cancelled (cooperative flag): publish the terminal 'cancelled' status LAST (heartbeat
+        # already stopped by terminal()), clear the flag, and finish normally.
+        await reporter.terminal("cancelled", "Cancelled by user")
         try:
             await redis.delete(_cancel_key)
         except Exception:
@@ -520,13 +590,16 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         return {"cancelled": True, "operator": operator,
                 "registrations": list(registrations) if registrations else None}
     except asyncio.CancelledError:
-        # ARQ abort / worker shutdown: publish 'cancelled' on a DETACHED task (survives this task's
-        # cancellation), then re-raise so ARQ records the job as aborted.
+        # ARQ abort / worker shutdown: stop the heartbeat synchronously, publish 'cancelled' on a
+        # DETACHED task (survives this task's cancellation), then re-raise so ARQ records the abort.
+        reporter.request_stop()
         asyncio.ensure_future(_pub("cancelled", "Cancelled by user"))
         logger.info("forecast_panel aborted (%s)", label)
         raise
     except Exception as e:
         if not isinstance(e, ValueError):
-            await _pub("error", f"Forecast panel failed: {e}")
+            await reporter.terminal("error", f"Forecast panel failed: {e}")
         logger.exception("forecast_panel failed (%s)", label)
         raise
+    finally:
+        reporter.request_stop()

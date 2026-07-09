@@ -6,6 +6,11 @@ The forecast panel fetches only the request window MINUS this ledger (the missin
 each fetched range — even if it returned no flights — so it is never re-fetched. This bounds FR24 token
 spend to genuinely-new date ranges.
 
+Two phases, kept SEPARATE so the panel can show them as distinct steps:
+  * plan_missing_ranges  — STEP 1 "searching": pure DB/planning, spends NO API budget. Seeds the ledger,
+                           computes each tail's missing ranges, clusters them into batched groups.
+  * fetch_planned_ranges — STEP 2 "fetching": spends API budget, newest-first, records each range.
+
 Bootstrap (a reg with no ledger row yet): seed the ledger from the reg's existing flightsummary days,
 coalescing no-fly gaps shorter than FLIGHT_RADAR_COVERAGE_GAP_DAYS into a covered span. Longer internal
 gaps stay UNCOVERED and get fetched once (then recorded, so a genuinely-empty stretch is not re-fetched).
@@ -18,7 +23,7 @@ from sqlalchemy import text
 
 from Config import setup_logger
 from settings import (FLIGHT_RADAR_COVERAGE_GAP_DAYS, FLIGHT_RADAR_RANGE_DAYS,
-                      FLIGHT_RADAR_MAX_REG_PER_BATCH, FR24_SECONDS_PER_REQUEST_EST)
+                      FLIGHT_RADAR_MAX_REG_PER_BATCH)
 from API.FlightRadarAPI.FlightSummary import fetch_all_ranges
 
 logger = setup_logger("fr24_coverage")
@@ -122,24 +127,23 @@ async def _record(session, reg, f, t):
             {"r": reg, "f": mf, "t": mt})
 
 
-async def fetch_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_days: int = None,
-                               time_budget_s: float = None, on_progress=None, should_cancel=None) -> dict:
-    """Fetch ONLY the missing FR24 date ranges for `regs` within [w_start, w_end].
+async def plan_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_days: int = None,
+                              on_progress=None, should_cancel=None) -> dict:
+    """STEP 1 (spends NO API budget): plan what must be fetched.
 
-    Pre-pass: seed the ledger if absent, compute each reg's missing ranges, and GROUP tails by an
-    identical (from, to) gap so tails sharing a range (typically the common trailing gap) are fetched
-    in ONE batched FR24 request instead of one-per-tail (which multiplied requests + rate-limit sleeps
-    and stalled between them). Groups are fetched newest-first, each recorded after so it is never
-    re-fetched, UNTIL `time_budget_s` elapses (checked per API request) — unfetched groups retry next
-    run. `on_progress(fetch_seconds_remaining)` is called live (measured per-request time, throttled to
-    ~2s, capped by the remaining budget). Never raises (except the internal budget stop, handled here).
-    """
+    Seed each tail's coverage ledger if absent, compute its MISSING date ranges within [w_start, w_end],
+    and GROUP tails by an identical (from, to) gap so tails sharing a range (typically the common trailing
+    gap) are fetched in ONE batched request. Near-identical ranges (±_MERGE_TOL_DAYS) are merged into
+    batched clusters, newest first. Returns {plan, total_requests, regs, groups}.
+    `on_progress(done, total)` reports tails planned (for the live step-1 fraction)."""
     gap_days = FLIGHT_RADAR_COVERAGE_GAP_DAYS if gap_days is None else gap_days
     regs = [r for r in regs if r]   # drop NULL/empty registrations — cannot be fetched from FR24
+    total = len(regs)
 
-    # PRE-PASS: seed + compute each reg's missing ranges, group tails by identical (from, to).
     groups: dict = {}   # (gf, gt) -> [regs]
-    for reg in regs:
+    for i, reg in enumerate(regs):
+        if should_cancel is not None and await should_cancel():
+            raise JobCancelled()
         try:
             async with db_client.session("flightradar") as s:
                 await _seed_if_absent(s, reg, gap_days)
@@ -147,32 +151,33 @@ async def fetch_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_
                 covered = await _covered(s, reg)
             for gf, gt in _complement(covered, w_start, w_end):
                 groups.setdefault((gf, gt), []).append(reg)
+        except JobCancelled:
+            raise
         except Exception as e:
             logger.warning("coverage plan failed for %s: %s", reg, e)
-    # merge near-identical gap ranges (±_MERGE_TOL_DAYS) into batched clusters; newest first (so fresh
-    # data is prioritised if the budget runs out).
+        if on_progress is not None and (i % 10 == 0 or i == total - 1):
+            try:
+                await on_progress(i + 1, total)
+            except Exception:
+                pass
+
     plan = _cluster_groups(groups, _MERGE_TOL_DAYS)
     plan.sort(key=lambda c: c[1], reverse=True)
-
     total_requests = sum(_estimate_requests(gf, gt) * ceil(len(rs) / FLIGHT_RADAR_MAX_REG_PER_BATCH)
                          for gf, gt, rs in plan)
+    return {"plan": plan, "total_requests": total_requests, "regs": total, "groups": len(plan)}
+
+
+async def fetch_planned_ranges(db_client, plan, total_requests: int, time_budget_s: float = None,
+                               on_progress=None, should_cancel=None) -> dict:
+    """STEP 2 (spends API budget): fetch each planned group's missing range.
+
+    Groups are fetched newest-first, each recorded after so it is never re-fetched, UNTIL `time_budget_s`
+    elapses (checked per API request) — unfetched groups retry on the next run. `on_progress(done_requests,
+    total_requests)` is called live per request (for the step-2 fraction). Never raises except JobCancelled
+    (propagated to the caller) — the internal budget stop is handled here."""
     started = time.monotonic()
     done_requests = 0
-    last_report = -1e9
-
-    async def _report(force=False):
-        nonlocal last_report
-        if on_progress is None:
-            return
-        elapsed = time.monotonic() - started
-        if not force and elapsed - last_report < 2.0:
-            return
-        last_report = elapsed
-        avg = elapsed / done_requests if done_requests else FR24_SECONDS_PER_REQUEST_EST
-        remaining = max(0, total_requests - done_requests) * avg
-        if time_budget_s is not None:
-            remaining = min(remaining, max(0.0, time_budget_s - elapsed))
-        await on_progress(remaining)
 
     async def _on_request():
         nonlocal done_requests
@@ -181,9 +186,11 @@ async def fetch_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_
             raise JobCancelled()
         if time_budget_s is not None and (time.monotonic() - started) >= time_budget_s:
             raise _BudgetReached()
-        await _report()
-
-    await _report(force=True)   # initial ETA (total_requests * per-request estimate)
+        if on_progress is not None:
+            try:
+                await on_progress(done_requests, total_requests)
+            except Exception:
+                pass
 
     ranges_fetched, tail_days, incomplete = 0, 0, False
     for gf, gt, grp_regs in plan:
@@ -213,9 +220,8 @@ async def fetch_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_
             await s.commit()
         ranges_fetched += 1
         tail_days += ((gt - gf).days + 1) * len(grp_regs)
-        await _report(force=True)
 
-    summary = {"regs": len(regs), "groups": len(plan), "ranges_fetched": ranges_fetched,
-               "tail_days": tail_days, "requests_est": total_requests, "incomplete": incomplete}
+    summary = {"groups": len(plan), "ranges_fetched": ranges_fetched, "tail_days": tail_days,
+               "requests_est": total_requests, "incomplete": incomplete}
     logger.info("FR24 coverage refresh: %s", summary)
     return summary
