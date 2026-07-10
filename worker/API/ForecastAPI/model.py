@@ -37,6 +37,8 @@ SEAS_K = 6.0          # seasonal-factor shrinkage toward 1.0 by month support
 FRONTIER_FRAC = 0.6   # a recent month is "complete" if its flights ≥ this × the trailing-window median
 FRONTIER_WINDOW = 9   # trailing months the frontier threshold is measured against
 GROWTH_CAP = 4.0      # cap the forward-fleet growth multiplier (guard against bad delivery data)
+LIVE_WINDOW_MONTHS = 3  # an aircraft is forecastable only if it flew within this many months up to the
+                        # frontier; a longer-idle tail is treated as retired and NOT projected forward.
 
 _MONTHLY_SQL = """
 SELECT coalesce(nullif("Master Series",''),'NA') AS sf,
@@ -165,6 +167,12 @@ rep AS (
     JOIN plan p ON p.sf = {sfkey}
     WHERE t."Operator" = :op AND t."Date" IS NOT NULL
       AND date_trunc('month', t."Date")::date = :template_month {scope}
+      -- only project aircraft STILL in the fleet at the frontier: a template tail that stopped flying
+      -- >= LIVE_WINDOW_MONTHS before the frontier is retired and must NOT be revived in the forecast.
+      AND EXISTS (SELECT 1 FROM forecast.acys_actuals a2
+                  WHERE a2."Registration" = t."Registration" AND a2."Operator" = :op
+                    AND a2."Date" IS NOT NULL
+                    AND date_trunc('month', a2."Date")::date >= :live_since)
 )
 SELECT
     r."Registration", :period, :fdate, NULL, NULL,
@@ -182,7 +190,8 @@ WHERE r.copies > 0
 
 
 def _contract_year(d: date, anchor: date) -> str:
-    before = (d.month, d.day) < (anchor.month, anchor.day)
+    # MONTH-aligned (day ignored) so a CY is exactly 12 calendar months, labelled by its START year.
+    before = d.month < anchor.month
     return f"CY{d.year - (1 if before else 0)}"
 
 
@@ -201,6 +210,7 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         text(_FUTURE_SQL.format(scope=scope_sql)), {"op": operator, **sp})).all()]
 
     frontier, fmonths, plan = _plan(rows, future, as_of)
+    live_since = _add_months(frontier, -(LIVE_WINDOW_MONTHS - 1)) if frontier else None
     sql = _insert_sql(scope_sql)
     total = 0
     for m in fmonths:
@@ -210,7 +220,8 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         for tm, scales in by_tm.items():
             vals = []
             params = {"op": operator, "template_month": tm, "period": m.strftime("%m-%Y"),
-                      "fdate": m, "contract_year": _contract_year(m, as_of), **sp}
+                      "fdate": m, "contract_year": _contract_year(m, as_of),
+                      "live_since": live_since, **sp}
             for i, (sf, sc) in enumerate(scales.items()):
                 vals.append(f"(:sfk_{i}, CAST(:scale_{i} AS double precision))")
                 params[f"sfk_{i}"] = sf

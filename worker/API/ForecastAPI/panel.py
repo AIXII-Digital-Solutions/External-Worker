@@ -63,12 +63,11 @@ HISTORY_START = date(2022, 7, 1)   # Period >= 07-2022 (2.2) and flightsummary f
 _DB = "cirium"   # any aviation logical name -> the physical aixii DB (cirium/flightradar/main/forecast)
 _REQUEST_TYPE = "ACYS"   # this Cirium×FR24 panel algorithm — stamped on the forecast_last_requests row
 
-# Contract Year for a flight's first_seen vs the request anchor (:anchor_month/:anchor_day): the
-# 12-month window [anchor, anchor+1y) containing the date, labelled by its START year.
+# Contract Year for a flight's first_seen vs the request anchor MONTH (:anchor_month). MONTH-aligned so a
+# CY is EXACTLY 12 calendar months [anchor_month .. anchor_month-1], labelled by its START year (the day
+# is ignored — a July-10 request still yields CY = Jul..Jun, not a July-split 13-month bucket).
 _CONTRACT_YEAR = """'CY' || (extract(year from a6.first_seen)::int - CASE
         WHEN extract(month from a6.first_seen)::int < :anchor_month
-          OR (extract(month from a6.first_seen)::int = :anchor_month
-              AND extract(day from a6.first_seen)::int < :anchor_day)
         THEN 1 ELSE 0 END)::text"""
 
 # flightsummary.flight_time is integer seconds (with some bad negatives) -> interval, NULL if < 0/null.
@@ -172,9 +171,9 @@ array6 AS (
            f.actual_distance, f.flight_time
     FROM flightradar.flightsummary f
     WHERE f.reg IN (SELECT registration FROM array5)
-      -- lower bound is ALWAYS the start of CY2022 (anchor month/day in 2022): flights that would
-      -- fall in CY2021 are dropped. Upper bound is the request date.
-      AND f.first_seen >= make_date(2022, :anchor_month, :anchor_day)
+      -- lower bound is ALWAYS the start of CY2022 (start of the anchor month in 2022, month-aligned):
+      -- flights before it fall in CY2021 and are dropped. Upper bound is the request date.
+      AND f.first_seen >= make_date(2022, :anchor_month, 1)
       AND f.first_seen <  :as_of
       -- DROP a flight with NO ICAO origin, or NO ICAO destination (neither actual nor planned)
       AND nullif(f.orig_icao, '') IS NOT NULL
@@ -267,6 +266,9 @@ def _merge_sql(final_scope: str) -> str:
     dia, di = _ne('p."IATA Destination Actual"'), _ne('p."IATA Destination"')
     dica, dic = _ne('p."ICAO Destination Actual"'), _ne('p."ICAO Destination"')
     d_geo = _geo_lookup(f"coalesce({dia}, {di})", f"coalesce({dica}, {dic})")
+    # month ordinal (year*12+month) helper for the per-aircraft Agreed-Value model
+    ord_of = 'extract(year from {c})::int * 12 + extract(month from {c})::int'
+    p_ord = ord_of.format(c='p."Date"')
     return f"""
 INSERT INTO forecast.acys_summary_by_day
     ("Registration","Period","Date","Time Departed","Time Landed",
@@ -280,12 +282,40 @@ INSERT INTO forecast.acys_summary_by_day
      "Origin Country","Origin City","Origin Airport Name",
      "Destination Country","Destination City","Destination Airport Name",
      origin_lat, origin_lon, dest_lat, dest_lon)
-WITH panel AS (
+WITH aav AS (   -- per (reg, month-ordinal): the REAL actual Agreed Value (non-Wet, > 0) — source of truth
+    SELECT "Registration" reg, {ord_of.format(c='"Date"')} ord, max("Agreed Value") av
+    FROM forecast.acys_actuals
+    WHERE "Date" IS NOT NULL AND "Lease Dry Wet" IS DISTINCT FROM 'Wet' AND "Agreed Value" > 0
+    GROUP BY 1, 2
+),
+astat AS (      -- per reg: last known AV, its month-ordinal, and the monthly depreciation slope (<= 0,
+                -- clamped so a projection can only decline — an aircraft never baselessly gets pricier)
+    SELECT reg, (array_agg(av ORDER BY ord DESC))[1] last_av, max(ord) last_ord,
+           LEAST(0, coalesce(regr_slope(av, ord), 0)) slope
+    FROM aav GROUP BY 1
+),
+panel AS (
     -- each branch tags its source so rows carry Data Type = Actuals / Forecast
     SELECT {_PANEL_COLS}, 'Actuals' AS "Data Type" FROM forecast.acys_actuals
     WHERE "Date" IS NOT NULL AND {final_scope}     -- flights only + THIS request's slice
     UNION ALL
     SELECT {_PANEL_COLS}, 'Forecast' AS "Data Type" FROM forecast.acys_forecast
+),
+avfill AS (     -- fixed Agreed Value per (reg, month, data type):
+    --  * Actuals  -> the real month value, else CARRY FORWARD the last known one (fills Cirium gaps),
+    --  * Forecast -> project the aircraft's own depreciation forward from the last actual, floored at 0.
+    SELECT om.reg, om.ord, om.dt,
+           CASE WHEN om.dt = 'Forecast'
+                THEN GREATEST(0, st.last_av + st.slope * (om.ord - st.last_ord))
+                ELSE coalesce(
+                     (SELECT av FROM aav WHERE aav.reg = om.reg AND aav.ord <= om.ord
+                      ORDER BY aav.ord DESC LIMIT 1),   -- carry FORWARD the last known value (fills gaps/tail)
+                     (SELECT av FROM aav WHERE aav.reg = om.reg
+                      ORDER BY aav.ord ASC LIMIT 1))     -- else the earliest known value (fills LEADING nulls)
+           END AS av
+    FROM (SELECT DISTINCT "Registration" reg, {ord_of.format(c='"Date"')} ord, "Data Type" dt
+          FROM panel WHERE "Date" IS NOT NULL) om
+    LEFT JOIN astat st ON st.reg = om.reg
 )
 SELECT
     p."Registration", p."Period", p."Date", p."Time Departed", p."Time Landed",
@@ -293,7 +323,7 @@ SELECT
     p."ICAO Origin", p."ICAO Destination", p."ICAO Destination Actual",
     p."Operator", p."Master Series", p."Manufacturer", p."Aircraft Sub Series", p."Primary Usage",
     p."Contract Year", p."Circle Distance", p."Flight Time",
-    CASE WHEN p."Lease Dry Wet" = 'Wet' THEN 0 ELSE p."Agreed Value" END,
+    CASE WHEN p."Lease Dry Wet" = 'Wet' THEN 0 ELSE coalesce(av.av, p."Agreed Value") END,
     p."Total Seats", p."Total PAX", p."Actual Distance FR", p."Flight Time FR",
     p."Delivery Date", p."Lease Type", p."Lease Dry Wet", p."Operational Lessor",
     round((p."Date" - p."Delivery Date")::numeric / 365.25, 2),
@@ -302,6 +332,7 @@ SELECT
     d.country, d.city, d.airport_name,
     o.lat, o.lon, d.lat, d.lon
 FROM panel p
+LEFT JOIN avfill av ON av.reg = p."Registration" AND av.dt = p."Data Type" AND av.ord = ({p_ord})
 LEFT JOIN LATERAL {o_geo} o ON true
 LEFT JOIN LATERAL {d_geo} d ON true
 """
@@ -318,12 +349,9 @@ WHERE {a5_where}
 
 
 def _cy2022_floor(as_of: date) -> date:
-    """Start of CY2022 relative to the request anchor (make_date(2022, month, day)); the FR24 fetch
-    lower bound. Guards the Feb-29 case (2022 is not a leap year)."""
-    try:
-        return date(2022, as_of.month, as_of.day)
-    except ValueError:
-        return date(2022, as_of.month, 28)
+    """Start of CY2022 relative to the request anchor MONTH (month-aligned: make_date(2022, month, 1));
+    the FR24 fetch lower bound."""
+    return date(2022, as_of.month, 1)
 
 
 def _scope(operator, registrations):
@@ -376,20 +404,31 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
     from API.FlightRadarAPI.coverage import (plan_missing_ranges, fetch_planned_ranges,
                                              JobCancelled)   # lazy: avoid import cycle
 
-    # `weight` = each step's FIXED share of the visual bar (steps 1+2 = 55%, so a long fetch can't drive
-    # the bar near 100% while still on step 2; the later steps keep a visible 45%). ETA stays time-based.
+    # `weight` = each step's FIXED share of the visual bar so the two long steps (Fetching / Generating
+    # forecast) can't push the bar near 100% while earlier steps run; brief steps keep a small share.
+    # ETA stays time-based. Titles + detail NEVER name a data source.
     steps = [
-        Step("search",   "Searching historical data",
-             "Locating the relevant records for the requested aircraft.", unit_based=True, weight=5),
-        Step("fetch",    "Fetching data",
-             "Retrieving flight history for the requested aircraft.", unit_based=True,
-             max_s=FORECAST_FETCH_BUDGET_SECONDS, weight=50),
-        Step("assemble", "Creating actuals dataset",
+        Step("validating",    "Validating request",
+             "Checking the request and matching the requested aircraft.", unit_based=False, weight=2),
+        Step("aircraft_list", "Building Aircraft List",
+             "Preparing the working tables and the list of aircraft in scope.", unit_based=False, weight=3),
+        Step("coverage",      "Checking data coverage",
+             "Determining which history is already available and what is missing.", unit_based=True, weight=8),
+        Step("fetching",      "Fetching historical data",
+             "Retrieving the missing flight history for the requested aircraft.", unit_based=True,
+             max_s=FORECAST_FETCH_BUDGET_SECONDS, weight=33),
+        Step("snapshot",      "Saving historical coverage snapshot",
+             "Recording which history has been retrieved so it is not fetched again.", unit_based=False, weight=2),
+        Step("transform",     "Transforming historical data",
              "Compiling the historical activity into the working dataset.", unit_based=False, weight=12),
-        Step("forecast", "Creating predictive analysis",
-             "Projecting future activity from the historical patterns.", unit_based=True, weight=23),
-        Step("merge",    "Building dataset",
-             "Finalising and aggregating the results for reporting.", unit_based=False, weight=10),
+        Step("measures",      "Calculating measures",
+             "Adding incoming aircraft (forward fleet) and their derived measures.", unit_based=False, weight=5),
+        Step("forecast",      "Generating forecast",
+             "Projecting future activity from the historical patterns.", unit_based=True, weight=20),
+        Step("merging",       "Merging all data in the dataset",
+             "Combining the actual and forecast data into the final dataset.", unit_based=False, weight=12),
+        Step("rendering",     "Rendering report",
+             "Finalising the dataset for reporting.", unit_based=False, weight=3),
     ]
 
     async def _pub(state, message, progress=None, payload=None):
@@ -419,11 +458,16 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
     cal = Calibrator(db_client, window_days=FORECAST_CALIB_WINDOW_DAYS)
     await cal.load()
     estimates = [
-        cal.estimate("search",   boot_flat=FORECAST_BOOT_SEARCH_SECONDS),
-        cal.estimate("fetch",    boot_flat=FR24_SECONDS_PER_REQUEST_EST * 4),
-        cal.estimate("assemble", boot_flat=FORECAST_ASSEMBLE_ETA_SECONDS),
-        cal.estimate("forecast", boot_flat=FORECAST_BOOT_FORECAST_PER_OP_SECONDS * 4),
-        cal.estimate("merge",    boot_flat=FORECAST_MERGE_ETA_SECONDS),
+        cal.estimate("validating",    boot_flat=1),
+        cal.estimate("aircraft_list", boot_flat=2),
+        cal.estimate("coverage",      boot_flat=FORECAST_BOOT_SEARCH_SECONDS),
+        cal.estimate("fetching",      boot_flat=FR24_SECONDS_PER_REQUEST_EST * 4),
+        cal.estimate("snapshot",      boot_flat=1),
+        cal.estimate("transform",     boot_flat=FORECAST_ASSEMBLE_ETA_SECONDS),
+        cal.estimate("measures",      boot_flat=3),
+        cal.estimate("forecast",      boot_flat=FORECAST_BOOT_FORECAST_PER_OP_SECONDS * 4),
+        cal.estimate("merging",       boot_flat=FORECAST_MERGE_ETA_SECONDS),
+        cal.estimate("rendering",     boot_flat=1),
     ]
     reporter = ProgressReporter(publish=_pub, steps=steps, estimates=estimates,
                                 heartbeat_s=FORECAST_PROGRESS_HEARTBEAT_SECONDS,
@@ -432,10 +476,8 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
     try:
         await reporter.start()
 
-        # ── Step 1/5 — Searching historical data: validate the scope, reset the per-request tables
-        # (acys_actuals keeps other scopes — delete only THIS one; acys_forecast/acys_summary wiped),
-        # and PLAN the missing date ranges per tail (pure DB search — spends no external budget). ─────
-        await reporter.enter("search", unit_total=1)
+        # ── 1/10 Validating request — the scope has matching aircraft (else fail fast). ─────────────
+        await reporter.enter("validating")
         async with db_client.session(_DB) as s:
             ok = (await s.execute(
                 text(f'SELECT 1 FROM cirium.ciriumaircrafts ca WHERE {a5_where} LIMIT 1'),
@@ -443,23 +485,33 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         if not ok:
             await reporter.terminal("error", "No aircraft match the request")
             raise ValueError(f"empty scope: {label}")
+        d = await reporter.complete()
+        await cal.record("validating", d, 1, {"label": label})
+
+        # ── 2/10 Building Aircraft List — reset THIS request's tables + collect the aircraft list. ───
+        await _ck()
+        await reporter.enter("aircraft_list")
         async with db_client.session(_DB) as s:
-            await s.execute(text(hist_delete), scope_params)
+            await s.execute(text(hist_delete), scope_params)   # acys_actuals keeps other scopes
             await s.execute(text("TRUNCATE forecast.acys_forecast"))
             await s.execute(text("TRUNCATE forecast.acys_summary_by_day"))
             await s.commit()
         async with db_client.session(_DB) as s:
             scope_regs = (await s.execute(text(_SCOPE_REGS_TMPL.format(a5_where=a5_where)),
                                           base)).scalars().all()
-
         n_regs = max(1, len(scope_regs))
-        reporter.set_estimate("search",   cal.estimate("search", n_regs, boot_per_unit=0.03,
-                                                        boot_flat=FORECAST_BOOT_SEARCH_SECONDS))
-        reporter.set_estimate("assemble", cal.estimate("assemble", n_regs, boot_per_unit=0.02,
-                                                        boot_flat=FORECAST_ASSEMBLE_ETA_SECONDS))
-        reporter.set_estimate("merge",    cal.estimate("merge", n_regs, boot_per_unit=0.02,
-                                                        boot_flat=FORECAST_MERGE_ETA_SECONDS))
-        reporter.set_units(0, n_regs)
+        # refine the estimates now that the fleet size is known (unit-scaled where it helps)
+        reporter.set_estimate("aircraft_list", cal.estimate("aircraft_list", n_regs, boot_per_unit=0.005, boot_flat=2))
+        reporter.set_estimate("coverage",  cal.estimate("coverage", n_regs, boot_per_unit=0.03, boot_flat=FORECAST_BOOT_SEARCH_SECONDS))
+        reporter.set_estimate("transform", cal.estimate("transform", n_regs, boot_per_unit=0.02, boot_flat=FORECAST_ASSEMBLE_ETA_SECONDS))
+        reporter.set_estimate("measures",  cal.estimate("measures", n_regs, boot_per_unit=0.005, boot_flat=3))
+        reporter.set_estimate("merging",   cal.estimate("merging", n_regs, boot_per_unit=0.02, boot_flat=FORECAST_MERGE_ETA_SECONDS))
+        d = await reporter.complete()
+        await cal.record("aircraft_list", d, n_regs, {"regs": n_regs})
+
+        # ── 3/10 Checking data coverage — what history exists vs is missing (no external calls). ─────
+        await _ck()
+        await reporter.enter("coverage", unit_total=n_regs)
 
         async def _plan_progress(done, total):
             await reporter.tick(done, total)
@@ -469,15 +521,15 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             w_start=_cy2022_floor(as_of), w_end=date.today() - timedelta(days=1),
             on_progress=_plan_progress, should_cancel=_cancelled)
         d = await reporter.complete()
-        await cal.record("search", d, n_regs, {"regs": n_regs, "groups": plan_info["groups"]})
+        await cal.record("coverage", d, n_regs, {"regs": n_regs, "groups": plan_info["groups"]})
 
-        # ── Step 2/5 — Fetching data: fetch ONLY the missing ranges per tail (spends the budget). ────
+        # ── 4/10 Fetching historical data — fetch ONLY the missing ranges per tail (spends budget). ──
         await _ck()
         total_requests = max(1, plan_info["total_requests"])
-        reporter.set_estimate("fetch", cal.estimate("fetch", total_requests,
-                                                    boot_per_unit=FR24_SECONDS_PER_REQUEST_EST,
-                                                    boot_flat=FR24_SECONDS_PER_REQUEST_EST))
-        await reporter.enter("fetch", unit_total=total_requests)
+        reporter.set_estimate("fetching", cal.estimate("fetching", total_requests,
+                                                       boot_per_unit=FR24_SECONDS_PER_REQUEST_EST,
+                                                       boot_flat=FR24_SECONDS_PER_REQUEST_EST))
+        await reporter.enter("fetching", unit_total=total_requests)
 
         async def _fetch_progress(done, total):
             await reporter.tick(done, total)
@@ -488,28 +540,40 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             on_progress=_fetch_progress, should_cancel=_cancelled)
         coverage["regs"] = plan_info["regs"]
         d = await reporter.complete()
-        # calibrate fetch by the SAME unit the estimate scales on (planned requests). Skip a budget-capped
-        # fetch: its wall time reflects the budget, not the full work, so it would skew the per-unit rate.
+        # calibrate by planned requests; skip a budget-capped fetch (its wall time reflects the budget).
         if not coverage["incomplete"]:
-            await cal.record("fetch", d, total_requests,
+            await cal.record("fetching", d, total_requests,
                              {"groups": coverage["groups"], "ranges_fetched": coverage["ranges_fetched"],
                               "requests_est": total_requests, "incomplete": coverage["incomplete"]})
 
-        # ── Step 3/5 — Creating actuals dataset: assemble acys_actuals (flights) + future stubs. ─────
+        # ── 5/10 Saving historical coverage snapshot — the coverage ledger was persisted during fetch. ─
         await _ck()
-        await reporter.enter("assemble")
+        await reporter.enter("snapshot")
+        d = await reporter.complete()
+        await cal.record("snapshot", d, 1, {"ranges_fetched": coverage["ranges_fetched"]})
+
+        # ── 6/10 Transforming historical data — assemble acys_actuals (one row per flight). ──────────
+        await _ck()
+        await reporter.enter("transform")
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_assemble_sql(a5_where)), base)
             history_rows = res.rowcount
-            # future-delivery aircraft (forward fleet) as flightless stubs — no external data, never dropped
+            await s.commit()
+        d = await reporter.complete()
+        await cal.record("transform", d, n_regs, {"regs": n_regs, "history_rows": history_rows})
+
+        # ── 7/10 Calculating measures — forward-fleet aircraft (future deliveries) as flightless stubs
+        # (no external data, never dropped) + their derived measures. ────────────────────────────────
+        await _ck()
+        await reporter.enter("measures")
+        async with db_client.session(_DB) as s:
             fut = await s.execute(text(_future_aircraft_sql(a5_where)), base)
             future_aircraft = fut.rowcount
             await s.commit()
         d = await reporter.complete()
-        await cal.record("assemble", d, n_regs,
-                         {"regs": n_regs, "history_rows": history_rows, "future": future_aircraft})
+        await cal.record("measures", d, n_regs, {"regs": n_regs, "future": future_aircraft})
 
-        # ── Step 4/5 — Creating predictive analysis: forecast forward per operator. ──────────────────
+        # ── 8/10 Generating forecast — project forward per operator. ─────────────────────────────────
         await _ck()
         from API.ForecastAPI.model import run_forecast_model   # lazy: model imports panel helpers
         # forecast per operator in scope: the explicit operator, else the operators of the scoped tails
@@ -539,20 +603,21 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         await cal.record("forecast", d, n_ops,
                          {"operators": len(fc_ops), "forecast_rows": forecast_rows})
 
-        # ── Step 5/5 — Building dataset: merge into acys_summary (this request's flights + forecast). ─
+        # ── 9/10 Merging all data in the dataset — actuals + forecast → acys_summary_by_day. ─────────
         await _ck()
-        await reporter.enter("merge")
+        await reporter.enter("merging")
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_merge_sql(final_scope)), scope_params)
             final_rows = res.rowcount
             await s.commit()
         d = await reporter.complete()
-        await cal.record("merge", d, max(1, history_rows + forecast_rows),
+        await cal.record("merging", d, max(1, history_rows + forecast_rows),
                          {"history_rows": history_rows, "forecast_rows": forecast_rows,
                           "final_rows": final_rows})
 
-        # Record this run for GET /forecast/last — written ONLY here, once the WHOLE panel finished
-        # successfully (moved out of the POST /forecast trigger). Best-effort: never fail a good run.
+        # ── 10/10 Rendering report — record the run for GET /forecast/last, finalise the dataset. ────
+        await reporter.enter("rendering")
+        # best-effort: never fail a good run
         try:
             async with db_client.session("service") as s:
                 await s.execute(
@@ -566,6 +631,8 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                 await s.commit()
         except Exception as e:
             logger.warning("failed to record forecast_last_requests: %s", e)
+        d = await reporter.complete()
+        await cal.record("rendering", d, 1, {"final_rows": final_rows})
 
         summary = {
             "mode": "+".join((["operator"] if operator else []) + (["registrations"] if registrations else [])),
