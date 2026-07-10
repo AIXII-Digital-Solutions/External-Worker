@@ -120,7 +120,10 @@ def _plan(rows, future, as_of: date):
         sf_hist[sf] = [(mn, fl) for mn, fl, _ in s_tr]
         base_fleet[sf] = st.median([tl for _, _, tl in s_tr[-LEVEL_L:]]) or 1
 
-    end = date(as_of.year + FORECAST_HORIZON_YEARS, as_of.month, 1)
+    # Horizon END = last month of the last FULL contract year (as_of's CY + HORIZON-1). CYs are
+    # month-aligned on as_of.month, so the next CY would start at (as_of.month, as_of.year+HORIZON);
+    # stop ONE month before that so the forecast never spills a stray 1-month CY (e.g. Jul-2028 -> CY2028).
+    end = _add_months(date(as_of.year + FORECAST_HORIZON_YEARS, as_of.month, 1), -1)
     fmonths, plan = [], {}
     m = _add_months(frontier, 1)
     while m <= end:
