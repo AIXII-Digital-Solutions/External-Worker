@@ -88,14 +88,27 @@ def _fit(series):
     return st.median(des[-LEVEL_L:]), seas
 
 
+def _horizon_month(as_of: date) -> date:
+    return date(as_of.year + FORECAST_HORIZON_YEARS, as_of.month, 1)
+
+
+def _month_span(m: date, as_of: date):
+    """Days of month `m` the forecast covers: the CURRENT month starts today; the FINAL (horizon) month
+    ends on the anchor day; all others are full months. Returns (start_day, end_day, day_span, days_in_month).
+    `proration = day_span / days_in_month` scales the flight volume AND the day-spread identically."""
+    dim = _days_in_month(m)
+    start_day = as_of.day if m == date(as_of.year, as_of.month, 1) else 1
+    end_day = as_of.day if m == _horizon_month(as_of) else dim
+    return start_day, end_day, max(1, end_day - start_day + 1), dim
+
+
 def _plan(rows, as_of: date):
     """Fit level×seasonal per sub-fleet on months ≤ the coverage frontier, then plan the forecast months
-    from the CURRENT month (as_of) to the horizon. Returns (frontier, forecast_months, plan) where
-    plan[m] = {sf: (template_month, k)} and k = PER-AIRCRAFT flights the sub-fleet flies in month m =
-    (level / base_fleet) × seasonal[cal(m)] × proration. The ACTIVE fleet per month is resolved in SQL from
-    the latest Cirium revision (delivery ≤ month) — so every in-fleet aircraft flies every month, the volume
-    grows with deliveries, and nothing retires unless Cirium drops it. The current month is prorated from
-    today (actuals cover up to yesterday)."""
+    from the CURRENT month (as_of) to the horizon. Returns (frontier, forecast_months, plan, fits) where
+    plan[m] = {sf: (template_month, k)}, k = round((level / base_fleet) × seasonal[cal(m)] × proration), and
+    fits[sf] = (level, seasonal[1..12], base_fleet). The ACTIVE fleet per month is resolved in SQL from the
+    latest Cirium revision (delivery ≤ month) — every in-fleet aircraft flies every month, volume grows with
+    deliveries, nothing retires unless Cirium drops it. Current & final months are prorated by covered days."""
     by_sf = defaultdict(list)      # sf -> sorted [(mon, flights, tails)]
     by_mon = defaultdict(int)
     for r in rows:
@@ -105,7 +118,7 @@ def _plan(rows, as_of: date):
         by_sf[sf].sort()
     months = sorted(by_mon)
     if not months:
-        return None, [], {}
+        return None, [], {}, {}
 
     trailing = [by_mon[m] for m in months[-FRONTIER_WINDOW:]]
     med = st.median(trailing) if trailing else 0
@@ -122,17 +135,12 @@ def _plan(rows, as_of: date):
         fits[sf] = (level, seas, base)
         sf_hist[sf] = [(mn, fl) for mn, fl, _ in s_tr]
 
-    # Forecast from the CURRENT month (prorated from today) to the horizon = anchor month HORIZON years out.
-    # Horizon rows are stamped day 1 (<= anchor day) -> land in CY(as_of.year+HORIZON-1), no stray CY beyond.
-    cur_month = date(as_of.year, as_of.month, 1)
-    end = date(as_of.year + FORECAST_HORIZON_YEARS, as_of.month, 1)
     fmonths, plan = [], {}
-    m = cur_month
-    while m <= end:
-        prorate = 1.0
-        if m == cur_month:                          # current month: forecast only the remaining days
-            dim = _days_in_month(m)
-            prorate = max(0.0, dim - as_of.day + 1) / dim
+    m = date(as_of.year, as_of.month, 1)
+    horizon = _horizon_month(as_of)
+    while m <= horizon:
+        _, _, day_span, dim = _month_span(m, as_of)
+        prorate = day_span / dim                    # covered-days fraction (1.0 except current & final months)
         sfp = {}
         for sf, (level, seas, base) in fits.items():
             k = round(level * seas[m.month] / base * prorate)       # PER-AIRCRAFT flights this month
@@ -145,7 +153,7 @@ def _plan(rows, as_of: date):
             plan[m] = sfp
             fmonths.append(m)
         m = _add_months(m, 1)
-    return frontier, fmonths, plan
+    return frontier, fmonths, plan, fits
 
 
 def _insert_sql(scope: str) -> str:
@@ -240,17 +248,24 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         logger.info("forecast_model: no acys_actuals flights for %s", operator)
         return {"forecast_rows": 0, "months": 0, "frontier": None}
 
-    frontier, fmonths, plan = _plan(rows, as_of)
+    frontier, fmonths, plan, fits = _plan(rows, as_of)
+    # fleet delivery dates per sub-fleet (latest revision) — for the active-fleet count + coefficients table
+    fleet_deliv = defaultdict(list)
+    for r in (await session.execute(text(
+            'WITH latest AS (SELECT max(revision_id) mr FROM cirium.ciriumaircrafts WHERE "Operator" = :op) '
+            'SELECT coalesce(nullif("Master Series", \'\'), \'NA\') sf, "Delivery Date" deliv '
+            'FROM cirium.ciriumaircrafts WHERE "Operator" = :op AND revision_id = (SELECT mr FROM latest) '
+            f'AND "Registration" IS NOT NULL AND "Registration" <> \'\' {scope_sql}'),
+            {"op": operator, **sp})).all():
+        fleet_deliv[r[0]].append(r[1])
+
     sql = _insert_sql(scope_sql)
-    total = 0
+    total, coeff = 0, []
     nfm = max(1, len(fmonths))
-    cur_month = date(as_of.year, as_of.month, 1)
-    horizon_month = date(as_of.year + FORECAST_HORIZON_YEARS, as_of.month, 1)
     for fi, m in enumerate(fmonths):
         m_end = _add_months(m, 1) - timedelta(days=1)          # last day of the forecast month (delivery cutoff)
-        start_day = as_of.day if m == cur_month else 1         # current month starts TODAY; else the 1st
-        end_day = as_of.day if m == horizon_month else _days_in_month(m)  # last month stops at as_of+HORIZON day
-        day_span = max(1, end_day - start_day + 1)             # flights are spread over these days of the month
+        start_day, end_day, day_span, dim = _month_span(m, as_of)
+        prorate = day_span / dim
         for sf, (tm, k) in plan[m].items():
             params = {"op": operator, "sf": sf, "template_month": tm, "m_end": m_end, "k": int(k),
                       "period": m.strftime("%m-%Y"), "year": m.year, "month": m.month,
@@ -259,12 +274,34 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
                       "pax_factor": FORECAST_PAX_LOAD_FACTOR, **sp}
             res = await session.execute(text(sql), params)
             total += res.rowcount or 0
+            level, seas, base = fits[sf]
+            active = sum(1 for d in fleet_deliv.get(sf, []) if d is None or d <= m_end)
+            coeff.append({"op": operator, "sf": sf, "fm": m, "cm": m.month, "fr": frontier,
+                          "lvl": float(level), "base": float(base), "par": float(level / base),
+                          "seas": float(seas[m.month]), "pro": float(prorate), "act": active,
+                          "k": int(k), "nhat": int(k) * active, "tm": tm})
         if on_progress is not None:
             try:
                 await on_progress((fi + 1) / nfm)
             except Exception:
                 pass
     await session.commit()
+
+    # coefficients table (per-operator refresh) — powers "how the forecast is computed" charts
+    try:
+        await session.execute(
+            text('DELETE FROM forecast.acys_forecast_coefficients WHERE "Operator" = :op'), {"op": operator})
+        if coeff:
+            await session.execute(text(
+                'INSERT INTO forecast.acys_forecast_coefficients '
+                '("Operator","Master Series","Forecast Month","Calendar Month","Frontier","Level",'
+                ' "Base Fleet","Per Aircraft Rate","Seasonal Factor","Proration","Active Fleet",'
+                ' "Flights Per Aircraft","Forecast Flights","Template Month") '
+                'VALUES (:op,:sf,:fm,:cm,:fr,:lvl,:base,:par,:seas,:pro,:act,:k,:nhat,:tm)'), coeff)
+        await session.commit()
+    except Exception as e:
+        logger.warning("forecast coefficients write failed for %s: %s", operator, e)
+
     logger.info("forecast_model: %s → %d forecast rows over %d months (frontier %s)",
                 operator, total, len(fmonths), frontier)
     return {"forecast_rows": total, "months": len(fmonths),

@@ -83,7 +83,7 @@ months ≤ frontier feed the fit (recent lagging/incomplete months are ignored f
 ### 4.3 Per forecast month `m`, per sub-fleet
 - **`k` (flights per aircraft this month)** = `round(level / base_fleet × seasonal[cal(m)] × proration)`.
   - `level / base_fleet` = deseasonalized flights **per aircraft**.
-  - `proration` = 1.0 for full months; for the **current** month = `(days_in_month − today.day + 1) / days_in_month` (forecast covers today → month end; actuals cover the earlier days).
+  - `proration` = covered-days / days-in-month = 1.0 for full months; the **current** month covers today → month-end (actuals cover the earlier days), and the **final** month covers month-start → the `as_of + HORIZON` day. Both scale `k` AND the day-spread identically.
 - **`active fleet`** = latest-revision aircraft of the sub-fleet with `Delivery Date ≤ end of m` (or null). **No retirement.**
 - **`route pool`** = the flights of the sub-fleet's **template month** (latest same-calendar-month ≤ frontier; else the sub-fleet's latest month). This is the operator's usual network for that type.
 - **Generation:** each active aircraft flies `k` flights, cycling the route pool: `route = pool[((g−1) mod pool_size) + 1]` for `g = 1..k`. Total sub-fleet flights = `k × |active fleet|` → grows automatically with deliveries.
@@ -126,5 +126,35 @@ Wet months and non-positive values are excluded from all four.
 One row per real flight. Aircraft attributes from the reference (authoritative operator per (tail, month)
 = newest revision; wet-lease/ACMI duplicates collapsed). Route/geo from the flight source. `Circle Distance`
 = great-circle (haversine) km between origin & destination; `Age = (Date − Delivery Date)/365.25`.
-Flights with no origin **or** no destination airport code are dropped. Lower bound = the day after the
-anchor day in 2022 (CY2022 start).
+Flights with no origin **or** no destination airport code are dropped. Lower bound is by **date**:
+`first_seen::date > (anchor day in 2022)` — a same-day flight at any clock time on the anchor day still
+falls in CY2021 and is dropped, so **CY2021 never appears**.
+
+---
+
+## 7. `forecast.acys_forecast_coefficients` — coefficients for charts
+
+One row per **(Operator, Master Series, Forecast Month)**, written by the forecast model (per-operator
+refresh: it deletes its operator's rows, then re-inserts). It exposes every coefficient behind the forecast.
+
+| Column | Meaning |
+|--------|---------|
+| Operator, Master Series | operator and sub-fleet (type) |
+| Forecast Month / Calendar Month | 1st of the forecast month / its month-of-year (1..12, for the seasonal curve) |
+| Frontier | last complete actual month (fit boundary) |
+| Level | deseasonalized recent flight level (sub-fleet) |
+| Base Fleet | typical flown-tail count |
+| Per Aircraft Rate | `Level / Base Fleet` = deseasonalized flights per aircraft |
+| Seasonal Factor | `seasonal[Calendar Month]` |
+| Proration | covered-days fraction (1.0 except current & final months) |
+| Active Fleet | aircraft flying this month (delivered ≤ month) |
+| Flights Per Aircraft | `k = round(Per Aircraft Rate × Seasonal Factor × Proration)` |
+| Forecast Flights | `k × Active Fleet` — the month's forecast volume |
+| Template Month | route-template month used |
+
+Chart recipes:
+- **Forecast volume over time:** `SELECT "Forecast Month", sum("Forecast Flights") … GROUP BY 1`.
+- **Fleet growth (deliveries arriving):** `sum("Active Fleet")` by `"Forecast Month"`.
+- **Seasonal curve:** `"Seasonal Factor"` by `"Calendar Month"` (distinct per `"Master Series"`).
+- **Per-aircraft rate / level / base fleet:** one value per sub-fleet.
+- `Forecast Flights = Flights Per Aircraft × Active Fleet` and `Flights Per Aircraft = round(Per Aircraft Rate × Seasonal Factor × Proration)` — the whole calculation is reconstructable from the row.
