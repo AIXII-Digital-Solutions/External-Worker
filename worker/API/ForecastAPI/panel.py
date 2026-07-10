@@ -592,11 +592,17 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         forecast_rows = 0
         for idx, op in enumerate(fc_ops):
             await _ck()
+
+            async def _fc_prog(frac, _i=idx):
+                # move WITHIN this operator's share of the step so a single-operator run isn't frozen
+                await reporter.tick(_i + frac, n_ops)
+
             async with db_client.session(_DB) as s:
                 # scope the forecast source to THIS request's tails (acys_actuals accumulates across
                 # requests) so a registrations-scoped run does not forecast sibling tails
                 fr = await run_forecast_model(session=s, operator=op, as_of=as_of,
-                                              scope_where=final_scope, scope_params=scope_params)
+                                              scope_where=final_scope, scope_params=scope_params,
+                                              on_progress=_fc_prog)
             forecast_rows += fr.get("forecast_rows", 0)
             await reporter.tick(idx + 1, n_ops)
         d = await reporter.complete()
