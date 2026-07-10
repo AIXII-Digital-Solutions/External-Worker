@@ -95,7 +95,7 @@ CY2026 = (10-июл-2026 , 10-июл-2027]
 | Registration, Manufacturer, Aircraft Sub Series, Primary Usage, **Total Seats**, Delivery Date, Lease Type, Lease Dry/Wet, Operational Lessor | **назначенный борт** (последняя ревизия справочника) |
 | Master Series, Operator | суб-флот / оператор запроса |
 | IATA/ICAO Origin & Destination, Circle Distance, Actual Distance FR, Flight Time, Flight Time FR | **маршрут** из пула (реальный исторический маршрут типа) |
-| Date | `сегодня` для текущего месяца, иначе 1-е число месяца |
+| Date | **распределяется по дням месяца** (текущий месяц: с сегодня; последний месяц: до дня `as_of + HORIZON`) — чтобы день-в-день контрактный год делил якорный месяц так же, как факт (окно Jul→Jul, а не Aug→Jul) |
 | Contract Year | §3 к Date |
 | **Total PAX** | `Total Seats × FORECAST_PAX_LOAD_FACTOR (0.8)` |
 | Time Departed / Time Landed | null (у месячного прогноза нет времени суток) |
