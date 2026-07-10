@@ -26,16 +26,21 @@
 - `step_key`: `search` | `fetch` | `assemble` | `forecast` | `merge`.
 - на `success` дополнительно едут сводные поля (`history_rows`, `forecast_rows`, `final_rows`, …).
 
-## 5 шагов (в этом порядке)
+## 10 шагов (в этом порядке)
 
-1. **Searching historical data**
-2. **Fetching data**
-3. **Creating actuals dataset**
-4. **Creating predictive analysis**
-5. **Building dataset**
+1. **Validating request**
+2. **Building Aircraft List**
+3. **Checking data coverage**
+4. **Fetching historical data**
+5. **Saving historical coverage snapshot**
+6. **Transforming historical data**
+7. **Calculating measures**
+8. **Generating forecast**
+9. **Merging all data in the dataset**
+10. **Rendering report**
 → `success`
 
-Заголовки/пояснения **не хардкодь** — рендери то, что прислал API (`message` + `payload.detail`). Номер шага можно показать как «Step 2 of 5» из `step`/`step_total`.
+Заголовки/пояснения **не хардкодь** — рендери то, что прислал API (`message` + `payload.detail`). Номер шага показывай как «Step N of `step_total`» из `step`/`step_total` (сейчас `step_total`=10, но НЕ хардкодь 10 — бери из payload, число шагов может меняться).
 
 ## Что делать (правила)
 
