@@ -174,9 +174,10 @@ array6 AS (
            f.actual_distance, f.flight_time
     FROM flightradar.flightsummary f
     WHERE f.reg IN (SELECT registration FROM array5)
-      -- lower bound is ALWAYS the start of CY2022 (day after the anchor day in 2022): flights on/before
-      -- the anchor day fall in CY2021 and are dropped. Upper bound is the request date.
-      AND f.first_seen > make_date(2022, :anchor_month, :anchor_day)
+      -- lower bound is ALWAYS the start of CY2022: flights ON or before the anchor DAY in 2022 fall in
+      -- CY2021 and are dropped. Compare the DATE (first_seen is a timestamp — a same-day flight at any
+      -- clock time must still be excluded, so `first_seen > midnight` is not enough). Upper: request date.
+      AND f.first_seen::date > make_date(2022, :anchor_month, :anchor_day)
       AND f.first_seen <  :as_of
       -- DROP a flight with NO ICAO origin, or NO ICAO destination (neither actual nor planned)
       AND nullif(f.orig_icao, '') IS NOT NULL
