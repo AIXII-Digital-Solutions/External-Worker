@@ -120,10 +120,10 @@ def _plan(rows, future, as_of: date):
         sf_hist[sf] = [(mn, fl) for mn, fl, _ in s_tr]
         base_fleet[sf] = st.median([tl for _, _, tl in s_tr[-LEVEL_L:]]) or 1
 
-    # Horizon END = last month of the last FULL contract year (as_of's CY + HORIZON-1). CYs are
-    # month-aligned on as_of.month, so the next CY would start at (as_of.month, as_of.year+HORIZON);
-    # stop ONE month before that so the forecast never spills a stray 1-month CY (e.g. Jul-2028 -> CY2028).
-    end = _add_months(date(as_of.year + FORECAST_HORIZON_YEARS, as_of.month, 1), -1)
+    # Horizon END = the anchor month HORIZON years out. Its forecast rows are stamped on day 1, which is
+    # <= the anchor day, so they land in CY(as_of.year + HORIZON - 1) — the last full CY — with no stray
+    # CY beyond it (e.g. for a 10-Jul-2026 request the last forecast month is Jul-2028 -> CY2027).
+    end = date(as_of.year + FORECAST_HORIZON_YEARS, as_of.month, 1)
     fmonths, plan = [], {}
     m = _add_months(frontier, 1)
     while m <= end:
@@ -191,8 +191,9 @@ WHERE r.copies > 0
 
 
 def _contract_year(d: date, anchor: date) -> str:
-    # MONTH-aligned (day ignored) so a CY is exactly 12 calendar months, labelled by its START year.
-    before = d.month < anchor.month
+    # DAY-PRECISE window ending ON the anchor day: (anchor, anchor+1y], labelled by its START year.
+    # A forecast month stamped on day 1 (< anchor day) lands in the CY that the anchor day closes.
+    before = (d.month, d.day) <= (anchor.month, anchor.day)
     return f"CY{d.year - (1 if before else 0)}"
 
 
