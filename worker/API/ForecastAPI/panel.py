@@ -63,11 +63,14 @@ HISTORY_START = date(2022, 7, 1)   # Period >= 07-2022 (2.2) and flightsummary f
 _DB = "cirium"   # any aviation logical name -> the physical aixii DB (cirium/flightradar/main/forecast)
 _REQUEST_TYPE = "ACYS"   # this Cirium×FR24 panel algorithm — stamped on the forecast_last_requests row
 
-# Contract Year for a flight's first_seen vs the request anchor MONTH (:anchor_month). MONTH-aligned so a
-# CY is EXACTLY 12 calendar months [anchor_month .. anchor_month-1], labelled by its START year (the day
-# is ignored — a July-10 request still yields CY = Jul..Jun, not a July-split 13-month bucket).
+# Contract Year for a flight's first_seen vs the request anchor DATE (:anchor_month/:anchor_day): a
+# DAY-PRECISE 12-month window ending ON the anchor day. For a 10-Jul-2026 request, CY2025 =
+# (10-Jul-2025 .. 10-Jul-2026], i.e. 11-Jul-2025 .. 10-Jul-2026 — the anchor day is the LAST day of the CY
+# (hence `<= :anchor_day`). Labelled by its START year.
 _CONTRACT_YEAR = """'CY' || (extract(year from a6.first_seen)::int - CASE
         WHEN extract(month from a6.first_seen)::int < :anchor_month
+          OR (extract(month from a6.first_seen)::int = :anchor_month
+              AND extract(day from a6.first_seen)::int <= :anchor_day)
         THEN 1 ELSE 0 END)::text"""
 
 # flightsummary.flight_time is integer seconds (with some bad negatives) -> interval, NULL if < 0/null.
@@ -171,9 +174,9 @@ array6 AS (
            f.actual_distance, f.flight_time
     FROM flightradar.flightsummary f
     WHERE f.reg IN (SELECT registration FROM array5)
-      -- lower bound is ALWAYS the start of CY2022 (start of the anchor month in 2022, month-aligned):
-      -- flights before it fall in CY2021 and are dropped. Upper bound is the request date.
-      AND f.first_seen >= make_date(2022, :anchor_month, 1)
+      -- lower bound is ALWAYS the start of CY2022 (day after the anchor day in 2022): flights on/before
+      -- the anchor day fall in CY2021 and are dropped. Upper bound is the request date.
+      AND f.first_seen > make_date(2022, :anchor_month, :anchor_day)
       AND f.first_seen <  :as_of
       -- DROP a flight with NO ICAO origin, or NO ICAO destination (neither actual nor planned)
       AND nullif(f.orig_icao, '') IS NOT NULL
@@ -349,9 +352,12 @@ WHERE {a5_where}
 
 
 def _cy2022_floor(as_of: date) -> date:
-    """Start of CY2022 relative to the request anchor MONTH (month-aligned: make_date(2022, month, 1));
-    the FR24 fetch lower bound."""
-    return date(2022, as_of.month, 1)
+    """Start of CY2022 relative to the request anchor DATE (make_date(2022, month, day)); the FR24 fetch
+    lower bound. Guards the Feb-29 case (2022 is not a leap year)."""
+    try:
+        return date(2022, as_of.month, as_of.day)
+    except ValueError:
+        return date(2022, as_of.month, 28)
 
 
 def _scope(operator, registrations):
