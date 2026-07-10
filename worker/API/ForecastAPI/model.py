@@ -41,7 +41,7 @@ LIVE_WINDOW_MONTHS = 3  # an aircraft is forecastable only if it flew within thi
                         # frontier; a longer-idle tail is treated as retired and NOT projected forward.
 
 _MONTHLY_SQL = """
-SELECT coalesce(nullif("Master Series",''),'NA') AS sf,
+SELECT coalesce(nullif("Aircraft Sub Series",''),'NA') AS sf,
        date_trunc('month',"Date")::date          AS mon,
        count(*)                                   AS flights,
        count(DISTINCT "Registration")             AS tails
@@ -50,9 +50,10 @@ WHERE "Operator" = :op AND "Date" IS NOT NULL AND "Date" >= :start {scope}
 GROUP BY 1, 2
 """
 
-# forward fleet: future-delivery STUB rows (Date NULL) — aircraft arriving per (sub-fleet, delivery month)
+# DEPRECATED (unused): the fleet + future deliveries now come from the reference (§ run_forecast_model),
+# not from Date-NULL stub rows. Kept only to avoid churn; sub-fleet key would be "Aircraft Sub Series".
 _FUTURE_SQL = """
-SELECT coalesce(nullif("Master Series",''),'NA')      AS sf,
+SELECT coalesce(nullif("Aircraft Sub Series",''),'NA') AS sf,
        date_trunc('month',"Delivery Date")::date      AS deliv,
        count(*)                                        AS n
 FROM forecast.acys_actuals
@@ -174,13 +175,13 @@ INSERT INTO forecast.acys_forecast
 WITH latest AS (SELECT max(revision_id) mr FROM cirium.ciriumaircrafts WHERE "Operator" = :op),
 fleet AS (   -- active aircraft of this sub-fleet at :m_end (delivered by then; future deliveries included)
     SELECT DISTINCT ON (ca."Registration")
-           ca."Registration" reg, ca."Manufacturer" manuf, ca."Aircraft Sub Series" subs,
+           ca."Registration" reg, ca."Master Series" mseries, ca."Manufacturer" manuf,
            ca."Primary Usage" usage, ca."Indicative Market Value (US$m)" av, ca."Number of Seats" seats,
            ca."Delivery Date" deliv, ca."Lease Type" ltype, ca."Lease Dry / Wet" ldw,
            ca."Operational Lessor" lessor
     FROM cirium.ciriumaircrafts ca
     WHERE ca."Operator" = :op AND ca.revision_id = (SELECT mr FROM latest)
-      AND coalesce(nullif(ca."Master Series",''),'NA') = :sf
+      AND coalesce(nullif(ca."Aircraft Sub Series",''),'NA') = :sf
       AND ca."Registration" IS NOT NULL AND ca."Registration" <> ''
       AND (ca."Delivery Date" IS NULL OR ca."Delivery Date" <= :m_end) {scope}
     ORDER BY ca."Registration"
@@ -192,12 +193,12 @@ routes AS (   -- the sub-fleet's typical route pool = a template month's real fl
            row_number() OVER (ORDER BY id) rn
     FROM forecast.acys_actuals
     WHERE "Operator" = :op AND "Date" IS NOT NULL
-      AND coalesce(nullif("Master Series",''),'NA') = :sf
+      AND coalesce(nullif("Aircraft Sub Series",''),'NA') = :sf
       AND date_trunc('month',"Date")::date = :template_month {scope}
 ),
 nr AS (SELECT count(*)::int c FROM routes),
 gen AS (   -- every active aircraft × :k flights, cycling the route pool
-    SELECT f.reg, f.manuf, f.subs, f.usage, f.av, f.seats, f.deliv, f.ltype, f.ldw, f.lessor,
+    SELECT f.reg, f.mseries, f.manuf, f.usage, f.av, f.seats, f.deliv, f.ltype, f.ldw, f.lessor,
            r.io, r.idd, r.ida, r.ico, r.icd, r.ica, r.cd, r.ft, r.adf, r.ftf,
            (row_number() OVER () - 1) AS rn
     FROM fleet f
@@ -212,7 +213,7 @@ s AS (   -- SPREAD the flights across the month's days (current month: from toda
 SELECT
     s.reg, :period, s.fdate, NULL, NULL,
     s.io, s.idd, s.ida, s.ico, s.icd, s.ica,
-    :op, :sf, s.manuf, s.subs, s.usage,
+    :op, s.mseries, s.manuf, :sf, s.usage,
     'CY' || (extract(year from s.fdate)::int - CASE
         WHEN extract(month from s.fdate)::int < :anchor_month
           OR (extract(month from s.fdate)::int = :anchor_month
@@ -249,15 +250,17 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         return {"forecast_rows": 0, "months": 0, "frontier": None}
 
     frontier, fmonths, plan, fits = _plan(rows, as_of)
-    # fleet delivery dates per sub-fleet (latest revision) — for the active-fleet count + coefficients table
-    fleet_deliv = defaultdict(list)
+    # fleet delivery dates per sub-fleet (Aircraft Sub Series, latest revision) — active-fleet count +
+    # coefficients; also capture each sub-series' Master Series (constant per sub-series) for chart grouping.
+    fleet_deliv, sf_master = defaultdict(list), {}
     for r in (await session.execute(text(
             'WITH latest AS (SELECT max(revision_id) mr FROM cirium.ciriumaircrafts WHERE "Operator" = :op) '
-            'SELECT coalesce(nullif("Master Series", \'\'), \'NA\') sf, "Delivery Date" deliv '
+            'SELECT coalesce(nullif("Aircraft Sub Series", \'\'), \'NA\') sf, "Master Series" ms, "Delivery Date" deliv '
             'FROM cirium.ciriumaircrafts WHERE "Operator" = :op AND revision_id = (SELECT mr FROM latest) '
             f'AND "Registration" IS NOT NULL AND "Registration" <> \'\' {scope_sql}'),
             {"op": operator, **sp})).all():
-        fleet_deliv[r[0]].append(r[1])
+        fleet_deliv[r[0]].append(r[2])
+        sf_master.setdefault(r[0], r[1])
 
     sql = _insert_sql(scope_sql)
     total, coeff = 0, []
@@ -267,6 +270,9 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         start_day, end_day, day_span, dim = _month_span(m, as_of)
         prorate = day_span / dim
         for sf, (tm, k) in plan[m].items():
+            active = sum(1 for d in fleet_deliv.get(sf, []) if d is None or d <= m_end)
+            if active == 0:
+                continue   # sub-series no longer in the latest fleet -> nothing to forecast this month
             params = {"op": operator, "sf": sf, "template_month": tm, "m_end": m_end, "k": int(k),
                       "period": m.strftime("%m-%Y"), "year": m.year, "month": m.month,
                       "start_day": start_day, "day_span": day_span,
@@ -275,9 +281,8 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
             res = await session.execute(text(sql), params)
             total += res.rowcount or 0
             level, seas, base = fits[sf]
-            active = sum(1 for d in fleet_deliv.get(sf, []) if d is None or d <= m_end)
-            coeff.append({"op": operator, "sf": sf, "fm": m, "cm": m.month, "fr": frontier,
-                          "lvl": float(level), "base": float(base), "par": float(level / base),
+            coeff.append({"op": operator, "ms": sf_master.get(sf), "sf": sf, "fm": m, "cm": m.month,
+                          "fr": frontier, "lvl": float(level), "base": float(base), "par": float(level / base),
                           "seas": float(seas[m.month]), "pro": float(prorate), "act": active,
                           "k": int(k), "nhat": int(k) * active, "tm": tm})
         if on_progress is not None:
@@ -294,10 +299,10 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         if coeff:
             await session.execute(text(
                 'INSERT INTO forecast.acys_forecast_coefficients '
-                '("Operator","Master Series","Forecast Month","Calendar Month","Frontier","Level",'
-                ' "Base Fleet","Per Aircraft Rate","Seasonal Factor","Proration","Active Fleet",'
-                ' "Flights Per Aircraft","Forecast Flights","Template Month") '
-                'VALUES (:op,:sf,:fm,:cm,:fr,:lvl,:base,:par,:seas,:pro,:act,:k,:nhat,:tm)'), coeff)
+                '("Operator","Master Series","Aircraft Sub Series","Forecast Month","Calendar Month",'
+                ' "Frontier","Level","Base Fleet","Per Aircraft Rate","Seasonal Factor","Proration",'
+                ' "Active Fleet","Flights Per Aircraft","Forecast Flights","Template Month") '
+                'VALUES (:op,:ms,:sf,:fm,:cm,:fr,:lvl,:base,:par,:seas,:pro,:act,:k,:nhat,:tm)'), coeff)
         await session.commit()
     except Exception as e:
         logger.warning("forecast coefficients write failed for %s: %s", operator, e)
