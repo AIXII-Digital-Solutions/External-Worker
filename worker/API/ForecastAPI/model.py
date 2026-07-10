@@ -187,19 +187,34 @@ routes AS (   -- the sub-fleet's typical route pool = a template month's real fl
       AND coalesce(nullif("Master Series",''),'NA') = :sf
       AND date_trunc('month',"Date")::date = :template_month {scope}
 ),
-nr AS (SELECT count(*)::int c FROM routes)
+nr AS (SELECT count(*)::int c FROM routes),
+gen AS (   -- every active aircraft × :k flights, cycling the route pool
+    SELECT f.reg, f.manuf, f.subs, f.usage, f.av, f.seats, f.deliv, f.ltype, f.ldw, f.lessor,
+           r.io, r.idd, r.ida, r.ico, r.icd, r.ica, r.cd, r.ft, r.adf, r.ftf,
+           (row_number() OVER () - 1) AS rn
+    FROM fleet f
+    CROSS JOIN generate_series(1, :k) g          -- :k flights per aircraft this month
+    CROSS JOIN nr
+    JOIN routes r ON nr.c > 0 AND r.rn = ((g - 1) % nr.c) + 1   -- cycle the route pool
+),
+s AS (   -- SPREAD the flights across the month's days (current month: from today) so the DAY-PRECISE
+         -- Contract Year splits the anchor month exactly like the actuals (Jul→Jul window, not Aug→Jul)
+    SELECT gen.*, make_date(:year, :month, (:start_day + (rn % :day_span))::int) AS fdate FROM gen
+)
 SELECT
-    f.reg, :period, :fdate, NULL, NULL,
-    r.io, r.idd, r.ida, r.ico, r.icd, r.ica,
-    :op, :sf, f.manuf, f.subs, f.usage,
-    :contract_year, r.cd, r.ft,
-    CASE WHEN f.ldw = 'Wet' THEN 0 ELSE f.av END,
-    f.seats, f.seats * CAST(:pax_factor AS double precision), r.adf, r.ftf,
-    f.deliv, f.ltype, f.ldw, f.lessor
-FROM fleet f
-CROSS JOIN generate_series(1, :k) g          -- :k flights per aircraft this month
-CROSS JOIN nr
-JOIN routes r ON nr.c > 0 AND r.rn = ((g - 1) % nr.c) + 1   -- cycle the route pool
+    s.reg, :period, s.fdate, NULL, NULL,
+    s.io, s.idd, s.ida, s.ico, s.icd, s.ica,
+    :op, :sf, s.manuf, s.subs, s.usage,
+    'CY' || (extract(year from s.fdate)::int - CASE
+        WHEN extract(month from s.fdate)::int < :anchor_month
+          OR (extract(month from s.fdate)::int = :anchor_month
+              AND extract(day from s.fdate)::int <= :anchor_day)
+        THEN 1 ELSE 0 END)::text,
+    s.cd, s.ft,
+    CASE WHEN s.ldw = 'Wet' THEN 0 ELSE s.av END,
+    s.seats, s.seats * CAST(:pax_factor AS double precision), s.adf, s.ftf,
+    s.deliv, s.ltype, s.ldw, s.lessor
+FROM s
 """
 
 
@@ -230,13 +245,17 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
     total = 0
     nfm = max(1, len(fmonths))
     cur_month = date(as_of.year, as_of.month, 1)
+    horizon_month = date(as_of.year + FORECAST_HORIZON_YEARS, as_of.month, 1)
     for fi, m in enumerate(fmonths):
-        m_end = _add_months(m, 1) - timedelta(days=1)     # last day of the forecast month (delivery cutoff)
-        fdate = as_of if m == cur_month else m            # current month stamped 'today', else the 1st
+        m_end = _add_months(m, 1) - timedelta(days=1)          # last day of the forecast month (delivery cutoff)
+        start_day = as_of.day if m == cur_month else 1         # current month starts TODAY; else the 1st
+        end_day = as_of.day if m == horizon_month else _days_in_month(m)  # last month stops at as_of+HORIZON day
+        day_span = max(1, end_day - start_day + 1)             # flights are spread over these days of the month
         for sf, (tm, k) in plan[m].items():
             params = {"op": operator, "sf": sf, "template_month": tm, "m_end": m_end, "k": int(k),
-                      "period": m.strftime("%m-%Y"), "fdate": fdate,
-                      "contract_year": _contract_year(fdate, as_of),
+                      "period": m.strftime("%m-%Y"), "year": m.year, "month": m.month,
+                      "start_day": start_day, "day_span": day_span,
+                      "anchor_month": as_of.month, "anchor_day": as_of.day,
                       "pax_factor": FORECAST_PAX_LOAD_FACTOR, **sp}
             res = await session.execute(text(sql), params)
             total += res.rowcount or 0
