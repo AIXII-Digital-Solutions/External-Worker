@@ -94,7 +94,7 @@ months ≤ frontier feed the fit (recent lagging/incomplete months are ignored f
 | Registration, Manufacturer, Aircraft Sub Series, Primary Usage, **Total Seats**, Delivery Date, Lease Type, Lease Dry/Wet, Operational Lessor | the **assigned aircraft** (latest reference revision) |
 | Master Series, Operator | the sub-fleet / request operator |
 | IATA/ICAO Origin & Destination, Circle Distance, Actual Distance FR, Flight Time, Flight Time FR | the **route** from the pool (the type's real historical route) |
-| Date | `today` for the current month, else the 1st of the month |
+| Date | **spread across the month's days** (current month: from today; final month: up to the `as_of + HORIZON` day) so the day-precise Contract Year divides the anchor month exactly like the actuals (Jul→Jul window, not Aug→Jul) |
 | Contract Year | §3 applied to Date |
 | **Total PAX** | `Total Seats × FORECAST_PAX_LOAD_FACTOR (0.8)` |
 | Time Departed / Time Landed | null (monthly forecast has no clock time) |
