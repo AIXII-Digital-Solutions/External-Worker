@@ -167,12 +167,10 @@ rep AS (
     JOIN plan p ON p.sf = {sfkey}
     WHERE t."Operator" = :op AND t."Date" IS NOT NULL
       AND date_trunc('month', t."Date")::date = :template_month {scope}
-      -- only project aircraft STILL in the fleet at the frontier: a template tail that stopped flying
-      -- >= LIVE_WINDOW_MONTHS before the frontier is retired and must NOT be revived in the forecast.
-      AND EXISTS (SELECT 1 FROM forecast.acys_actuals a2
-                  WHERE a2."Registration" = t."Registration" AND a2."Operator" = :op
-                    AND a2."Date" IS NOT NULL
-                    AND date_trunc('month', a2."Date")::date >= :live_since)
+      -- only project aircraft STILL in the fleet at the frontier (precomputed live-reg list — a fast hash
+      -- filter, not a per-flight subquery). A tail idle >= LIVE_WINDOW_MONTHS before the frontier is
+      -- retired and must NOT be revived in the forecast.
+      AND t."Registration" = ANY(:live_regs)
 )
 SELECT
     r."Registration", :period, :fdate, NULL, NULL,
@@ -196,8 +194,11 @@ def _contract_year(d: date, anchor: date) -> str:
 
 
 async def run_forecast_model(*, session, operator: str, as_of: date,
-                             scope_where: str | None = None, scope_params: dict | None = None) -> dict:
-    """Populate forecast.acys_forecast for `operator`, restricted to the request scope. Returns counts."""
+                             scope_where: str | None = None, scope_params: dict | None = None,
+                             on_progress=None) -> dict:
+    """Populate forecast.acys_forecast for `operator`, restricted to the request scope. Returns counts.
+    `on_progress(fraction)` (async, optional) is called after each forecast month, so a single-operator
+    run still shows movement across the step instead of freezing at the band floor."""
     scope_sql = f"AND ({scope_where})" if scope_where else ""
     sp = dict(scope_params or {})
     base_params = {"op": operator, "start": HISTORY_START, **sp}
@@ -210,10 +211,20 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         text(_FUTURE_SQL.format(scope=scope_sql)), {"op": operator, **sp})).all()]
 
     frontier, fmonths, plan = _plan(rows, future, as_of)
-    live_since = _add_months(frontier, -(LIVE_WINDOW_MONTHS - 1)) if frontier else None
+    # live fleet: aircraft that flew within LIVE_WINDOW_MONTHS up to the frontier (else retired) — computed
+    # ONCE so the replication filters by a small reg list (fast) instead of a per-flight correlated subquery.
+    live_regs = []
+    if frontier:
+        live_since = _add_months(frontier, -(LIVE_WINDOW_MONTHS - 1))
+        live_regs = [r[0] for r in (await session.execute(
+            text('SELECT DISTINCT "Registration" FROM forecast.acys_actuals '
+                 'WHERE "Operator" = :op AND "Date" IS NOT NULL '
+                 f'AND date_trunc(\'month\',"Date")::date >= :ls {scope_sql}'),
+            {"op": operator, "ls": live_since, **sp})).all()]
     sql = _insert_sql(scope_sql)
     total = 0
-    for m in fmonths:
+    nfm = max(1, len(fmonths))
+    for fi, m in enumerate(fmonths):
         by_tm = defaultdict(dict)
         for sf, (tm, scale) in plan.get(m, {}).items():
             by_tm[tm][sf] = scale
@@ -221,13 +232,18 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
             vals = []
             params = {"op": operator, "template_month": tm, "period": m.strftime("%m-%Y"),
                       "fdate": m, "contract_year": _contract_year(m, as_of),
-                      "live_since": live_since, **sp}
+                      "live_regs": live_regs, **sp}
             for i, (sf, sc) in enumerate(scales.items()):
                 vals.append(f"(:sfk_{i}, CAST(:scale_{i} AS double precision))")
                 params[f"sfk_{i}"] = sf
                 params[f"scale_{i}"] = float(sc)
             res = await session.execute(text(sql.replace("{plan_values}", ", ".join(vals))), params)
             total += res.rowcount or 0
+        if on_progress is not None:
+            try:
+                await on_progress((fi + 1) / nfm)
+            except Exception:
+                pass
     await session.commit()
     logger.info("forecast_model: %s → %d forecast rows over %d months (frontier %s, %d future-fleet cells)",
                 operator, total, len(fmonths), frontier, len(future))
