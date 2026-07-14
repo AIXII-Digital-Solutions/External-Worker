@@ -115,8 +115,9 @@ falls in CY2021 and is dropped, so **CY2021 never appears**.
 
 ## 6. `forecast.acys_forecast_coefficients` — coefficients for charts
 
-One row per **(Operator, Master Series, Forecast Month)**, written by the forecast model (per-operator
-refresh: it deletes its operator's rows, then re-inserts). It exposes every coefficient behind the forecast.
+One row per **(Operator, Aircraft Sub Series, Forecast Month)** — the forecast's own grain — written by the
+forecast model (per-operator refresh: it deletes its operator's rows, then re-inserts). It exposes every
+coefficient behind the forecast. `Master Series` rides along on each row purely for chart grouping.
 
 | Column | Meaning |
 |--------|---------|
@@ -138,6 +139,6 @@ refresh: it deletes its operator's rows, then re-inserts). It exposes every coef
 Chart recipes:
 - **Forecast volume over time:** `SELECT "Forecast Month", sum("Forecast Flights") … GROUP BY 1`.
 - **Fleet growth (deliveries arriving):** `sum("Active Fleet")` by `"Forecast Month"`.
-- **Seasonal curve:** `"Seasonal Factor"` by `"Calendar Month"` (distinct per `"Master Series"`).
+- **Seasonal curve:** `"Seasonal Factor"` by `"Calendar Month"` (distinct per `"Aircraft Sub Series"`).
 - **Per-aircraft rate / level / base fleet:** one value per sub-fleet.
 - `Forecast Flights = Flights Per Aircraft × Active Fleet` and `Flights Per Aircraft = round(Per Aircraft Rate × Seasonal Factor × Proration)` — the whole calculation is reconstructable from the row.
