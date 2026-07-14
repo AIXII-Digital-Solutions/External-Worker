@@ -36,7 +36,7 @@ SELECT to_char(date_trunc('month',"Date"),'YYYY-MM')                 AS ym,
        count(DISTINCT "Registration")                               AS flown,
        count(DISTINCT ("Registration","Date"))                      AS active_tail_days,
        count(*)                                                     AS cycles,
-       sum(extract(epoch FROM "Flight Time"))/3600.0                AS block_hours,
+       sum("Flight Time")                                           AS block_hours,
        sum("Circle Distance")                                       AS sum_km,
        percentile_cont(0.5) WITHIN GROUP (ORDER BY "Circle Distance") AS med_haul,
        percentile_cont(0.5) WITHIN GROUP (ORDER BY "Total Seats")    AS seats_med,
@@ -44,7 +44,7 @@ SELECT to_char(date_trunc('month',"Date"),'YYYY-MM')                 AS ym,
           / nullif(count(DISTINCT "Registration"),0))               AS active_days_per_tail,
        (count(*)::float
           / nullif(count(DISTINCT ("Registration","Date")),0))      AS cyc_per_active_day,
-       (sum(extract(epoch FROM "Flight Time"))/3600.0
+       (sum("Flight Time")
           / nullif(count(DISTINCT ("Registration","Date")),0))      AS bh_per_active_day
 FROM forecast.acys_actuals
 WHERE "Operator" = $1 AND "Date" >= date '{start}'
