@@ -22,10 +22,11 @@ Assemble (acys_actuals) — per FLIGHT:
     Delivery Date, Lease Type, Lease Dry Wet (Lease Dry / Wet), Operational Lessor.
   * flight (2.3) from flightradar.flightsummary matched by reg AND first_seen's month == Period month.
     Date = first_seen; Time Departed/Landed = datetime_takeoff/landed; Actual Distance FR =
-    actual_distance; Flight Time FR = flight_time (sec -> interval); IATA/ICAO Origin & Destination(+Actual).
+    actual_distance; Flight Time FR = flight_time (sec -> DECIMAL HOURS); IATA/ICAO Origin & Dest(+Actual).
   * derived (2.4): Contract Year (fiscal window anchored at the REQUEST date's month/day, labelled by
     its START year); Circle Distance = GREAT-CIRCLE (haversine, km) between origin & destination coords;
-    Flight Time = Time Landed - Time Departed; Total PAX = Total Seats * FORECAST_PAX_LOAD_FACTOR (0.8).
+    Flight Time = Time Landed - Time Departed, in DECIMAL HOURS (6.51 = 6h31m — NOT an interval, so it
+    sums/averages straight in BI); Total PAX = Total Seats * FORECAST_PAX_LOAD_FACTOR (0.8).
   * DROP a flight whose ICAO Origin is empty OR whose ICAO Destination (actual or planned) is empty.
   * The flight LOWER BOUND is always the start of CY2022 (make_date(2022, anchor_month, anchor_day)) —
     flights that would land in CY2021 are excluded.
@@ -37,9 +38,13 @@ IATA -> main.airports by ICAO.
 acys_summary_by_day (2.6) — merge acys_actuals + acys_forecast into ONE ROW PER FLIGHT, adding Age /
 geography / Origin&Dest lat-lon / Data Type:
   * Agreed Value = 0    — when Lease Dry Wet = 'Wet'.
+  * Agreed Value        — own history projected forward; a BRAND-NEW tail (no history, and Cirium carries
+                          no market value for an undelivered aircraft) falls back to the CROSS-OPERATOR
+                          value of its Aircraft Sub Series (see the sfbench CTE in _merge_sql).
   * Age                 — (Date - Delivery Date) in decimal years ((Date - Delivery Date)/365.25).
   * Data Type           — 'Actuals' (from acys_actuals) / 'Forecast' (from acys_forecast).
-acys_summary_grouped (VIEW, not written here) rolls by_day up to one row per (aircraft, month, route):
+acys_summary_grouped (MATERIALIZED VIEW, refreshed in step 10) rolls by_day up to one row per
+(aircraft, month, route):
   * # Of Flights        — count of grouped flights; SUMS Actual Distance FR / Circle Distance /
                           Flight Time FR / Flight Time; drops Date / Time Departed / Time Landed.
 """
@@ -73,8 +78,9 @@ _CONTRACT_YEAR = """'CY' || (extract(year from a6.first_seen)::int - CASE
               AND extract(day from a6.first_seen)::int <= :anchor_day)
         THEN 1 ELSE 0 END)::text"""
 
-# flightsummary.flight_time is integer seconds (with some bad negatives) -> interval, NULL if < 0/null.
-_FLIGHT_TIME_FR = "CASE WHEN a6.flight_time >= 0 THEN a6.flight_time * interval '1 second' ELSE NULL END"
+# flightsummary.flight_time is integer SECONDS (with some bad negatives) -> DECIMAL HOURS (6.51 = 6h31m),
+# NULL if negative/absent. `/ 3600.0` (not 3600) so integer division never truncates it to whole hours.
+_FLIGHT_TIME_FR = "CASE WHEN a6.flight_time >= 0 THEN a6.flight_time / 3600.0 ELSE NULL END"
 
 
 def _ne(expr: str) -> str:
@@ -192,7 +198,8 @@ SELECT
     a5.operator, a5.master_series, a5.manufacturer, a5.sub_series, a5.primary_usage,
     {_CONTRACT_YEAR},
     {_great_circle('o', 'd')},
-    (a6.datetime_landed - a6.datetime_takeoff),
+    -- Flight Time in DECIMAL HOURS (6.51 = 6h31m), not an interval
+    extract(epoch from (a6.datetime_landed - a6.datetime_takeoff)) / 3600.0,
     a5.agreed_value,
     a5.total_seats,
     a5.total_seats * CAST(:pax_factor AS double precision),
@@ -235,10 +242,10 @@ SELECT DISTINCT ON (ca."Registration")
     NULL, NULL, NULL, NULL, NULL, NULL,                     -- IATA/ICAO origin & destination(+actual)
     ca."Operator", ca."Master Series", ca."Manufacturer", ca."Aircraft Sub Series", ca."Primary Usage",
     NULL,                                                   -- Contract Year (no flight)
-    NULL::double precision, NULL::interval,                 -- Circle Distance, Flight Time
+    NULL::double precision, NULL::double precision,         -- Circle Distance, Flight Time (decimal hours)
     ca."Indicative Market Value (US$m)", ca."Number of Seats",
     NULL::double precision,                                 -- Total PAX (no flight)
-    NULL::double precision, NULL::interval,                 -- Actual Distance FR, Flight Time FR
+    NULL::double precision, NULL::double precision,         -- Actual Distance FR, Flight Time FR (dec. hours)
     ca."Delivery Date", ca."Lease Type", ca."Lease Dry / Wet", ca."Operational Lessor"
 FROM cirium.ciriumaircrafts ca
 JOIN latest_rev lr ON lr.id = ca.revision_id
@@ -298,6 +305,40 @@ astat AS (      -- per reg: last known AV, its month-ordinal, and the monthly de
            LEAST(0, coalesce(regr_slope(av, ord), 0)) slope
     FROM aav GROUP BY 1
 ),
+sfspan AS (     -- the newest Cirium month, and the calendar year it falls in
+    SELECT max(to_date(period,'MM-YYYY'))                          AS last_mon,
+           extract(year from max(to_date(period,'MM-YYYY')))::int  AS last_year,
+           date_trunc('year', max(to_date(period,'MM-YYYY')))::date AS year_start
+    FROM cirium.aircraftrevision
+),
+sfbench AS (    -- CROSS-OPERATOR type benchmark, for a BRAND-NEW tail: it has flown nothing (no valuation
+                -- history of its own) and Cirium carries no market value for an undelivered aircraft, so
+                -- there is nothing to project from. Anchor it on what the SAME "Aircraft Sub Series" is
+                -- worth MARKET-WIDE — deliberately NOT scoped to this operator (one airline's handful of
+                -- tails is a far thinner sample than every operator of the type).
+                --   1st choice: mean value in the NEWEST Cirium month.
+                --   fallback:   if the type has no valued tail in that month, mean over the NEWEST YEAR.
+                -- Scoped to the sub-series this run actually forecasts, so it never scans the type universe.
+    SELECT b.sf,
+           coalesce(
+               avg(b.av) FILTER (WHERE b.mon = s.last_mon),
+               avg(b.av) FILTER (WHERE extract(year from b.mon)::int = s.last_year)
+           ) AS av
+    FROM sfspan s
+    CROSS JOIN LATERAL (
+        SELECT coalesce(nullif(ca."Aircraft Sub Series",''),'NA') AS sf,
+               to_date(r.period,'MM-YYYY')                        AS mon,
+               ca."Indicative Market Value (US$m)"                AS av
+        FROM cirium.ciriumaircrafts ca
+        JOIN cirium.aircraftrevision r ON r.id = ca.revision_id
+        WHERE ca."Indicative Market Value (US$m)" > 0
+          AND to_date(r.period,'MM-YYYY') >= s.year_start
+          AND coalesce(nullif(ca."Aircraft Sub Series",''),'NA') IN (
+                  SELECT DISTINCT coalesce(nullif("Aircraft Sub Series",''),'NA')
+                  FROM forecast.acys_forecast)
+    ) b
+    GROUP BY b.sf
+),
 panel AS (
     -- each branch tags its source so rows carry Data Type = Actuals / Forecast
     SELECT {_PANEL_COLS}, 'Actuals' AS "Data Type" FROM forecast.acys_actuals
@@ -310,7 +351,12 @@ avfill AS (     -- fixed Agreed Value per (reg, month, data type):
     --  * Forecast -> project the aircraft's own depreciation forward from the last actual, floored at 0.
     SELECT om.reg, om.ord, om.dt,
            CASE WHEN om.dt = 'Forecast'
-                THEN GREATEST(0, st.last_av + st.slope * (om.ord - st.last_ord))
+                -- NOTE the explicit NULL guard: Postgres GREATEST/LEAST *ignore* NULL args and only return
+                -- NULL when ALL of them are NULL. So for a brand-new tail (st.last_av IS NULL, nothing to
+                -- project from) `GREATEST(0, NULL)` silently yields 0 — a real-looking "$0 aircraft" that
+                -- the outer coalesce then accepts, never reaching the sfbench fallback. Emit NULL instead.
+                THEN CASE WHEN st.last_av IS NULL THEN NULL
+                          ELSE GREATEST(0, st.last_av + st.slope * (om.ord - st.last_ord)) END
                 ELSE coalesce(
                      (SELECT av FROM aav WHERE aav.reg = om.reg AND aav.ord <= om.ord
                       ORDER BY aav.ord DESC LIMIT 1),   -- carry FORWARD the last known value (fills gaps/tail)
@@ -327,7 +373,10 @@ SELECT
     p."ICAO Origin", p."ICAO Destination", p."ICAO Destination Actual",
     p."Operator", p."Master Series", p."Manufacturer", p."Aircraft Sub Series", p."Primary Usage",
     p."Contract Year", p."Circle Distance", p."Flight Time",
-    CASE WHEN p."Lease Dry Wet" = 'Wet' THEN 0 ELSE coalesce(av.av, p."Agreed Value") END,
+    -- Agreed Value, in priority order: the aircraft's OWN projected/carried value -> its own Cirium market
+    -- value -> the cross-operator benchmark for its type (the brand-new-tail case, which has neither).
+    CASE WHEN p."Lease Dry Wet" = 'Wet' THEN 0
+         ELSE coalesce(av.av, p."Agreed Value", sfb.av) END,
     p."Total Seats", p."Total PAX", p."Actual Distance FR", p."Flight Time FR",
     p."Delivery Date", p."Lease Type", p."Lease Dry Wet", p."Operational Lessor",
     round((p."Date" - p."Delivery Date")::numeric / 365.25, 2),
@@ -337,6 +386,7 @@ SELECT
     o.lat, o.lon, d.lat, d.lon
 FROM panel p
 LEFT JOIN avfill av ON av.reg = p."Registration" AND av.dt = p."Data Type" AND av.ord = ({p_ord})
+LEFT JOIN sfbench sfb ON sfb.sf = coalesce(nullif(p."Aircraft Sub Series",''),'NA')
 LEFT JOIN LATERAL {o_geo} o ON true
 LEFT JOIN LATERAL {d_geo} d ON true
 """
