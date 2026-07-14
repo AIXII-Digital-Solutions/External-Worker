@@ -112,8 +112,9 @@ Wet-месяцы и неположительные значения исключ
 
 ## 6. `forecast.acys_forecast_coefficients` — коэффициенты для графиков
 
-Одна строка на **(Operator, Master Series, Forecast Month)**, пишется моделью прогноза (обновление по
-оператору: удаляет свои строки оператора, затем вставляет заново). Содержит все коэффициенты, стоящие за прогнозом.
+Одна строка на **(Operator, Aircraft Sub Series, Forecast Month)** — это и есть зерно прогноза. Пишется моделью
+прогноза (обновление по оператору: удаляет свои строки оператора, затем вставляет заново). Содержит все
+коэффициенты, стоящие за прогнозом. `Master Series` едет в строке только ради группировки на графиках.
 
 | Колонка | Смысл |
 |---------|-------|
@@ -135,6 +136,6 @@ Wet-месяцы и неположительные значения исключ
 Рецепты графиков:
 - **Объём прогноза по времени:** `SELECT "Forecast Month", sum("Forecast Flights") … GROUP BY 1`.
 - **Рост флота (приход поставок):** `sum("Active Fleet")` по `"Forecast Month"`.
-- **Сезонная кривая:** `"Seasonal Factor"` по `"Calendar Month"` (distinct по `"Master Series"`).
+- **Сезонная кривая:** `"Seasonal Factor"` по `"Calendar Month"` (distinct по `"Aircraft Sub Series"`).
 - **Rate / level / base fleet:** одно значение на суб-флот.
 - `Forecast Flights = Flights Per Aircraft × Active Fleet`, `Flights Per Aircraft = round(Per Aircraft Rate × Seasonal Factor × Proration)` — весь расчёт восстанавливается из строки.

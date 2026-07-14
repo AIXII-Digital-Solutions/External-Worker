@@ -628,8 +628,17 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                          {"history_rows": history_rows, "forecast_rows": forecast_rows,
                           "final_rows": final_rows})
 
-        # ── 10/10 Rendering report — record the run for GET /forecast/last, finalise the dataset. ────
+        # ── 10/10 Rendering report — refresh the report rollup, record the run, finalise the dataset. ─
         await reporter.enter("rendering")
+        # acys_summary_grouped is a MATERIALIZED view (the report reads a physical rollup instead of
+        # re-aggregating acys_summary_by_day on every query), so it MUST be refreshed now that
+        # acys_summary_by_day has just been filled — otherwise the report still serves the PREVIOUS run.
+        # Not best-effort: a stale rollup is a wrong report, so let it fail loudly.
+        # Only an owner (or a member of the owning role) may REFRESH: the matview is owned by
+        # grp_aviation_write, which this connection's role belongs to.
+        async with db_client.session(_DB) as s:
+            await s.execute(text("REFRESH MATERIALIZED VIEW forecast.acys_summary_grouped"))
+            await s.commit()
         # best-effort: never fail a good run
         try:
             async with db_client.session("service") as s:
