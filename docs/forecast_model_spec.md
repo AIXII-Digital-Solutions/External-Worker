@@ -26,6 +26,11 @@ The output has two `Data Type`s:
 The forecast has **no growth cap and no per-flight retirement rule** — fleet size comes straight from the
 reference source (§3), so growth and retirement are whatever the reference says.
 
+**Units.** `Flight Time` and `Flight Time FR` are **decimal hours** — `6.51` = 6h31m, *not* an interval — so
+they sum and average natively in BI (an interval does neither). `Circle Distance` / `Actual Distance FR` are
+km. Full precision is stored (1h42m15s → 1.704166…): rounding per flight before summing would drift a
+Contract Year's block hours, so round for display, not in storage.
+
 ---
 
 ## 2. Contract Year (day-precise)
@@ -52,6 +57,14 @@ their delivery date lands. Volume per aircraft comes from the type's typical act
 the type's typical network for **this** operator (never a route it never flew).
 
 ### 3.1 Fit (per sub-fleet = `Aircraft Sub Series`), on months ≤ frontier
+
+**History fallback.** An operator can take delivery of a sub-series it has **never flown** (Air Arabia is
+getting 12 `A321-253N neo ACF` with zero flights on the type), so there is no history to fit and no route
+pool to draw from. Such a sub-fleet falls back to its **`Master Series`** history — both the fit *and* the
+route pool (`A321-253N neo ACF` → `A321neo`, i.e. the operator's real `A321-251LR neo ACF` network). The
+fleet is always the target sub-series; only the *history* is borrowed. Which history was used is recorded
+per row in `acys_forecast_coefficients."History Key"` (§6) — the substitution is never silent. A sub-series
+whose master series has no history either produces no forecast.
 - **`seasonal[1..12]`** — month-of-year factor. For each calendar month `c`:
   `ratio_i = flights_i / mean(flights)`, then `seasonal[c] = (Σ ratio + SEAS_K) / (n_c + SEAS_K)` (shrunk toward 1.0).
 - **`level`** — median of the last `LEVEL_L` (=3) **deseasonalized** monthly flight totals (`flights / seasonal[cal]`).
@@ -65,7 +78,17 @@ months ≤ frontier feed the fit (recent lagging/incomplete months are ignored f
 - **`k` (flights per aircraft this month)** = `round(level / base_fleet × seasonal[cal(m)] × proration)`.
   - `level / base_fleet` = deseasonalized flights **per aircraft**.
   - `proration` = covered-days / days-in-month = 1.0 for full months; the **current** month covers today → month-end (actuals cover the earlier days), and the **final** month covers month-start → the `as_of + HORIZON` day. Both scale `k` AND the day-spread identically.
-- **`active fleet`** = latest-revision aircraft of the sub-fleet with `Delivery Date ≤ end of m` (or null). **No retirement.**
+- **`active fleet`** = the sub-fleet's aircraft in the reference's latest revision that are in the fleet by the end of month `m`. **No retirement** — nothing leaves unless the reference drops it. The rules that decide *what counts as one aircraft* matter more than they look:
+  - **Identity = (Serial Number, Aircraft Sub Series)**, *not* Registration. An **ordered airframe has no registration yet**, so the reference parks every one of them under a bare country prefix (`A6-`). Keying the fleet on Registration therefore collapses an operator's **entire order book — 113 aircraft — into ONE** per sub-series, undercounting growth by an order of magnitude. Registration is the key only when no serial exists.
+  - The reference also leaves the stale `On order` row in place **after** an aircraft is delivered, so one airframe can appear twice (once ordered, once in service, same serial). Keying orders by serial but the in-service fleet by registration would count it **twice**; identifying everything by serial resolves it to one, and the **delivered row wins** the tie-break (real delivery date, not the order's estimate).
+  - **Status whitelist — only these eight are an aircraft**, in two buckets. The bucket answers exactly one question: *if the row has no delivery date, is the aircraft already flying, or not there yet?*
+    - **LIVE** — `In Service`, `Storage`. Already in the fleet; a missing delivery date just means the reference never recorded one, so it flies from month one.
+    - **ORDER** — `On order`, `On option`, `LOI to Order`, `LOI to Option`, `Type swap`, `Reengineered`. Not yet delivered: it joins the fleet **in its delivery month**, and with **no delivery date it cannot be placed in any month at all**, so it is dropped rather than assumed to be flying.
+
+    Everything else is explicitly **not** fleet: `Cancelled` (never arrives), `Written off` (destroyed), `Retired` (scrapped), `Unknown`. A **whitelist on purpose** — a new status appearing in the reference must not silently start flying.
+
+    Putting `Type swap` / `Reengineered` in ORDER rather than LIVE is load-bearing, not a formality: in the latest commercial revision **all 3,490 `Type swap` rows carry no delivery date whatsoever**, and 0 of 27 `Reengineered` registrations are ever seen flying. In LIVE they would hand the forecast 3,490 aircraft of unknown arrival, each flying *every* month of the horizon — exactly the phantom-fleet bug that `Cancelled` caused. In ORDER they are counted the moment the reference gives them a delivery date (today that is 16 `Reengineered` and 0 `Type swap`).
+  - **Report registration:** a placeholder is expanded to `Registration + Aircraft Sub Series + short serial` → `A6-A320-251N neo-124349`. The *short* serial is everything after the last dash: the reference's serial for an order is a synthetic string (`ABY-A320-124349`) whose only meaningful part is the trailing number, while a delivered aircraft carries the bare MSN (`13343`). An aircraft that already has a real registration keeps it unchanged.
 - **`route pool`** = the flights of the sub-fleet's **template month** (latest same-calendar-month ≤ frontier; else the sub-fleet's latest month). This is the operator's usual network for that type.
 - **Generation:** each active aircraft flies `k` flights, cycling the route pool: `route = pool[((g−1) mod pool_size) + 1]` for `g = 1..k`. Total sub-fleet flights = `k × |active fleet|` → grows automatically with deliveries.
 
@@ -89,7 +112,12 @@ Base per (aircraft, month) = the reference **Indicative Market Value (US$m)**. R
 
 1. **Wet lease → 0** (`Lease Dry/Wet = 'Wet'`).
 2. **Actuals, missing month** → carry the last known value **forward** (fills reference gaps); leading gaps take the earliest known value.
-3. **Forecast** → project the aircraft's **own depreciation** forward: `value(m) = last_actual_value + slope × months_after_last`, `slope = LEAST(0, regr_slope(value, month))` (**clamped ≤ 0 — never rises**), floored at 0. A brand-new aircraft with no history holds its reference value flat.
+3. **Forecast** → project the aircraft's **own depreciation** forward: `value(m) = last_actual_value + slope × months_after_last`, `slope = LEAST(0, regr_slope(value, month))` (**clamped ≤ 0 — never rises**), floored at 0.
+4. **Brand-new aircraft** (never flew → no valuation history of its own, and the reference carries no market value for an undelivered airframe) → **cross-operator type benchmark**: the mean value of the SAME `Aircraft Sub Series` **across ALL operators**, not just this one — one airline's handful of tails is a far thinner sample than every operator of the type. Taken from the **newest reference month**; if the type has no valued airframe in that month, from the **newest year**. Held flat (it has no depreciation history to project).
+
+The three sources apply in priority order: **own projected value → own reference value → cross-operator type benchmark**.
+
+Resolution order matters (a real bug this guards): SQL `GREATEST`/`LEAST` *ignore* NULL arguments and return NULL only when every argument is NULL, so `GREATEST(0, NULL)` is `0`, not NULL. Without an explicit NULL guard a brand-new aircraft silently becomes a "$0 airframe" that looks like a real value, and the fallback chain never fires.
 
 ### Weighted Average (`acys_summary_grouped`), per (aircraft, Contract Year)
 | Column | Formula |
@@ -124,6 +152,7 @@ coefficient behind the forecast. `Master Series` rides along on each row purely 
 | Operator | operator |
 | Master Series | broader type (for chart grouping) |
 | Aircraft Sub Series | the **sub-fleet key** the forecast groups by (fit / fleet / routes) |
+| **History Key** | **whose flight history the fit and the route pool came from.** Equal to `Aircraft Sub Series` = the sub-fleet's own history. Equal to the Master Series name = **fallback** (§3.1): the operator has never flown this sub-series, so its master series' history was borrowed |
 | Forecast Month / Calendar Month | 1st of the forecast month / its month-of-year (1..12, for the seasonal curve) |
 | Frontier | last complete actual month (fit boundary) |
 | Level | deseasonalized recent flight level (sub-fleet) |

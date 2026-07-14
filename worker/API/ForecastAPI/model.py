@@ -40,8 +40,12 @@ GROWTH_CAP = 4.0      # cap the forward-fleet growth multiplier (guard against b
 LIVE_WINDOW_MONTHS = 3  # an aircraft is forecastable only if it flew within this many months up to the
                         # frontier; a longer-idle tail is treated as retired and NOT projected forward.
 
+# The monthly history, grouped by {key}. Run TWICE: once keyed on Aircraft Sub Series (the forecast's own
+# grain) and once on Master Series — an operator can take delivery of a sub-series it has NEVER flown (Air
+# Arabia is getting 12 A321-253N neo ACF with zero flights on the type), which leaves nothing to fit and no
+# route pool. Those sub-fleets fall back to their MASTER SERIES history.
 _MONTHLY_SQL = """
-SELECT coalesce(nullif("Aircraft Sub Series",''),'NA') AS sf,
+SELECT {key}                                      AS sf,
        date_trunc('month',"Date")::date          AS mon,
        count(*)                                   AS flights,
        count(DISTINCT "Registration")             AS tails
@@ -49,6 +53,9 @@ FROM forecast.acys_actuals
 WHERE "Operator" = :op AND "Date" IS NOT NULL AND "Date" >= :start {scope}
 GROUP BY 1, 2
 """
+
+_KEY_SF = """coalesce(nullif("Aircraft Sub Series",''),'NA')"""
+_KEY_MS = """coalesce(nullif("Master Series",''),'NA')"""
 
 # DEPRECATED (unused): the fleet + future deliveries now come from the reference (§ run_forecast_model),
 # not from Date-NULL stub rows. Kept only to avoid churn; sub-fleet key would be "Aircraft Sub Series".
@@ -157,12 +164,91 @@ def _plan(rows, as_of: date):
     return frontier, fmonths, plan, fits
 
 
-def _insert_sql(scope: str) -> str:
+# ── Fleet identity ─────────────────────────────────────────────────────────────────────────────────────
+# THE AIRFRAME IS THE SERIAL NUMBER, NOT THE REGISTRATION.
+#
+# An ordered airframe has no registration yet, so Cirium parks every one of them under a bare country
+# prefix ('A6-'). Air Arabia's 113 on-order aircraft therefore share ONE registration string: keying the
+# fleet on Registration collapses the whole order book into a SINGLE aircraft per sub-series and
+# undercounts fleet growth by an order of magnitude.
+#
+# Keying orders on the serial but the in-service fleet on the registration does NOT work either: Cirium
+# leaves the stale 'On order' row in place after an aircraft is delivered, so A6-ARI exists twice (serial
+# 13343, once 'On order' and once 'In Service') and the two keys would count ONE airframe TWICE.
+#
+# So: identify by (Serial Number, Aircraft Sub Series) whenever a serial exists — that is the airframe —
+# and fall back to Registration only when it does not. For the in-service fleet this changes nothing
+# (54 registrations <-> 54 serials, 1:1); it only makes the delivered/ordered duplicate resolve to one.
+# The ONLY statuses that are an aircraft. Two buckets, and the bucket answers exactly ONE question: if the
+# row has NO delivery date, is the aircraft already flying, or not there yet?
+#   LIVE  — In Service / Storage. It is in the fleet; a missing delivery date just means the reference never
+#           recorded one, so it flies from month one.
+#   ORDER — not yet delivered. It joins the fleet in its DELIVERY MONTH, and with no delivery date it cannot
+#           be placed in any month at all, so it is dropped rather than assumed to be flying.
+# Everything else is explicitly NOT fleet: 'Cancelled' (never arrives), 'Written off' (destroyed),
+# 'Retired' (scrapped), 'Unknown'. A whitelist on purpose — a NEW status appearing in the reference must not
+# silently start flying.
+#
+# 'Type swap' and 'Reengineered' are ORDER, not LIVE, and that placement is load-bearing: in the latest
+# commercial revision ALL 3,490 'Type swap' rows have NO delivery date whatsoever (and 0 of 27 'Reengineered'
+# registrations are ever seen flying). Putting them in LIVE would hand the forecast 3,490 aircraft with an
+# unknown arrival date, each flying EVERY month of the horizon — precisely the phantom-fleet bug that
+# 'Cancelled' caused. In ORDER they are counted the moment the reference gives them a delivery date.
+_LIVE_STATUS = ("'In Service','Storage'")
+_ORDER_STATUS = ("'On order','On option','LOI to Order','LOI to Option','Type swap','Reengineered'")
+
+_ALLOWED = f"""ca."Status" IN ({_LIVE_STATUS}, {_ORDER_STATUS})"""
+_ORDER = f"""ca."Status" IN ({_ORDER_STATUS})"""
+
+_IDENT = """CASE WHEN coalesce(ca."Serial Number",'') <> ''
+            THEN 'SN:' || ca."Serial Number" || '|' || coalesce(nullif(ca."Aircraft Sub Series",''),'NA')
+            ELSE 'REG:' || coalesce(ca."Registration",'') END"""
+
+# Tie-break: when one airframe has BOTH a delivered row and a leftover order row, the delivered row wins
+# (it carries the real delivery date and status, not the order's estimate).
+_PREFER_DELIVERED = f"""(CASE WHEN {_ORDER} THEN 1 ELSE 0 END)"""
+
+# The short serial: the reference's serial for an ORDER is a synthetic string ('ABY-A320-124349') whose only
+# meaningful part is the trailing number, while a delivered aircraft carries the bare MSN ('13343'). Take
+# whatever follows the LAST dash — that normalises both to just the number.
+_SERIAL_SHORT = """regexp_replace(coalesce(ca."Serial Number",''), '^.*-', '')"""
+
+# Registration for the report. A placeholder ('A6-', i.e. a prefix with nothing after the dash) is shared by
+# EVERY unregistered airframe of the operator, so it cannot be shown as-is: expand it to
+# Registration + Sub Series + short serial  ->  'A6-A320-251N neo-124349'.
+# An aircraft that already HAS a real registration keeps it untouched — mangling A6-ARI into
+# 'A6-ARIA320-251N neo-13343' helps nobody, and it is already unique.
+_REG_OUT = f"""CASE WHEN coalesce(ca."Registration",'') = '' OR ca."Registration" ~ '-$'
+               THEN coalesce(ca."Registration",'') || coalesce(ca."Aircraft Sub Series",'')
+                    || '-' || {_SERIAL_SHORT}
+               ELSE ca."Registration" END"""
+
+# A row can only BE an aircraft if it carries a key at all; an ORDER additionally needs a delivery date,
+# because without one it cannot be placed in any month (and must NOT fall through to "flies from month 1").
+_HAS_KEY = f"""CASE WHEN {_ORDER}
+               THEN (coalesce(ca."Serial Number",'') <> '' AND ca."Delivery Date" IS NOT NULL)
+               ELSE (coalesce(ca."Registration",'') <> '' OR coalesce(ca."Serial Number",'') <> '') END"""
+
+# In the fleet at month-end :m_end? An order joins ON its delivery month (and, per _HAS_KEY, must have a
+# date at all). An in-service aircraft with no delivery date is simply already flying.
+_DELIVERED = f"""CASE WHEN {_ORDER}
+                 THEN (ca."Delivery Date" <= :m_end)
+                 ELSE (ca."Delivery Date" IS NULL OR ca."Delivery Date" <= :m_end) END"""
+
+
+def _insert_sql(scope: str, by_master: bool) -> str:
     """One (forecast month, sub-fleet) INSERT into acys_forecast. EVERY active Cirium-fleet aircraft of the
     sub-fleet (latest revision, delivered ≤ :m_end — nothing retires; future deliveries appear once due)
-    flies :k flights, each taking a route from the sub-fleet's typical route pool (:template_month's flights
-    = the type's usual network for THIS operator, so no route the operator never flew). Aircraft attributes
-    (value / seats / lease / delivery) come from Cirium; the merge step later projects the Agreed Value."""
+    flies :k flights, each taking a route from the route pool (:template_month's flights = the type's usual
+    network for THIS operator, so never a route the operator has not flown). Aircraft attributes (value /
+    seats / lease / delivery) come from Cirium; the merge step later projects the Agreed Value.
+
+    The FLEET is always the target sub-series (:sf). The ROUTE POOL is keyed on :hist_key, which is normally
+    that same sub-series — but for a sub-series the operator has never flown (a brand-new type entering the
+    fleet) there is no pool at all, so `by_master` switches the pool to the aircraft's MASTER SERIES history.
+    """
+    # route pool key: the sub-fleet's own history, or its master series' when the sub-fleet has none
+    route_key = (_KEY_MS if by_master else _KEY_SF)
     return f"""
 INSERT INTO forecast.acys_forecast
     ("Registration","Period","Date","Time Departed","Time Landed",
@@ -174,26 +260,33 @@ INSERT INTO forecast.acys_forecast
      "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor")
 WITH latest AS (SELECT max(revision_id) mr FROM cirium.ciriumaircrafts WHERE "Operator" = :op),
 fleet AS (   -- active aircraft of this sub-fleet at :m_end (delivered by then; future deliveries included)
-    SELECT DISTINCT ON (ca."Registration")
-           ca."Registration" reg, ca."Master Series" mseries, ca."Manufacturer" manuf,
+    SELECT DISTINCT ON ({_IDENT})
+           {_REG_OUT} AS reg,
+           ca."Master Series" mseries, ca."Manufacturer" manuf,
            ca."Primary Usage" usage, ca."Indicative Market Value (US$m)" av, ca."Number of Seats" seats,
            ca."Delivery Date" deliv, ca."Lease Type" ltype, ca."Lease Dry / Wet" ldw,
            ca."Operational Lessor" lessor
     FROM cirium.ciriumaircrafts ca
     WHERE ca."Operator" = :op AND ca.revision_id = (SELECT mr FROM latest)
       AND coalesce(nullif(ca."Aircraft Sub Series",''),'NA') = :sf
-      AND ca."Registration" IS NOT NULL AND ca."Registration" <> ''
-      AND (ca."Delivery Date" IS NULL OR ca."Delivery Date" <= :m_end) {scope}
-    ORDER BY ca."Registration"
+      AND {_ALLOWED}
+      AND {_HAS_KEY}
+      AND {_DELIVERED} {scope}
+    -- The tie-break is NOT cosmetic: Cirium carries SEVERAL rows for one airframe inside the SAME revision
+    -- (A6-ARF twice with two Delivery Dates; A6-ARI as both a delivered aircraft and a leftover order).
+    -- With no tie-break the DISTINCT ON pick is arbitrary, and since this query re-runs PER forecast month
+    -- the same aircraft could resolve to a different row (different Delivery Date / value / seats) from
+    -- month to month. Delivered beats order, then newest id — one aircraft, one identity, whole horizon.
+    ORDER BY {_IDENT}, {_PREFER_DELIVERED}, ca.id DESC
 ),
-routes AS (   -- the sub-fleet's typical route pool = a template month's real flights for this operator
+routes AS (   -- typical route pool = a template month's real flights for this operator on :hist_key
     SELECT "IATA Origin" io, "IATA Destination" idd, "IATA Destination Actual" ida,
            "ICAO Origin" ico, "ICAO Destination" icd, "ICAO Destination Actual" ica,
            "Circle Distance" cd, "Flight Time" ft, "Actual Distance FR" adf, "Flight Time FR" ftf,
            row_number() OVER (ORDER BY id) rn
     FROM forecast.acys_actuals
     WHERE "Operator" = :op AND "Date" IS NOT NULL
-      AND coalesce(nullif("Aircraft Sub Series",''),'NA') = :sf
+      AND {route_key} = :hist_key
       AND date_trunc('month',"Date")::date = :template_month {scope}
 ),
 nr AS (SELECT count(*)::int c FROM routes),
@@ -243,46 +336,82 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
     scope_sql = f"AND ({scope_where})" if scope_where else ""
     sp = dict(scope_params or {})
     base_params = {"op": operator, "start": HISTORY_START, **sp}
-    rows = [dict(r._mapping) for r in (await session.execute(
-        text(_MONTHLY_SQL.format(scope=scope_sql)), base_params)).all()]
-    if not rows:
+
+    async def _hist(key: str):
+        return [dict(r._mapping) for r in (await session.execute(
+            text(_MONTHLY_SQL.format(scope=scope_sql, key=key)), base_params)).all()]
+
+    # Fit the history TWICE — once at the forecast's own grain (Aircraft Sub Series) and once at the broader
+    # Master Series. A sub-series the operator has never flown has no fit and no route pool of its own, and
+    # falls back to its master series (below). _plan is grain-agnostic: it just keys on whatever it is given.
+    rows_sf = await _hist(_KEY_SF)
+    if not rows_sf:
         logger.info("forecast_model: no acys_actuals flights for %s", operator)
         return {"forecast_rows": 0, "months": 0, "frontier": None}
+    rows_ms = await _hist(_KEY_MS)
 
-    frontier, fmonths, plan, fits = _plan(rows, as_of)
-    # fleet delivery dates per sub-fleet (Aircraft Sub Series, latest revision) — active-fleet count +
-    # coefficients; also capture each sub-series' Master Series (constant per sub-series) for chart grouping.
+    frontier, fmonths, plan_sf, fits_sf = _plan(rows_sf, as_of)
+    fr_ms, fm_ms, plan_ms, fits_ms = _plan(rows_ms, as_of)
+    fmonths = sorted(set(fmonths) | set(fm_ms))
+
+    # Fleet delivery dates per sub-fleet (latest revision) — the active-fleet count and the coefficients.
+    # MUST dedupe on exactly the same identity as _insert_sql's `fleet` CTE. It used to append one entry per
+    # CIRIUM ROW, so all 113 placeholder-'A6-' order rows counted as 113 aircraft here while the INSERT
+    # collapsed them to one — "Active Fleet"/"Forecast Flights" in the coefficients table then disagreed with
+    # the rows actually generated. One key, one aircraft, both places.
     fleet_deliv, sf_master = defaultdict(list), {}
     for r in (await session.execute(text(
-            'WITH latest AS (SELECT max(revision_id) mr FROM cirium.ciriumaircrafts WHERE "Operator" = :op) '
-            'SELECT coalesce(nullif("Aircraft Sub Series", \'\'), \'NA\') sf, "Master Series" ms, "Delivery Date" deliv '
-            'FROM cirium.ciriumaircrafts WHERE "Operator" = :op AND revision_id = (SELECT mr FROM latest) '
-            f'AND "Registration" IS NOT NULL AND "Registration" <> \'\' {scope_sql}'),
+            'WITH latest AS (SELECT max(revision_id) mr FROM cirium.ciriumaircrafts WHERE "Operator" = :op), '
+            f'f AS (SELECT DISTINCT ON ({_IDENT}) '
+            '          coalesce(nullif(ca."Aircraft Sub Series", \'\'), \'NA\') sf, '
+            '          coalesce(nullif(ca."Master Series", \'\'), \'NA\') ms, ca."Delivery Date" deliv '
+            '      FROM cirium.ciriumaircrafts ca '
+            '      WHERE ca."Operator" = :op AND ca.revision_id = (SELECT mr FROM latest) '
+            f'        AND {_ALLOWED} AND {_HAS_KEY} {scope_sql} '
+            f'      ORDER BY {_IDENT}, {_PREFER_DELIVERED}, ca.id DESC) '
+            'SELECT sf, ms, deliv FROM f'),
             {"op": operator, **sp})).all():
         fleet_deliv[r[0]].append(r[2])
         sf_master.setdefault(r[0], r[1])
 
-    sql = _insert_sql(scope_sql)
+    sql = {False: _insert_sql(scope_sql, by_master=False),   # route pool keyed on Aircraft Sub Series
+           True:  _insert_sql(scope_sql, by_master=True)}    # ...on Master Series (sub-series has no history)
     total, coeff = 0, []
     nfm = max(1, len(fmonths))
+    # Iterate the FLEET, not the history: a sub-series can be in the fleet with no history of its own (a new
+    # type arriving), and it must still be forecast — off its master series' history.
     for fi, m in enumerate(fmonths):
         m_end = _add_months(m, 1) - timedelta(days=1)          # last day of the forecast month (delivery cutoff)
         start_day, end_day, day_span, dim = _month_span(m, as_of)
         prorate = day_span / dim
-        for sf, (tm, k) in plan[m].items():
+        for sf in sorted(fleet_deliv):
             active = sum(1 for d in fleet_deliv.get(sf, []) if d is None or d <= m_end)
             if active == 0:
-                continue   # sub-series no longer in the latest fleet -> nothing to forecast this month
-            params = {"op": operator, "sf": sf, "template_month": tm, "m_end": m_end, "k": int(k),
+                continue   # nobody of this sub-series is in the fleet yet this month
+            ms = sf_master.get(sf) or "NA"
+            if sf in plan_sf.get(m, {}):                       # own history
+                hist_key, by_master = sf, False
+                tm, k = plan_sf[m][sf]
+                level, seas, base = fits_sf[sf]
+                fr = frontier
+            elif ms in plan_ms.get(m, {}):                     # fallback: the master series' history
+                hist_key, by_master = ms, True
+                tm, k = plan_ms[m][ms]
+                level, seas, base = fits_ms[ms]
+                fr = fr_ms
+            else:
+                continue   # neither the sub-series nor its master series has any history -> nothing to fit
+            params = {"op": operator, "sf": sf, "hist_key": hist_key, "template_month": tm,
+                      "m_end": m_end, "k": int(k),
                       "period": m.strftime("%m-%Y"), "year": m.year, "month": m.month,
                       "start_day": start_day, "day_span": day_span,
                       "anchor_month": as_of.month, "anchor_day": as_of.day,
                       "pax_factor": FORECAST_PAX_LOAD_FACTOR, **sp}
-            res = await session.execute(text(sql), params)
+            res = await session.execute(text(sql[by_master]), params)
             total += res.rowcount or 0
-            level, seas, base = fits[sf]
-            coeff.append({"op": operator, "ms": sf_master.get(sf), "sf": sf, "fm": m, "cm": m.month,
-                          "fr": frontier, "lvl": float(level), "base": float(base), "par": float(level / base),
+            coeff.append({"op": operator, "ms": sf_master.get(sf), "sf": sf, "hk": hist_key,
+                          "fm": m, "cm": m.month,
+                          "fr": fr, "lvl": float(level), "base": float(base), "par": float(level / base),
                           "seas": float(seas[m.month]), "pro": float(prorate), "act": active,
                           "k": int(k), "nhat": int(k) * active, "tm": tm})
         if on_progress is not None:
@@ -299,10 +428,11 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         if coeff:
             await session.execute(text(
                 'INSERT INTO forecast.acys_forecast_coefficients '
-                '("Operator","Master Series","Aircraft Sub Series","Forecast Month","Calendar Month",'
+                '("Operator","Master Series","Aircraft Sub Series","History Key","Forecast Month",'
+                ' "Calendar Month",'
                 ' "Frontier","Level","Base Fleet","Per Aircraft Rate","Seasonal Factor","Proration",'
                 ' "Active Fleet","Flights Per Aircraft","Forecast Flights","Template Month") '
-                'VALUES (:op,:ms,:sf,:fm,:cm,:fr,:lvl,:base,:par,:seas,:pro,:act,:k,:nhat,:tm)'), coeff)
+                'VALUES (:op,:ms,:sf,:hk,:fm,:cm,:fr,:lvl,:base,:par,:seas,:pro,:act,:k,:nhat,:tm)'), coeff)
         await session.commit()
     except Exception as e:
         logger.warning("forecast coefficients write failed for %s: %s", operator, e)
