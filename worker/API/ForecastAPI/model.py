@@ -101,24 +101,24 @@ def _horizon_month(as_of: date) -> date:
     return date(as_of.year + FORECAST_HORIZON_YEARS, as_of.month, 1)
 
 
-def _month_span(m: date, as_of: date):
-    """Days of month `m` the forecast covers: the CURRENT month starts today; the FINAL (horizon) month
-    ends on the anchor day; all others are full months. Returns (start_day, end_day, day_span, days_in_month).
-    `proration = day_span / days_in_month` scales the flight volume AND the day-spread identically."""
+def _month_span(m: date, fc_start: date, as_of: date):
+    """Days of month `m` the forecast covers. TWO anchors: the FIRST forecast month starts on `fc_start` (the
+    day AFTER the last fact — so there is NO gap between facts and forecast), and the HORIZON month
+    (as_of + horizon) ends on the CY anchor day `as_of.day`; every month between is full. proration =
+    day_span / days_in_month scales the flight volume AND the day-spread identically. fc_start pins the START;
+    as_of pins the HORIZON and (elsewhere) the day-precise Contract Year, which may sit later than fc_start."""
     dim = _days_in_month(m)
-    # clamp the anchor day to the month length: the horizon month is `as_of.month` two years on, and if
-    # as_of is 29-Feb (leap) the horizon Feb is NOT a leap month (28 days) — an unclamped end_day=29 makes
-    # the day-spread emit make_date(year, 2, 29), which OVERFLOWS and crashes the INSERT. min() keeps every
-    # generated day inside the month. (start_day is already safe: the current month IS as_of's month, so
-    # as_of.day <= dim there.)
-    start_day = min(as_of.day, dim) if m == date(as_of.year, as_of.month, 1) else 1
+    # clamp both anchor days to the month length so the day-spread never emits an out-of-range date (a 29-Feb
+    # as_of whose horizon Feb has 28 days would otherwise make_date(year,2,29) and crash the INSERT).
+    start_day = min(fc_start.day, dim) if m == date(fc_start.year, fc_start.month, 1) else 1
     end_day = min(as_of.day, dim) if m == _horizon_month(as_of) else dim
     return start_day, end_day, max(1, end_day - start_day + 1), dim
 
 
-def _plan(rows, as_of: date):
+def _plan(rows, fc_start: date, as_of: date):
     """Fit level×seasonal per sub-fleet on months ≤ the coverage frontier, then plan the forecast months
-    from the CURRENT month (as_of) to the horizon. Returns (frontier, forecast_months, plan, fits) where
+    from `fc_start`'s month (the day after the last fact) to the horizon (as_of + horizon). The Contract Year
+    is cut on the as_of day, which may sit LATER than fc_start. Returns (frontier, forecast_months, plan, fits) where
     plan[m] = {sf: (template_month, k)}, k = round((level / base_fleet) × seasonal[cal(m)] × proration), and
     fits[sf] = (level, seasonal[1..12], base_fleet). The ACTIVE fleet per month is resolved in SQL from the
     latest Cirium revision (delivery ≤ month) — every in-fleet aircraft flies every month, volume grows with
@@ -150,18 +150,17 @@ def _plan(rows, as_of: date):
         sf_hist[sf] = [(mn, fl) for mn, fl, _ in s_tr]
 
     fmonths, plan = [], {}
-    first_month = date(as_of.year, as_of.month, 1)
+    first_month = date(fc_start.year, fc_start.month, 1)
     m = first_month
     horizon = _horizon_month(as_of)
     while m <= horizon:
-        _, _, day_span, dim = _month_span(m, as_of)
+        _, _, day_span, dim = _month_span(m, fc_start, as_of)
         prorate = day_span / dim                    # covered-days fraction (1.0 except current & final months)
-        # The FIRST forecast month is partial (covers as_of.day..month-end) and its proration can be tiny
-        # (a late-month anchor -> a day or two). For a low-volume sub-fleet round() would then give k=0, and
+        # The FIRST forecast month is partial (covers fc_start.day..month-end) and its proration can be tiny
+        # (a late-month fc_start -> a day or two). For a low-volume sub-fleet round() would then give k=0, and
         # if EVERY sub-fleet rounds to 0 the first month is empty -> the forecast starts next month instead
-        # of the day after the last fact = a GAP (invariant: no hole between facts and forecast). Floor k at
-        # 1 in the first month only, so the boundary day (the min day-spread day = as_of.day) is always
-        # covered. High-volume operators are unaffected (their k is already >= 1).
+        # of the day after the last fact = a GAP (invariant: no hole between facts and forecast). The floor
+        # below keeps the boundary day (the min day-spread day = fc_start.day) always covered.
         sfp = {}
         for sf, (level, seas, base) in fits.items():
             full = level * seas[m.month] / base            # un-prorated per-aircraft flights this cal. month
@@ -424,8 +423,18 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         return {"forecast_rows": 0, "months": 0, "frontier": None}
     rows_ms = await _hist(_KEY_MS)
 
-    frontier, fmonths, plan_sf, fits_sf = _plan(rows_sf, as_of)
-    fr_ms, fm_ms, plan_ms, fits_ms = _plan(rows_ms, as_of)
+    # forecast START = the day AFTER the last fact, so there is NO gap between facts and forecast; the CY
+    # stays anchored on the REQUEST date `as_of` (which may be LATER — the CY is simply cut on the as_of day).
+    # The assemble step caps facts at `first_seen < as_of`, so last_fact <= as_of-1 and fc_start <= as_of;
+    # the forecast then runs fc_start .. (as_of + FORECAST_HORIZON_YEARS).
+    last_fact = (await session.execute(text(
+        'SELECT max("Date") FROM forecast.acys_actuals '
+        f'WHERE "Operator" = :op AND "Date" IS NOT NULL {scope_sql}'),
+        {"op": operator, **sp})).scalar()
+    fc_start = (last_fact + timedelta(days=1)) if last_fact is not None else as_of
+
+    frontier, fmonths, plan_sf, fits_sf = _plan(rows_sf, fc_start, as_of)
+    fr_ms, fm_ms, plan_ms, fits_ms = _plan(rows_ms, fc_start, as_of)
     fmonths = sorted(set(fmonths) | set(fm_ms))
 
     # Fleet delivery dates per sub-fleet (latest revision) — the active-fleet count and the coefficients.
@@ -456,7 +465,7 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
     # type arriving), and it must still be forecast — off its master series' history.
     for fi, m in enumerate(fmonths):
         m_end = _add_months(m, 1) - timedelta(days=1)          # last day of the forecast month (delivery cutoff)
-        start_day, end_day, day_span, dim = _month_span(m, as_of)
+        start_day, end_day, day_span, dim = _month_span(m, fc_start, as_of)
         prorate = day_span / dim
         for sf in sorted(fleet_deliv):
             active = sum(1 for d in fleet_deliv.get(sf, []) if d is None or d <= m_end)
