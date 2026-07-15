@@ -309,7 +309,12 @@ INSERT INTO forecast.acys_forecast
      "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR",
      "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor")
 WITH latest AS ({_LATEST_CTE}),
-fleet AS (   -- active aircraft of this sub-fleet at :m_end (delivered by then; future deliveries included)
+owned_regs AS (   -- every registration in the operator's OWN Cirium fleet (any sub-series) — never supplemented
+    SELECT ca."Registration" reg FROM cirium.ciriumaircrafts ca
+    WHERE ca."Operator" = :op AND ca.revision_id IN (SELECT mr FROM latest)
+      AND {_ALLOWED} AND {_NOT_DEAD}
+),
+cirium_fleet AS (   -- active aircraft of this sub-fleet at :m_end (delivered by then; future deliveries included)
     SELECT DISTINCT ON ({_IDENT})
            {_REG_OUT} AS reg,
            ca."Master Series" mseries, ca."Manufacturer" manuf,
@@ -329,6 +334,30 @@ fleet AS (   -- active aircraft of this sub-fleet at :m_end (delivered by then; 
     -- the same aircraft could resolve to a different row (different Delivery Date / value / seats) from
     -- month to month. Delivered beats order, then newest id — one aircraft, one identity, whole horizon.
     ORDER BY {_IDENT}, {_PREFER_DELIVERED}, ca.id DESC
+),
+sup AS (   -- carry-forward: tails that OPERATED for :op in the last actual month but are NOT in the owned
+           -- Cirium fleet (sister-airline / wet-lease airframes flying under this brand). Without this they
+           -- vanish at the actuals->forecast seam even though they were just flying. Identity is the real
+           -- registration; attributes come from the tail's most recent actual flight; they are already
+           -- delivered (they just flew), so they fly EVERY forecast month. Wet leases keep ldw='Wet', so the
+           -- INSERT still zeroes their Agreed Value — only their flight activity is projected. This set MUST
+           -- match run_forecast_model's fleet_deliv supplement exactly, or Active Fleet vs rows disagree.
+    SELECT DISTINCT ON (aa."Registration")
+           aa."Registration" AS reg,
+           aa."Master Series" mseries, aa."Manufacturer" manuf,
+           aa."Primary Usage" usage, aa."Agreed Value" av, aa."Total Seats" seats,
+           aa."Delivery Date" deliv, aa."Lease Type" ltype, aa."Lease Dry Wet" ldw,
+           aa."Operational Lessor" lessor
+    FROM forecast.acys_actuals aa
+    WHERE aa."Operator" = :op AND aa."Date" IS NOT NULL AND aa."Date" >= :sup_since
+      AND coalesce(nullif(aa."Aircraft Sub Series",''),'NA') = :sf
+      AND aa."Registration" NOT IN (SELECT reg FROM owned_regs) {scope}
+    ORDER BY aa."Registration", aa."Date" DESC
+),
+fleet AS (
+    SELECT * FROM cirium_fleet
+    UNION ALL
+    SELECT * FROM sup
 ),
 routes AS (   -- typical route pool = a template month's real flights for this operator on :hist_key
     SELECT "IATA Origin" io, "IATA Destination" idd, "IATA Destination Actual" ida,
@@ -433,6 +462,11 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         {"op": operator, **sp})).scalar()
     fc_start = (last_fact + timedelta(days=1)) if last_fact is not None else as_of
 
+    # Fleet carry-forward window: the first day of the LAST ACTUAL month. Tails that operated for the operator
+    # inside this window but are NOT in the owned Cirium fleet (sister-airline / wet-lease) are supplemented
+    # into the forecast fleet so they do not vanish at the seam (see _insert_sql's `sup` CTE).
+    sup_since = last_fact.replace(day=1) if last_fact is not None else fc_start
+
     frontier, fmonths, plan_sf, fits_sf = _plan(rows_sf, fc_start, as_of)
     fr_ms, fm_ms, plan_ms, fits_ms = _plan(rows_ms, fc_start, as_of)
     fmonths = sorted(set(fmonths) | set(fm_ms))
@@ -454,6 +488,25 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
             f'      ORDER BY {_IDENT}, {_PREFER_DELIVERED}, ca.id DESC) '
             'SELECT sf, ms, deliv FROM f'),
             {"op": operator, **sp})).all():
+        fleet_deliv[r[0]].append(r[2])
+        sf_master.setdefault(r[0], r[1])
+
+    # Supplement fleet_deliv with the carry-forward tails (sister-airline / wet-lease that operated in the last
+    # actual month, not owned in Cirium). MUST mirror _insert_sql's `sup` CTE exactly so the Active Fleet count
+    # equals the rows actually generated. Their delivery dates are historical, so they count active every month.
+    for r in (await session.execute(text(
+            f'WITH latest AS ({_LATEST_CTE}), '
+            'owned_regs AS (SELECT ca."Registration" reg FROM cirium.ciriumaircrafts ca '
+            '               WHERE ca."Operator" = :op AND ca.revision_id IN (SELECT mr FROM latest) '
+            f'                 AND {_ALLOWED} AND {_NOT_DEAD}) '
+            'SELECT DISTINCT ON (aa."Registration") '
+            '       coalesce(nullif(aa."Aircraft Sub Series", \'\'), \'NA\') sf, '
+            '       coalesce(nullif(aa."Master Series", \'\'), \'NA\') ms, aa."Delivery Date" deliv '
+            'FROM forecast.acys_actuals aa '
+            'WHERE aa."Operator" = :op AND aa."Date" IS NOT NULL AND aa."Date" >= :sup_since '
+            f'  AND aa."Registration" NOT IN (SELECT reg FROM owned_regs) {scope_sql} '
+            'ORDER BY aa."Registration", aa."Date" DESC'),
+            {"op": operator, "sup_since": sup_since, **sp})).all():
         fleet_deliv[r[0]].append(r[2])
         sf_master.setdefault(r[0], r[1])
 
@@ -485,7 +538,7 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
             else:
                 continue   # neither the sub-series nor its master series has any history -> nothing to fit
             params = {"op": operator, "sf": sf, "hist_key": hist_key, "template_month": tm,
-                      "m_end": m_end, "k": int(k),
+                      "m_end": m_end, "k": int(k), "sup_since": sup_since,
                       "period": m.strftime("%m-%Y"), "year": m.year, "month": m.month,
                       "start_day": start_day, "day_span": day_span,
                       "anchor_month": as_of.month, "anchor_day": as_of.day,
