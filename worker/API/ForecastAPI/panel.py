@@ -78,9 +78,16 @@ _CONTRACT_YEAR = """'CY' || (extract(year from a6.first_seen)::int - CASE
               AND extract(day from a6.first_seen)::int <= :anchor_day)
         THEN 1 ELSE 0 END)::text"""
 
+# Physical ceiling for ONE commercial flight: the longest scheduled flight in the world is ~18h55m, so any
+# duration >= this is a broken record (a wrong-day landing timestamp), never a real flight. Used to guard the
+# UPPER end of both Flight Time columns (the LOWER end — negatives — is guarded by the > checks).
+_MAX_FT_HOURS = 19
+
 # flightsummary.flight_time is integer SECONDS (with some bad negatives) -> DECIMAL HOURS (6.51 = 6h31m),
-# NULL if negative/absent. `/ 3600.0` (not 3600) so integer division never truncates it to whole hours.
-_FLIGHT_TIME_FR = "CASE WHEN a6.flight_time >= 0 THEN a6.flight_time / 3600.0 ELSE NULL END"
+# NULL if negative/absent OR implausibly long (>= _MAX_FT_HOURS). `/ 3600.0` (not 3600) so integer division
+# never truncates it to whole hours.
+_FLIGHT_TIME_FR = (f"CASE WHEN a6.flight_time >= 0 AND a6.flight_time < {_MAX_FT_HOURS} * 3600 "
+                   "THEN a6.flight_time / 3600.0 ELSE NULL END")
 
 
 def _ne(expr: str) -> str:
@@ -202,8 +209,16 @@ SELECT
     a5.operator, a5.master_series, a5.manufacturer, a5.sub_series, a5.primary_usage,
     {_CONTRACT_YEAR},
     {_great_circle('o', 'd')},
-    -- Flight Time in DECIMAL HOURS (6.51 = 6h31m), not an interval
-    extract(epoch from (a6.datetime_landed - a6.datetime_takeoff)) / 3600.0,
+    -- Flight Time in DECIMAL HOURS (6.51 = 6h31m), not an interval. Guard broken timestamps on BOTH ends:
+    -- FR24 records datetime_landed <= datetime_takeoff (-> NEGATIVE) or a wrong-day-LATE landing (-> impossibly
+    -- LONG, >= _MAX_FT_HOURS). Use the timestamp delta only when positive AND under the physical ceiling; else
+    -- fall back to FR24's own flight_time (same bounds); else NULL.
+    CASE WHEN a6.datetime_landed > a6.datetime_takeoff
+              AND a6.datetime_landed - a6.datetime_takeoff < interval '{_MAX_FT_HOURS} hours'
+         THEN extract(epoch from (a6.datetime_landed - a6.datetime_takeoff)) / 3600.0
+         WHEN a6.flight_time >= 0 AND a6.flight_time < {_MAX_FT_HOURS} * 3600
+         THEN a6.flight_time / 3600.0
+         ELSE NULL END,
     a5.agreed_value,
     a5.total_seats,
     a5.total_seats * CAST(:pax_factor AS double precision),
