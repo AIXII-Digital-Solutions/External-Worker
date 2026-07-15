@@ -202,8 +202,13 @@ SELECT
     a5.operator, a5.master_series, a5.manufacturer, a5.sub_series, a5.primary_usage,
     {_CONTRACT_YEAR},
     {_great_circle('o', 'd')},
-    -- Flight Time in DECIMAL HOURS (6.51 = 6h31m), not an interval
-    extract(epoch from (a6.datetime_landed - a6.datetime_takeoff)) / 3600.0,
+    -- Flight Time in DECIMAL HOURS (6.51 = 6h31m), not an interval. Guard broken timestamps: FR24 sometimes
+    -- records datetime_landed <= datetime_takeoff (wrong-day / same-airport glitch) -> a NEGATIVE duration.
+    -- Use the timestamp delta only when it is positive; else fall back to FR24's own flight_time; else NULL.
+    CASE WHEN a6.datetime_landed > a6.datetime_takeoff
+         THEN extract(epoch from (a6.datetime_landed - a6.datetime_takeoff)) / 3600.0
+         WHEN a6.flight_time >= 0 THEN a6.flight_time / 3600.0
+         ELSE NULL END,
     a5.agreed_value,
     a5.total_seats,
     a5.total_seats * CAST(:pax_factor AS double precision),
