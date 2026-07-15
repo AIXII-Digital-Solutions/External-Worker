@@ -36,9 +36,10 @@ LEVEL_L = 3           # trailing months for the deseasonalized recent level (pre
 SEAS_K = 6.0          # seasonal-factor shrinkage toward 1.0 by month support
 FRONTIER_FRAC = 0.6   # a recent month is "complete" if its flights ≥ this × the trailing-window median
 FRONTIER_WINDOW = 9   # trailing months the frontier threshold is measured against
-GROWTH_CAP = 4.0      # cap the forward-fleet growth multiplier (guard against bad delivery data)
-LIVE_WINDOW_MONTHS = 3  # an aircraft is forecastable only if it flew within this many months up to the
-                        # frontier; a longer-idle tail is treated as retired and NOT projected forward.
+# NOTE: there is deliberately NO idle-aircraft retirement and NO growth cap. The fleet comes straight from
+# Cirium's latest revision (delivery-dated), and per the product rule we never PREDICT that an aircraft
+# retires — an in-service tail keeps flying to the horizon (invariant: future aircraft never leave). A dead
+# aircraft is dropped only when Cirium itself marks it Retired/Written off (see _NOT_DEAD), not by idleness.
 
 # The monthly history, grouped by {key}. Run TWICE: once keyed on Aircraft Sub Series (the forecast's own
 # grain) and once on Master Series — an operator can take delivery of a sub-series it has NEVER flown (Air
@@ -105,8 +106,13 @@ def _month_span(m: date, as_of: date):
     ends on the anchor day; all others are full months. Returns (start_day, end_day, day_span, days_in_month).
     `proration = day_span / days_in_month` scales the flight volume AND the day-spread identically."""
     dim = _days_in_month(m)
-    start_day = as_of.day if m == date(as_of.year, as_of.month, 1) else 1
-    end_day = as_of.day if m == _horizon_month(as_of) else dim
+    # clamp the anchor day to the month length: the horizon month is `as_of.month` two years on, and if
+    # as_of is 29-Feb (leap) the horizon Feb is NOT a leap month (28 days) — an unclamped end_day=29 makes
+    # the day-spread emit make_date(year, 2, 29), which OVERFLOWS and crashes the INSERT. min() keeps every
+    # generated day inside the month. (start_day is already safe: the current month IS as_of's month, so
+    # as_of.day <= dim there.)
+    start_day = min(as_of.day, dim) if m == date(as_of.year, as_of.month, 1) else 1
+    end_day = min(as_of.day, dim) if m == _horizon_month(as_of) else dim
     return start_day, end_day, max(1, end_day - start_day + 1), dim
 
 
@@ -144,14 +150,33 @@ def _plan(rows, as_of: date):
         sf_hist[sf] = [(mn, fl) for mn, fl, _ in s_tr]
 
     fmonths, plan = [], {}
-    m = date(as_of.year, as_of.month, 1)
+    first_month = date(as_of.year, as_of.month, 1)
+    m = first_month
     horizon = _horizon_month(as_of)
     while m <= horizon:
         _, _, day_span, dim = _month_span(m, as_of)
         prorate = day_span / dim                    # covered-days fraction (1.0 except current & final months)
+        # The FIRST forecast month is partial (covers as_of.day..month-end) and its proration can be tiny
+        # (a late-month anchor -> a day or two). For a low-volume sub-fleet round() would then give k=0, and
+        # if EVERY sub-fleet rounds to 0 the first month is empty -> the forecast starts next month instead
+        # of the day after the last fact = a GAP (invariant: no hole between facts and forecast). Floor k at
+        # 1 in the first month only, so the boundary day (the min day-spread day = as_of.day) is always
+        # covered. High-volume operators are unaffected (their k is already >= 1).
         sfp = {}
         for sf, (level, seas, base) in fits.items():
-            k = round(level * seas[m.month] / base * prorate)       # PER-AIRCRAFT flights this month
+            full = level * seas[m.month] / base            # un-prorated per-aircraft flights this cal. month
+            k = round(full * prorate)                      # actually flown this (possibly partial) month
+            # Floor k at 1 for EVERY month of a fitted sub-fleet. Invariant: once an aircraft is in the
+            # fleet it must be present every month to the horizon ("future aircraft never leave"). Rounding
+            # would otherwise drop a sub-fleet whenever round(full*prorate)=0 — in the partial first/horizon
+            # months (tiny proration) OR in a full seasonal-trough month for a THIN fleet (business jets /
+            # helicopters / sparse coverage, level/base < 1). That would make an active aircraft vanish for
+            # one month and reappear the next — a hole in the fleet. The floor keeps it present; the run
+            # loop's `active == 0` guard still suppresses aircraft that have NOT yet been delivered, so no
+            # phantom is created for a not-yet-in-fleet tail. (Also covers the Master-Series fallback grain,
+            # since plan_ms is built here too.)
+            if prorate > 0:
+                k = max(1, k)
             if k <= 0:
                 continue
             same = [mn for mn, fl in sf_hist[sf] if mn.month == m.month]
@@ -199,6 +224,32 @@ _ORDER_STATUS = ("'On order','On option','LOI to Order','LOI to Option','Type sw
 
 _ALLOWED = f"""ca."Status" IN ({_LIVE_STATUS}, {_ORDER_STATUS})"""
 _ORDER = f"""ca."Status" IN ({_ORDER_STATUS})"""
+
+# The operator's latest revision OF EACH plan_type. A Cirium revision is a single-plan snapshot
+# (plan_type = Commercial | Business&Helicopters), so an operator with aircraft in BOTH plans has rows in
+# TWO different revisions. `max(revision_id)` collapses that to ONE revision -> one plan -> the OTHER plan's
+# aircraft get active=0 and are never forecast (a mixed-plan operator's fleet is silently incomplete). This
+# picks the latest revision per plan_type the operator actually appears in; callers filter with
+# `revision_id IN (SELECT mr FROM latest)`. Mirrors panel._future_aircraft_sql's DISTINCT ON (plan_type).
+_LATEST_CTE = """SELECT DISTINCT ON (r.plan_type) r.id AS mr
+    FROM cirium.aircraftrevision r
+    WHERE EXISTS (SELECT 1 FROM cirium.ciriumaircrafts c
+                  WHERE c.revision_id = r.id AND c."Operator" = :op)
+    ORDER BY r.plan_type, to_date(r.period,'MM-YYYY') DESC, r.id DESC"""
+
+# Per-AIRFRAME dead check. _ALLOWED is a per-ROW predicate: Cirium can carry SEVERAL rows for one airframe
+# in the same revision, so a tail that is genuinely Retired/Written off but still has a STALE 'In Service'
+# row would slip through (_ALLOWED keeps the stale row, the newer dead row is filtered out before dedup) and
+# fly in the forecast — violating "a retired aircraft can never fly". This anti-join drops any airframe that
+# has ANY Retired/Written off row under the same identity (serial when present, else registration), so a
+# dead airframe cannot be resurrected by a stale active row. ('Cancelled' is deliberately NOT here — it is
+# an order state, not an airframe death; a delivered tail with a stale cancelled order must still fly.)
+_NOT_DEAD = """NOT EXISTS (
+        SELECT 1 FROM cirium.ciriumaircrafts cd
+        WHERE cd.revision_id IN (SELECT mr FROM latest) AND cd."Operator" = :op
+          AND cd."Status" IN ('Retired','Written off')
+          AND ( (coalesce(ca."Serial Number",'') <> '' AND cd."Serial Number" = ca."Serial Number")
+             OR (coalesce(ca."Serial Number",'') =  '' AND cd."Registration"  = ca."Registration") ))"""
 
 _IDENT = """CASE WHEN coalesce(ca."Serial Number",'') <> ''
             THEN 'SN:' || ca."Serial Number" || '|' || coalesce(nullif(ca."Aircraft Sub Series",''),'NA')
@@ -258,7 +309,7 @@ INSERT INTO forecast.acys_forecast
      "Contract Year","Circle Distance","Flight Time",
      "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR",
      "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor")
-WITH latest AS (SELECT max(revision_id) mr FROM cirium.ciriumaircrafts WHERE "Operator" = :op),
+WITH latest AS ({_LATEST_CTE}),
 fleet AS (   -- active aircraft of this sub-fleet at :m_end (delivered by then; future deliveries included)
     SELECT DISTINCT ON ({_IDENT})
            {_REG_OUT} AS reg,
@@ -267,9 +318,10 @@ fleet AS (   -- active aircraft of this sub-fleet at :m_end (delivered by then; 
            ca."Delivery Date" deliv, ca."Lease Type" ltype, ca."Lease Dry / Wet" ldw,
            ca."Operational Lessor" lessor
     FROM cirium.ciriumaircrafts ca
-    WHERE ca."Operator" = :op AND ca.revision_id = (SELECT mr FROM latest)
+    WHERE ca."Operator" = :op AND ca.revision_id IN (SELECT mr FROM latest)
       AND coalesce(nullif(ca."Aircraft Sub Series",''),'NA') = :sf
       AND {_ALLOWED}
+      AND {_NOT_DEAD}
       AND {_HAS_KEY}
       AND {_DELIVERED} {scope}
     -- The tie-break is NOT cosmetic: Cirium carries SEVERAL rows for one airframe inside the SAME revision
@@ -335,6 +387,35 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
     run still shows movement across the step instead of freezing at the band floor."""
     scope_sql = f"AND ({scope_where})" if scope_where else ""
     sp = dict(scope_params or {})
+
+    # Anchor the forecast to the DATA, not the calendar. It MUST begin the day AFTER the last actual, so
+    # there is never a gap OR an overlap between facts and forecast (facts run to yesterday, forecast starts
+    # today, nothing between). When FR24 is fresh the last actual IS yesterday and this equals the caller's
+    # as_of; when actuals are stale it fills the hole instead of leaving one (actuals end 30-Jun but as_of is
+    # 15-Jul -> the forecast still starts 01-Jul, not 15-Jul, so no 2-week gap). It also re-bases the horizon
+    # to `as_of + FORECAST_HORIZON_YEARS` measured from where the facts actually end.
+    last_actual = (await session.execute(text(
+        'SELECT max("Date") FROM forecast.acys_actuals '
+        f'WHERE "Operator" = :op AND "Date" IS NOT NULL {scope_sql}'),
+        {"op": operator, **sp})).scalar()
+    if last_actual is not None:
+        as_of = last_actual + timedelta(days=1)
+
+    # Keep the ACTUALS' Contract Year on the SAME anchor as the forecast. The actuals were stamped at
+    # assembly with the request as_of (panel), but the forecast is anchored to last_actual+1 (the clamp
+    # above); when FR24 is stale these differ, so the fact half and forecast half of the report would split
+    # into DIFFERENT contract years at the boundary (e.g. actuals on a Sep anchor, forecast on a Jul anchor).
+    # Re-stamp this scope's actuals CY with the effective anchor so both halves — and powerbi.z_dates_acys,
+    # which anchors on the first forecast date — agree. In a fresh run the anchors already coincide, so this
+    # is a no-op. Same day-precise rule as _insert_sql / _CONTRACT_YEAR: CY = year-1 iff (month,day) <= anchor.
+    await session.execute(text(
+        'UPDATE forecast.acys_actuals SET "Contract Year" = '
+        '\'CY\' || (extract(year from "Date")::int - CASE WHEN '
+        '(extract(month from "Date")::int, extract(day from "Date")::int) <= (:am, :ad) '
+        'THEN 1 ELSE 0 END)::text '
+        f'WHERE "Date" IS NOT NULL {scope_sql}'),
+        {"am": as_of.month, "ad": as_of.day, "op": operator, **sp})
+
     base_params = {"op": operator, "start": HISTORY_START, **sp}
 
     async def _hist(key: str):
@@ -361,13 +442,13 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
     # the rows actually generated. One key, one aircraft, both places.
     fleet_deliv, sf_master = defaultdict(list), {}
     for r in (await session.execute(text(
-            'WITH latest AS (SELECT max(revision_id) mr FROM cirium.ciriumaircrafts WHERE "Operator" = :op), '
+            f'WITH latest AS ({_LATEST_CTE}), '
             f'f AS (SELECT DISTINCT ON ({_IDENT}) '
             '          coalesce(nullif(ca."Aircraft Sub Series", \'\'), \'NA\') sf, '
             '          coalesce(nullif(ca."Master Series", \'\'), \'NA\') ms, ca."Delivery Date" deliv '
             '      FROM cirium.ciriumaircrafts ca '
-            '      WHERE ca."Operator" = :op AND ca.revision_id = (SELECT mr FROM latest) '
-            f'        AND {_ALLOWED} AND {_HAS_KEY} {scope_sql} '
+            '      WHERE ca."Operator" = :op AND ca.revision_id IN (SELECT mr FROM latest) '
+            f'        AND {_ALLOWED} AND {_NOT_DEAD} AND {_HAS_KEY} {scope_sql} '
             f'      ORDER BY {_IDENT}, {_PREFER_DELIVERED}, ca.id DESC) '
             'SELECT sf, ms, deliv FROM f'),
             {"op": operator, **sp})).all():

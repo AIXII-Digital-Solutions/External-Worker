@@ -181,9 +181,11 @@ array6 AS (
     FROM flightradar.flightsummary f
     WHERE f.reg IN (SELECT registration FROM array5)
       -- lower bound is ALWAYS the start of CY2022: flights ON or before the anchor DAY in 2022 fall in
-      -- CY2021 and are dropped. Compare the DATE (first_seen is a timestamp — a same-day flight at any
-      -- clock time must still be excluded, so `first_seen > midnight` is not enough). Upper: request date.
-      AND f.first_seen::date > make_date(2022, :anchor_month, :anchor_day)
+      -- CY2021 and are dropped. Use the precomputed :cy2022_floor (= _cy2022_floor(as_of)) NOT a raw
+      -- make_date(2022, anchor_month, anchor_day): on a leap-day anchor (29-Feb) make_date(2022,2,29) is an
+      -- invalid date and Postgres ABORTS the whole assemble — _cy2022_floor clamps 29-Feb to 28-Feb, and it
+      -- is the SAME value the FR24 fetch lower bound uses, keeping both bounds consistent.
+      AND f.first_seen::date > :cy2022_floor
       AND f.first_seen <  :as_of
       -- DROP a flight with NO ICAO origin, or NO ICAO destination (neither actual nor planned)
       AND nullif(f.orig_icao, '') IS NOT NULL
@@ -294,9 +296,17 @@ INSERT INTO forecast.acys_summary_by_day
      "Destination Country","Destination City","Destination Airport Name",
      origin_lat, origin_lon, dest_lat, dest_lon)
 WITH aav AS (   -- per (reg, month-ordinal): the REAL actual Agreed Value (non-Wet, > 0) — source of truth
+    -- MUST be scoped to THIS request. acys_actuals accumulates across operators/requests (the panel deletes
+    -- only the current scope), so the SAME registration can carry another operator's rows at a LATER month.
+    -- Unscoped, astat.last_ord would then be that later month, and this operator's earlier forecast months
+    -- have ord < last_ord -> (ord - last_ord) < 0 -> slope(<=0) * negative = a POSITIVE increment -> the
+    -- projected value climbs ABOVE the last actual (Agreed Value rising into the future). Scoping pins
+    -- last_ord to this operator's own last actual, so every forecast month has ord >= last_ord -> the
+    -- projection is monotonically non-increasing.
     SELECT "Registration" reg, {ord_of.format(c='"Date"')} ord, max("Agreed Value") av
     FROM forecast.acys_actuals
     WHERE "Date" IS NOT NULL AND "Lease Dry Wet" IS DISTINCT FROM 'Wet' AND "Agreed Value" > 0
+      AND {final_scope}
     GROUP BY 1, 2
 ),
 astat AS (      -- per reg: last known AV, its month-ordinal, and the monthly depreciation slope (<= 0,
@@ -450,6 +460,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
 
     base = {"start_date": HISTORY_START, "as_of": as_of,
             "anchor_month": as_of.month, "anchor_day": as_of.day,
+            "cy2022_floor": _cy2022_floor(as_of),   # leap-safe CY2022 lower bound for _assemble_sql
             "pax_factor": FORECAST_PAX_LOAD_FACTOR, **scope_params}
 
     # ── Progress + ETA: an honest, self-calibrating FIVE-step model (no hardcoded step weights) ──────
