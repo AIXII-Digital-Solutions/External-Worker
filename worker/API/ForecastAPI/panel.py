@@ -398,7 +398,12 @@ SELECT
          ELSE coalesce(av.av, p."Agreed Value", sfb.av) END,
     p."Total Seats", p."Total PAX", p."Actual Distance FR", p."Flight Time FR",
     p."Delivery Date", p."Lease Type", p."Lease Dry Wet", p."Operational Lessor",
-    round((p."Date" - p."Delivery Date")::numeric / 365.25, 2),
+    -- Age = (Date - Delivery Date) in decimal years, FLOORED at 0: a flight can land a few days before the
+    -- recorded delivery date (an order flying early in its delivery month; or Cirium carrying a delivery date
+    -- LATER than the tail's real first operations), and a negative age is meaningless. NULL delivery -> NULL age
+    -- (unknown, not 0): GREATEST ignores NULL, so guard it explicitly rather than collapse unknown to brand-new.
+    CASE WHEN p."Delivery Date" IS NULL THEN NULL
+         ELSE round(GREATEST(p."Date" - p."Delivery Date", 0)::numeric / 365.25, 2) END,
     p."Data Type",
     o.country, o.city, o.airport_name,
     d.country, d.city, d.airport_name,
