@@ -89,6 +89,9 @@ _MAX_FT_HOURS = 19
 # end. The guarded flight-time expressions are built inside _assemble_sql (they need the route distance).
 _MIN_BLOCK_KMH = 550
 _FT_OVERHEAD_H = 2
+# Upper bound on implied ground speed: real flights top out ~960 km/h (block); a duration so short it implies
+# more than this over the route (e.g. 3638 km in 0.14 h => 26,000 km/h) is a broken record, not a real flight.
+_MAX_BLOCK_KMH = 1100
 
 
 def _ne(expr: str) -> str:
@@ -140,31 +143,29 @@ def _assemble_sql(a5_where: str) -> str:
     d_geo = _geo_lookup(f'coalesce({_ne("a6.dest_iata_actual")}, {_ne("a6.dest_iata")})',
                         f'coalesce({_ne("a6.dest_icao_actual")}, {_ne("a6.dest_icao")})')
 
-    # Great-circle km, reused for the Circle Distance column AND the flight-time distance-plausibility guard.
+    # Great-circle km, reused for the Circle Distance column AND the route/flight-time junk filter below.
     gc = _great_circle('o', 'd')
-    # Route length for the guard: great-circle when known, else FR24's actual flown distance (so a flight with
-    # missing airport coords is still checked). NULL only when BOTH are absent => route unknown => guard skipped.
+    # Route length: great-circle when known, else FR24's actual flown distance (so a flight with missing airport
+    # coords is still checked). NULL only when BOTH are absent => route unknown => the distance test is skipped.
     dist = f"coalesce(nullif({gc}, 0), nullif(a6.actual_distance, 0))"
-    maxh = f"({dist} / {_MIN_BLOCK_KMH}.0 + {_FT_OVERHEAD_H})"   # max plausible flight hours for this route
     delta_h = "extract(epoch from (a6.datetime_landed - a6.datetime_takeoff)) / 3600.0"
     src_h = "a6.flight_time / 3600.0"
 
-    def plausible(h: str) -> str:   # duration h is plausible for the route (or the route length is unknown)
-        return f"({dist} IS NULL OR {h} <= {maxh})"
-
-    # Flight Time — guarded on BOTH ends: NEGATIVE (landed <= takeoff), the physical CEILING (>= _MAX_FT_HOURS),
-    # and route-DISTANCE plausibility. Prefer the timestamp delta; else FR24's own flight_time; else NULL.
-    flight_time = (f"""CASE
-        WHEN a6.datetime_landed > a6.datetime_takeoff
-             AND a6.datetime_landed - a6.datetime_takeoff < interval '{_MAX_FT_HOURS} hours'
-             AND {plausible(delta_h)}
-        THEN {delta_h}
-        WHEN a6.flight_time >= 0 AND a6.flight_time < {_MAX_FT_HOURS} * 3600 AND {plausible(src_h)}
-        THEN {src_h}
-        ELSE NULL END""")
-    # Flight Time FR — FR24's own duration, same UPPER guards (physical ceiling + distance); NULL if bad/absent.
+    # Flight Time (decimal hours): timestamp delta when positive AND under the physical ceiling, else FR24's own
+    # flight_time; else NULL. Route-distance-impossible flights are DROPPED by `junk` below (not nulled), so this
+    # value is already plausible for anything that survives.
+    flight_time = (f"CASE WHEN a6.datetime_landed > a6.datetime_takeoff "
+                   f"AND a6.datetime_landed - a6.datetime_takeoff < interval '{_MAX_FT_HOURS} hours' THEN {delta_h} "
+                   f"WHEN a6.flight_time >= 0 AND a6.flight_time < {_MAX_FT_HOURS} * 3600 THEN {src_h} "
+                   f"ELSE NULL END")
     flight_time_fr = (f"CASE WHEN a6.flight_time >= 0 AND a6.flight_time < {_MAX_FT_HOURS} * 3600 "
-                      f"AND {plausible(src_h)} THEN {src_h} ELSE NULL END")
+                      f"THEN {src_h} ELSE NULL END")
+
+    # SAME-AIRPORT junk — DROP the whole flight: orig == dest, or great-circle ~0. A return-to-field /
+    # air-turnback is not an O&D route and is useless for the forecast or the charts. (Flights with an
+    # implausible time/distance for a REAL route are NOT dropped — they are kept and their broken field is
+    # imputed from the same-route average afterwards; see _route_impute_sql.)
+    same_airport = f"nullif(a6.orig_iata,'') = nullif(a6.dest_iata,'') OR {gc} < 1"
     return f"""
 INSERT INTO forecast.acys_actuals
     ("Registration","Period","Date","Time Departed","Time Landed",
@@ -236,8 +237,9 @@ SELECT
     a5.operator, a5.master_series, a5.manufacturer, a5.sub_series, a5.primary_usage,
     {_CONTRACT_YEAR},
     {gc},
-    -- Flight Time in DECIMAL HOURS (6.51 = 6h31m), not an interval — negative / physical-ceiling / distance
-    -- guards built above.
+    -- Flight Time in DECIMAL HOURS (6.51 = 6h31m), not an interval — negative / physical-ceiling guards built
+    -- above. A time that is implausible for the route distance is left as-is here and IMPUTED from the
+    -- same-route average post-assembly (_route_impute_sql); only same-airport flights are dropped (WHERE below).
     {flight_time},
     a5.agreed_value,
     a5.total_seats,
@@ -258,7 +260,56 @@ JOIN array6 a6
       AND a5.period_month = LEAST(date_trunc('month', a6.first_seen)::date, rm.mx)
 LEFT JOIN LATERAL {o_geo} o ON true
 LEFT JOIN LATERAL {d_geo} d ON true
+WHERE NOT ({same_airport})
 """
+
+
+# Implied-speed bounds reused by the route-average imputation (same physics as the drop calibration above).
+_TOO_FAST = '"Flight Time" < "Circle Distance" / {mx}.0'
+_TOO_SLOW = '"Flight Time" > "Circle Distance" / {mn}.0 + {oh}'
+
+
+def _route_impute_sql(scope_sql: str, table: str = "forecast.acys_actuals") -> list[str]:
+    """Repair (NOT drop) a REAL route's broken fields by borrowing the SAME-ROUTE (operator, origin, dest)
+    average of the PLAUSIBLE flights, so the flight is still counted for the forecast/charts but with a sane
+    value. Two passes: (1) a missing/zero Circle Distance -> the route's average great-circle; (2) a Flight
+    Time that is missing or physically impossible for the (now-filled) distance -> the route's average of
+    plausible times, falling back to a distance estimate (~800 km/h + 0.5 h) when the whole route is broken.
+    `scope_sql` is the request's ' AND (...)' operator filter (may be empty). Returns statements to run in order.
+    """
+    too_fast = _TOO_FAST.format(mx=_MAX_BLOCK_KMH)
+    too_slow = _TOO_SLOW.format(mn=_MIN_BLOCK_KMH, oh=_FT_OVERHEAD_H)
+    return [
+        # (1) Circle Distance: fill 0/NULL from the route's average great-circle (identical for every A->B flight)
+        f'''WITH cd AS (
+            SELECT "Operator" op, "IATA Origin" o, "IATA Destination" d,
+                   avg(nullif("Circle Distance", 0)) avg_cd
+            FROM {table}
+            WHERE nullif("IATA Origin",'') IS DISTINCT FROM nullif("IATA Destination",'') {scope_sql}
+            GROUP BY 1, 2, 3)
+        UPDATE {table} a SET "Circle Distance" = cd.avg_cd
+        FROM cd WHERE cd.op = a."Operator" AND cd.o = a."IATA Origin" AND cd.d = a."IATA Destination"
+          AND cd.avg_cd IS NOT NULL AND coalesce(a."Circle Distance", 0) = 0 {scope_sql}''',
+        # (2) Flight Time: replace missing/implausible with the route's average of PLAUSIBLE times (else estimate)
+        f'''WITH ft AS (
+            SELECT "Operator" op, "IATA Origin" o, "IATA Destination" d,
+                   avg("Flight Time") FILTER (
+                       WHERE "Flight Time" IS NOT NULL AND "Circle Distance" > 0
+                         AND NOT ({too_fast}) AND NOT ({too_slow})) avg_ft
+            FROM {table}
+            WHERE nullif("IATA Origin",'') IS DISTINCT FROM nullif("IATA Destination",'') {scope_sql}
+            GROUP BY 1, 2, 3)
+        UPDATE {table} a SET "Flight Time" = coalesce(ft.avg_ft, a."Circle Distance" / 800.0 + 0.5)
+        FROM ft WHERE ft.op = a."Operator" AND ft.o = a."IATA Origin" AND ft.d = a."IATA Destination"
+          AND a."Circle Distance" > 0
+          AND (a."Flight Time" IS NULL OR ({too_fast}) OR ({too_slow})) {scope_sql}''',
+        # (3) safety net: any flight STILL implausible (the route average was out of band for THIS flight's own
+        # distance — e.g. a diversion whose great-circle differs from the route norm) -> a distance estimate on
+        # its OWN great-circle, which is in-band by construction. Guarantees no implausible time survives.
+        f'''UPDATE {table} SET "Flight Time" = "Circle Distance" / 800.0 + 0.5
+        WHERE "Circle Distance" > 0
+          AND ("Flight Time" IS NULL OR ({too_fast}) OR ({too_slow})) {scope_sql}''',
+    ]
 
 
 def _future_aircraft_sql(a5_where: str) -> str:
@@ -684,6 +735,11 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_assemble_sql(a5_where)), base)
             history_rows = res.rowcount
+            # Repair (not drop) broken Circle Distance / Flight Time in the just-assembled facts from the
+            # same-route average, so the flight is still counted but with a sane value. Runs BEFORE the forecast
+            # so its route pool draws from clean facts (no separate forecast repair needed).
+            for stmt in _route_impute_sql(f" AND ({final_scope})"):
+                await s.execute(text(stmt), scope_params)
             await s.commit()
         d = await reporter.complete()
         await cal.record("transform", d, n_regs, {"regs": n_regs, "history_rows": history_rows})
