@@ -356,6 +356,99 @@ ORDER BY ca."Registration", ca.revision_id DESC, ca.id DESC
 """
 
 
+# The CY of a calendar day vs the request anchor (:anchor_month/:anchor_day) — same day-precise rule as the
+# flight assemble's _CONTRACT_YEAR, but on an arbitrary date expression `d`.
+def _cy_of(d: str) -> str:
+    return (f"'CY' || (extract(year from {d})::int - CASE WHEN "
+            f"(extract(month from {d})::int, extract(day from {d})::int) <= (:anchor_month, :anchor_day) "
+            f"THEN 1 ELSE 0 END)::text")
+
+
+def _fleet_presence_sql(a5_where: str, scope_sql: str) -> str:
+    """FLEET PRESENCE stubs: a tail that is LIVE in Cirium (In Service / Storage — owned, not Retired/Written
+    off) must appear in EVERY (month, Contract-Year) cell of its life even in months it did not fly, so it
+    never vanishes from the fleet between maintenance/storage gaps. One FLIGHTLESS stub (Date + route + all
+    flight measures NULL, aircraft attributes from Cirium) per gap cell, from the tail's first observed month
+    to the request month (:as_of). The anchor month yields TWO cells (the CY split), so a tail that flew only
+    the CY(n-1) half of September still gets a stub for the CY(n) half. Stubs carry Date=NULL, so # Of Flights
+    (count of non-null Date) stays 0 — the tail is PRESENT with zero flights. Retired/Written off tails are
+    excluded, so a genuinely gone airframe does not linger.
+    """
+    return f"""
+INSERT INTO forecast.acys_actuals
+    ("Registration","Period","Date","Time Departed","Time Landed",
+     "IATA Origin","IATA Destination","IATA Destination Actual",
+     "ICAO Origin","ICAO Destination","ICAO Destination Actual",
+     "Operator","Master Series","Manufacturer","Aircraft Sub Series","Primary Usage",
+     "Contract Year","Circle Distance","Flight Time",
+     "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR",
+     "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor")
+WITH latest_rev AS (
+    SELECT DISTINCT ON (plan_type) id FROM cirium.aircraftrevision
+    ORDER BY plan_type, to_date(period,'MM-YYYY') DESC, id DESC
+),
+live AS (   -- authoritative LIVE tail (In Service / Storage), one row per registration
+    SELECT DISTINCT ON (ca."Registration")
+           ca."Registration" reg, ca."Operator" op, ca."Master Series" ms, ca."Manufacturer" mf,
+           ca."Aircraft Sub Series" ss, ca."Primary Usage" pu, ca."Indicative Market Value (US$m)" av,
+           ca."Number of Seats" seats, ca."Delivery Date" deliv, ca."Lease Type" lt,
+           ca."Lease Dry / Wet" ldw, ca."Operational Lessor" ol
+    FROM cirium.ciriumaircrafts ca JOIN latest_rev lr ON lr.id = ca.revision_id
+    WHERE {a5_where} AND ca."Status" IN ('In Service','Storage')
+      AND NOT EXISTS (
+          SELECT 1 FROM cirium.ciriumaircrafts ca2 JOIN latest_rev lr2 ON lr2.id = ca2.revision_id
+          WHERE ca2."Registration" = ca."Registration" AND (ca2.revision_id, ca2.id) > (ca.revision_id, ca.id))
+    ORDER BY ca."Registration", ca.revision_id DESC, ca.id DESC
+),
+first_flight AS (   -- the tail's first observed flight DATE (else its delivery date) bounds the span start
+    SELECT "Registration" reg, min("Date") ff
+    FROM forecast.acys_actuals WHERE "Date" IS NOT NULL {scope_sql} GROUP BY 1
+),
+span AS (
+    SELECT l.*, coalesce(f.ff, l.deliv) life_start,
+           date_trunc('month', coalesce(f.ff, l.deliv))::date start_m,
+           date_trunc('month', :as_of::date)::date end_m
+    FROM live l LEFT JOIN first_flight f ON f.reg = l.reg
+),
+cells AS (   -- (tail, month, Contract Year) presence cells over the span; the anchor month splits into two CYs
+    SELECT DISTINCT s.reg, s.op, s.ms, s.mf, s.ss, s.pu, s.av, s.seats, s.deliv, s.lt, s.ldw, s.ol,
+           s.life_start, g.mon::date mon, {_cy_of('cyd.d')} AS cy
+    FROM span s
+    CROSS JOIN generate_series(s.start_m, s.end_m, interval '1 month') AS g(mon)
+    CROSS JOIN LATERAL (VALUES (g.mon::date),
+                               ((g.mon + interval '1 month' - interval '1 day')::date)) AS cyd(d)
+    WHERE s.start_m IS NOT NULL AND s.start_m <= s.end_m
+),
+cells2 AS (   -- attach each cell's display DATE (= the matview's day-precise Date) to bound it to the real life
+    SELECT c.*,
+           make_date(extract(year from c.mon)::int, extract(month from c.mon)::int,
+               LEAST(CASE WHEN extract(month from c.mon)::int = :anchor_month
+                           AND right(c.cy, 4)::int = extract(year from c.mon)::int - 1
+                          THEN :anchor_day ELSE :anchor_day + 1 END,
+                     extract(day from (c.mon + interval '1 month' - interval '1 day'))::int)) cdate
+    FROM cells c
+),
+flown AS (   -- (tail, month, CY) cells that already have real flights — never stub these
+    SELECT "Registration" reg, date_trunc('month',"Date")::date mon, "Contract Year" cy
+    FROM forecast.acys_actuals WHERE "Date" IS NOT NULL {scope_sql} GROUP BY 1, 2, 3
+)
+SELECT
+    c.reg, to_char(c.mon, 'MM-YYYY'), NULL::date, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL,
+    c.op, c.ms, c.mf, c.ss, c.pu,
+    c.cy,
+    NULL::double precision, NULL::double precision,
+    c.av, c.seats, NULL::double precision,
+    NULL::double precision, NULL::double precision,
+    c.deliv, c.lt, c.ldw, c.ol
+FROM cells2 c
+LEFT JOIN flown f ON f.reg = c.reg AND f.mon = c.mon AND f.cy = c.cy
+WHERE f.reg IS NULL
+  AND c.cdate >= c.life_start::date          -- not before the tail's first flight / delivery
+  AND c.cdate <= :as_of::date                -- not after the request 'now'
+"""
+
+
 # Columns carried verbatim from acys_actuals / acys_forecast into the merge panel.
 _PANEL_COLS = """"Registration","Period","Date","Time Departed","Time Landed",
        "IATA Origin","IATA Destination","IATA Destination Actual",
@@ -447,7 +540,9 @@ sfbench AS (    -- CROSS-OPERATOR type benchmark, for a BRAND-NEW tail: it has f
 panel AS (
     -- each branch tags its source so rows carry Data Type = Actuals / Forecast
     SELECT {_PANEL_COLS}, 'Actuals' AS "Data Type" FROM forecast.acys_actuals
-    WHERE "Date" IS NOT NULL AND {final_scope}     -- flights only + THIS request's slice
+    -- real flights (Date set) PLUS fleet-presence stubs (Date NULL but Contract Year set — a live tail that did
+    -- not fly that month); future-delivery stubs (Date + Contract Year both NULL) stay excluded.
+    WHERE ("Date" IS NOT NULL OR "Contract Year" IS NOT NULL) AND {final_scope}
     UNION ALL
     SELECT {_PANEL_COLS}, 'Forecast' AS "Data Type" FROM forecast.acys_forecast
 ),
@@ -751,9 +846,16 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         async with db_client.session(_DB) as s:
             fut = await s.execute(text(_future_aircraft_sql(a5_where)), base)
             future_aircraft = fut.rowcount
+            # FLEET PRESENCE: a LIVE Cirium tail (In Service / Storage) appears in EVERY (month, Contract-Year)
+            # cell of its life even in months it did not fly (maintenance / storage), so it never vanishes from
+            # the fleet between gaps — a flightless stub per gap cell (# Of Flights = 0). Retired/Written off
+            # tails are excluded, so a genuinely gone airframe stops appearing.
+            pres = await s.execute(text(_fleet_presence_sql(a5_where, f" AND ({final_scope})")), base)
+            presence_stubs = pres.rowcount
             await s.commit()
         d = await reporter.complete()
-        await cal.record("measures", d, n_regs, {"regs": n_regs, "future": future_aircraft})
+        await cal.record("measures", d, n_regs,
+                         {"regs": n_regs, "future": future_aircraft, "presence": presence_stubs})
 
         # ── 8/10 Generating forecast — project forward per operator. ─────────────────────────────────
         await _ck()
