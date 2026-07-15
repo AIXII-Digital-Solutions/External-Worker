@@ -58,6 +58,12 @@ GROUP BY 1, 2
 _KEY_SF = """coalesce(nullif("Aircraft Sub Series",''),'NA')"""
 _KEY_MS = """coalesce(nullif("Master Series",''),'NA')"""
 
+# Minimum DISTINCT routes a route pool must have before it is trusted as-is. Below this, the pool is
+# "degenerate" (e.g. a barely-flown new type whose seasonal template month holds a single long-haul route),
+# and _insert_sql's tier cascade broadens it (sub-series all-history -> master all-history). Keeps one
+# aircraft from being pinned onto one route for a whole month (36x Toulouse-Sharjah = 226 flight-hours).
+_MIN_ROUTE_POOL = 5
+
 # DEPRECATED (unused): the fleet + future deliveries now come from the reference (§ run_forecast_model),
 # not from Date-NULL stub rows. Kept only to avoid churn; sub-fleet key would be "Aircraft Sub Series".
 _FUTURE_SQL = """
@@ -286,19 +292,25 @@ _DELIVERED = f"""CASE WHEN {_ORDER}
                  ELSE (ca."Delivery Date" IS NULL OR ca."Delivery Date" <= :m_end) END"""
 
 
-def _insert_sql(scope: str, by_master: bool) -> str:
+def _insert_sql(scope: str, tier: int) -> str:
     """One (forecast month, sub-fleet) INSERT into acys_forecast. EVERY active Cirium-fleet aircraft of the
     sub-fleet (latest revision, delivered ≤ :m_end — nothing retires; future deliveries appear once due)
-    flies :k flights, each taking a route from the route pool (:template_month's flights = the type's usual
-    network for THIS operator, so never a route the operator has not flown). Aircraft attributes (value /
-    seats / lease / delivery) come from Cirium; the merge step later projects the Agreed Value.
+    flies :k flights, each taking a route from the route pool. Aircraft attributes (value / seats / lease /
+    delivery) come from Cirium; the merge step later projects the Agreed Value.
 
-    The FLEET is always the target sub-series (:sf). The ROUTE POOL is keyed on :hist_key, which is normally
-    that same sub-series — but for a sub-series the operator has never flown (a brand-new type entering the
-    fleet) there is no pool at all, so `by_master` switches the pool to the aircraft's MASTER SERIES history.
+    The FLEET is always the target sub-series (:sf). The ROUTE POOL is chosen by `tier` (decided in
+    run_forecast_model from how many DISTINCT routes each source has, so a degenerate 1-route template month
+    cannot pin an aircraft's whole month onto one long-haul route — 36x Toulouse-Sharjah = 226 h/mo):
+      tier 1 — :sf in the seasonal :template_month  (the normal, seasonally-matched pool)
+      tier 2 — :sf across ALL history               (template month too sparse: <  _MIN_ROUTE_POOL routes)
+      tier 3 — :ms_key (master series) ALL history  (the sub-series itself is too sparse everywhere)
     """
-    # route pool key: the sub-fleet's own history, or its master series' when the sub-fleet has none
-    route_key = (_KEY_MS if by_master else _KEY_SF)
+    if tier == 1:
+        route_where = f'AND {_KEY_SF} = :sf AND date_trunc(\'month\',"Date")::date = :template_month'
+    elif tier == 2:
+        route_where = f'AND {_KEY_SF} = :sf'
+    else:
+        route_where = f'AND {_KEY_MS} = :ms_key'
     return f"""
 INSERT INTO forecast.acys_forecast
     ("Registration","Period","Date","Time Departed","Time Landed",
@@ -359,15 +371,14 @@ fleet AS (
     UNION ALL
     SELECT * FROM sup
 ),
-routes AS (   -- typical route pool = a template month's real flights for this operator on :hist_key
+routes AS (   -- route pool for this (month, sub-fleet), scoped by the tier chosen from pool richness (above)
     SELECT "IATA Origin" io, "IATA Destination" idd, "IATA Destination Actual" ida,
            "ICAO Origin" ico, "ICAO Destination" icd, "ICAO Destination Actual" ica,
            "Circle Distance" cd, "Flight Time" ft, "Actual Distance FR" adf, "Flight Time FR" ftf,
            row_number() OVER (ORDER BY id) rn
     FROM forecast.acys_actuals
     WHERE "Operator" = :op AND "Date" IS NOT NULL
-      AND {route_key} = :hist_key
-      AND date_trunc('month',"Date")::date = :template_month {scope}
+      {route_where} {scope}
 ),
 nr AS (SELECT count(*)::int c FROM routes),
 gen AS (   -- every active aircraft × :k flights, cycling the route pool
@@ -510,8 +521,26 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         fleet_deliv[r[0]].append(r[2])
         sf_master.setdefault(r[0], r[1])
 
-    sql = {False: _insert_sql(scope_sql, by_master=False),   # route pool keyed on Aircraft Sub Series
-           True:  _insert_sql(scope_sql, by_master=True)}    # ...on Master Series (sub-series has no history)
+    # Route-pool richness, to pick the route-pool tier per (month, sub-fleet) in the loop (see _insert_sql):
+    # distinct routes for each sub-series BY seasonal month (tier 1) and across ALL history (tier 2). A pool
+    # below _MIN_ROUTE_POOL distinct routes is degenerate and we broaden it; the master all-history pool
+    # (tier 3) is the final fallback and is assumed rich.
+    sf_seasonal_routes, sf_all_routes = defaultdict(dict), {}
+    for r in (await session.execute(text(
+            f'SELECT {_KEY_SF} sf, date_trunc(\'month\',"Date")::date m, '
+            '       count(DISTINCT ("IATA Origin","IATA Destination")) n '
+            'FROM forecast.acys_actuals '
+            f'WHERE "Operator" = :op AND "Date" IS NOT NULL {scope_sql} GROUP BY 1, 2'),
+            {"op": operator, **sp})).all():
+        sf_seasonal_routes[r[0]][r[1]] = r[2]
+    for r in (await session.execute(text(
+            f'SELECT {_KEY_SF} sf, count(DISTINCT ("IATA Origin","IATA Destination")) n '
+            'FROM forecast.acys_actuals '
+            f'WHERE "Operator" = :op AND "Date" IS NOT NULL {scope_sql} GROUP BY 1'),
+            {"op": operator, **sp})).all():
+        sf_all_routes[r[0]] = r[1]
+
+    sql = {t: _insert_sql(scope_sql, tier=t) for t in (1, 2, 3)}
     total, coeff = 0, []
     nfm = max(1, len(fmonths))
     # Iterate the FLEET, not the history: a sub-series can be in the fleet with no history of its own (a new
@@ -537,13 +566,21 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
                 fr = fr_ms
             else:
                 continue   # neither the sub-series nor its master series has any history -> nothing to fit
-            params = {"op": operator, "sf": sf, "hist_key": hist_key, "template_month": tm,
+            # Route-pool tier: prefer the sub-series' SEASONAL pool, but broaden if it is degenerate so an
+            # aircraft is not pinned onto one long-haul route for a whole month (see _insert_sql / _MIN_ROUTE_POOL).
+            if sf_seasonal_routes.get(sf, {}).get(tm, 0) >= _MIN_ROUTE_POOL:
+                pool_tier = 1
+            elif sf_all_routes.get(sf, 0) >= _MIN_ROUTE_POOL:
+                pool_tier = 2
+            else:
+                pool_tier = 3
+            params = {"op": operator, "sf": sf, "ms_key": ms, "hist_key": hist_key, "template_month": tm,
                       "m_end": m_end, "k": int(k), "sup_since": sup_since,
                       "period": m.strftime("%m-%Y"), "year": m.year, "month": m.month,
                       "start_day": start_day, "day_span": day_span,
                       "anchor_month": as_of.month, "anchor_day": as_of.day,
                       "pax_factor": FORECAST_PAX_LOAD_FACTOR, **sp}
-            res = await session.execute(text(sql[by_master]), params)
+            res = await session.execute(text(sql[pool_tier]), params)
             total += res.rowcount or 0
             coeff.append({"op": operator, "ms": sf_master.get(sf), "sf": sf, "hk": hist_key,
                           "fm": m, "cm": m.month,
