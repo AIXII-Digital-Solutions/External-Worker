@@ -79,15 +79,16 @@ _CONTRACT_YEAR = """'CY' || (extract(year from a6.first_seen)::int - CASE
         THEN 1 ELSE 0 END)::text"""
 
 # Physical ceiling for ONE commercial flight: the longest scheduled flight in the world is ~18h55m, so any
-# duration >= this is a broken record (a wrong-day landing timestamp), never a real flight. Used to guard the
-# UPPER end of both Flight Time columns (the LOWER end — negatives — is guarded by the > checks).
+# duration >= this is a broken record (a wrong-day landing timestamp), never a real flight.
 _MAX_FT_HOURS = 19
 
-# flightsummary.flight_time is integer SECONDS (with some bad negatives) -> DECIMAL HOURS (6.51 = 6h31m),
-# NULL if negative/absent OR implausibly long (>= _MAX_FT_HOURS). `/ 3600.0` (not 3600) so integer division
-# never truncates it to whole hours.
-_FLIGHT_TIME_FR = (f"CASE WHEN a6.flight_time >= 0 AND a6.flight_time < {_MAX_FT_HOURS} * 3600 "
-                   "THEN a6.flight_time / 3600.0 ELSE NULL END")
+# Route-distance plausibility: no jet sustains below ~550 km/h block speed, so the max plausible duration for a
+# route is great_circle_km / 550 + 2h (taxi/climb/descent + minor holding). A duration far above that (implied
+# ground speed < ~450 km/h over a real route) is a broken timestamp, not a real flight. Both the physical
+# ceiling and this distance test guard the UPPER end of Flight Time; the `>` / `>= 0` checks guard the negative
+# end. The guarded flight-time expressions are built inside _assemble_sql (they need the route distance).
+_MIN_BLOCK_KMH = 550
+_FT_OVERHEAD_H = 2
 
 
 def _ne(expr: str) -> str:
@@ -138,6 +139,32 @@ def _assemble_sql(a5_where: str) -> str:
     o_geo = _geo_lookup(_ne("a6.orig_iata"), _ne("a6.orig_icao"))
     d_geo = _geo_lookup(f'coalesce({_ne("a6.dest_iata_actual")}, {_ne("a6.dest_iata")})',
                         f'coalesce({_ne("a6.dest_icao_actual")}, {_ne("a6.dest_icao")})')
+
+    # Great-circle km, reused for the Circle Distance column AND the flight-time distance-plausibility guard.
+    gc = _great_circle('o', 'd')
+    # Route length for the guard: great-circle when known, else FR24's actual flown distance (so a flight with
+    # missing airport coords is still checked). NULL only when BOTH are absent => route unknown => guard skipped.
+    dist = f"coalesce(nullif({gc}, 0), nullif(a6.actual_distance, 0))"
+    maxh = f"({dist} / {_MIN_BLOCK_KMH}.0 + {_FT_OVERHEAD_H})"   # max plausible flight hours for this route
+    delta_h = "extract(epoch from (a6.datetime_landed - a6.datetime_takeoff)) / 3600.0"
+    src_h = "a6.flight_time / 3600.0"
+
+    def plausible(h: str) -> str:   # duration h is plausible for the route (or the route length is unknown)
+        return f"({dist} IS NULL OR {h} <= {maxh})"
+
+    # Flight Time — guarded on BOTH ends: NEGATIVE (landed <= takeoff), the physical CEILING (>= _MAX_FT_HOURS),
+    # and route-DISTANCE plausibility. Prefer the timestamp delta; else FR24's own flight_time; else NULL.
+    flight_time = (f"""CASE
+        WHEN a6.datetime_landed > a6.datetime_takeoff
+             AND a6.datetime_landed - a6.datetime_takeoff < interval '{_MAX_FT_HOURS} hours'
+             AND {plausible(delta_h)}
+        THEN {delta_h}
+        WHEN a6.flight_time >= 0 AND a6.flight_time < {_MAX_FT_HOURS} * 3600 AND {plausible(src_h)}
+        THEN {src_h}
+        ELSE NULL END""")
+    # Flight Time FR — FR24's own duration, same UPPER guards (physical ceiling + distance); NULL if bad/absent.
+    flight_time_fr = (f"CASE WHEN a6.flight_time >= 0 AND a6.flight_time < {_MAX_FT_HOURS} * 3600 "
+                      f"AND {plausible(src_h)} THEN {src_h} ELSE NULL END")
     return f"""
 INSERT INTO forecast.acys_actuals
     ("Registration","Period","Date","Time Departed","Time Landed",
@@ -208,22 +235,15 @@ SELECT
     a6.orig_icao, a6.dest_icao, a6.dest_icao_actual,
     a5.operator, a5.master_series, a5.manufacturer, a5.sub_series, a5.primary_usage,
     {_CONTRACT_YEAR},
-    {_great_circle('o', 'd')},
-    -- Flight Time in DECIMAL HOURS (6.51 = 6h31m), not an interval. Guard broken timestamps on BOTH ends:
-    -- FR24 records datetime_landed <= datetime_takeoff (-> NEGATIVE) or a wrong-day-LATE landing (-> impossibly
-    -- LONG, >= _MAX_FT_HOURS). Use the timestamp delta only when positive AND under the physical ceiling; else
-    -- fall back to FR24's own flight_time (same bounds); else NULL.
-    CASE WHEN a6.datetime_landed > a6.datetime_takeoff
-              AND a6.datetime_landed - a6.datetime_takeoff < interval '{_MAX_FT_HOURS} hours'
-         THEN extract(epoch from (a6.datetime_landed - a6.datetime_takeoff)) / 3600.0
-         WHEN a6.flight_time >= 0 AND a6.flight_time < {_MAX_FT_HOURS} * 3600
-         THEN a6.flight_time / 3600.0
-         ELSE NULL END,
+    {gc},
+    -- Flight Time in DECIMAL HOURS (6.51 = 6h31m), not an interval — negative / physical-ceiling / distance
+    -- guards built above.
+    {flight_time},
     a5.agreed_value,
     a5.total_seats,
     a5.total_seats * CAST(:pax_factor AS double precision),
     a6.actual_distance,
-    {_FLIGHT_TIME_FR},
+    {flight_time_fr},
     a5.delivery_date, a5.lease_type, a5.lease_dry_wet, a5.operational_lessor
 FROM array5 a5
 JOIN (SELECT registration, max(period_month) AS mx FROM array5 GROUP BY registration) rm
