@@ -11,6 +11,25 @@ The output has two `Data Type`s:
 
 ---
 
+## 0. Invariants (hard rules) and how they are guaranteed
+
+| # | Rule | How it is enforced |
+|---|------|--------------------|
+| 1 | Facts are the past, up to **yesterday** | Actuals come from flight history; upper bound `first_seen < as_of`. |
+| 2 | Forecast is **today** → future | The forecast is anchored to **last actual + 1 day** (the effective "today"). |
+| 3 | No day is both a fact and a forecast | The forecast begins strictly after the last fact → no overlap. |
+| 4 | **No gap** between facts and forecast | Forecast anchor = `last_actual + 1` (NOT the calendar `as_of`), so a stale FR24 fetch cannot open a hole. Plus a `k≥1` floor on the first month so proration rounding can't drop the boundary month. |
+| 5 | Value **never rises** in the future | `slope = LEAST(0, regr_slope(...))` (clamped ≤0); the `aav` projection is operator-scoped, else another operator's later row for the same tail would give a negative offset → a rise. |
+| 6 | A retired aircraft **never flies** | Status whitelist + `_NOT_DEAD` anti-join: an airframe with ANY `Retired/Written off` row under the same identity is excluded even if a stale `In Service` row exists. |
+| 7 | Future fleet **never leaves** | Fleet = the reference (no idle-based retirement); a `k≥1` floor for an active sub-fleet in **every** month keeps thin fleets (business jets/helicopters) from vanishing in a seasonal trough; the `latest` revision is taken **per plan_type** (else the other plan's aircraft were dropped). |
+
+One anchor (`last_actual + 1`) is reused for the actuals' CY (re-stamp) and the forecast, so both halves of
+the report bucket into the same contract years, and `powerbi.z_dates_acys` (anchored on the first forecast
+date) agrees with them. Edge dates (29-Feb of a leap year) are clamped to the month length so `make_date`
+never overflows.
+
+---
+
 ## 1. Coefficients (every tunable)
 
 | Constant | Value | Meaning / why |
