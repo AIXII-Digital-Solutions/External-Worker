@@ -192,7 +192,9 @@ array6 AS (
       AND coalesce(nullif(f.dest_icao_actual, ''), nullif(f.dest_icao, '')) IS NOT NULL
 )
 SELECT
-    a5.registration, a5.period,
+    a5.registration, to_char(a6.first_seen, 'MM-YYYY'),   -- Period = the FLIGHT's month (not the carried
+                                                          -- Cirium snapshot's), so a carry-forward July
+                                                          -- flight is Period 07-YYYY, not the June snapshot
     CAST(a6.first_seen AS date),
     a6.datetime_takeoff, a6.datetime_landed,
     a6.orig_iata, a6.dest_iata, a6.dest_iata_actual,
@@ -209,9 +211,16 @@ SELECT
     {_FLIGHT_TIME_FR},
     a5.delivery_date, a5.lease_type, a5.lease_dry_wet, a5.operational_lessor
 FROM array5 a5
+JOIN (SELECT registration, max(period_month) AS mx FROM array5 GROUP BY registration) rm
+       ON rm.registration = a5.registration
 JOIN array6 a6
        ON a6.reg = a5.registration
-      AND date_trunc('month', a6.first_seen) = a5.period_month
+      -- CARRY-FORWARD: a flight in a month NEWER than this tail's latest Cirium revision (Cirium hasn't
+      -- published that month yet) is attributed with the LATEST available Cirium snapshot, so a recently-
+      -- flown tail is NOT dropped from the facts just because the reference lags. Flights within Cirium's
+      -- range still match their EXACT month (rm.mx >= their month, so LEAST picks their month) — unchanged;
+      -- only months beyond the latest snapshot fall back to it. (Period above is still the flight's month.)
+      AND a5.period_month = LEAST(date_trunc('month', a6.first_seen)::date, rm.mx)
 LEFT JOIN LATERAL {o_geo} o ON true
 LEFT JOIN LATERAL {d_geo} d ON true
 """
@@ -584,9 +593,18 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         async def _plan_progress(done, total):
             await reporter.tick(done, total)
 
+        # Fetch ALL available flight history up to REAL YESTERDAY (today-1) — the aircraft flew every day up
+        # to now, so those facts must exist regardless of the request's as_of. The window is NOT clamped to
+        # as_of-1: a back-dated as_of must still pull the latest data (which the assemble step then caps at
+        # `first_seen < as_of`, so the fact/forecast boundary stays at as_of), and it lets a future as_of
+        # collect everything that already exists. `today-1` is the hard upper bound: the CURRENT day is
+        # incomplete and is NEVER queried, and the source has no future data, so we never waste budget on
+        # ranges that cannot exist. (`_complement` fetches [w_start, w_end] inclusive, so the last queried
+        # day is exactly today-1.)
+        w_end = date.today() - timedelta(days=1)
         plan_info = await plan_missing_ranges(
             db_client, list(scope_regs),
-            w_start=_cy2022_floor(as_of), w_end=date.today() - timedelta(days=1),
+            w_start=_cy2022_floor(as_of), w_end=w_end,
             on_progress=_plan_progress, should_cancel=_cancelled)
         d = await reporter.complete()
         await cal.record("coverage", d, n_regs, {"regs": n_regs, "groups": plan_info["groups"]})

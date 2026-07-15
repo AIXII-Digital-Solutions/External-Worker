@@ -388,26 +388,19 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
     scope_sql = f"AND ({scope_where})" if scope_where else ""
     sp = dict(scope_params or {})
 
-    # Anchor the forecast to the DATA, not the calendar. It MUST begin the day AFTER the last actual, so
-    # there is never a gap OR an overlap between facts and forecast (facts run to yesterday, forecast starts
-    # today, nothing between). When FR24 is fresh the last actual IS yesterday and this equals the caller's
-    # as_of; when actuals are stale it fills the hole instead of leaving one (actuals end 30-Jun but as_of is
-    # 15-Jul -> the forecast still starts 01-Jul, not 15-Jul, so no 2-week gap). It also re-bases the horizon
-    # to `as_of + FORECAST_HORIZON_YEARS` measured from where the facts actually end.
-    last_actual = (await session.execute(text(
-        'SELECT max("Date") FROM forecast.acys_actuals '
-        f'WHERE "Operator" = :op AND "Date" IS NOT NULL {scope_sql}'),
-        {"op": operator, **sp})).scalar()
-    if last_actual is not None:
-        as_of = last_actual + timedelta(days=1)
-
-    # Keep the ACTUALS' Contract Year on the SAME anchor as the forecast. The actuals were stamped at
-    # assembly with the request as_of (panel), but the forecast is anchored to last_actual+1 (the clamp
-    # above); when FR24 is stale these differ, so the fact half and forecast half of the report would split
-    # into DIFFERENT contract years at the boundary (e.g. actuals on a Sep anchor, forecast on a Jul anchor).
-    # Re-stamp this scope's actuals CY with the effective anchor so both halves — and powerbi.z_dates_acys,
-    # which anchors on the first forecast date — agree. In a fresh run the anchors already coincide, so this
-    # is a no-op. Same day-precise rule as _insert_sql / _CONTRACT_YEAR: CY = year-1 iff (month,day) <= anchor.
+    # The forecast pivots on the REQUEST date `as_of` — that is the "today" of the export. Facts are
+    # everything BEFORE it (the panel fetches the flight history up to as_of-1 and assembles it with
+    # `first_seen < as_of`); the forecast runs from as_of forward to as_of + FORECAST_HORIZON_YEARS. We do
+    # NOT shift the anchor to the last available actual: the request date decides where the forecast starts,
+    # and any hole up to as_of-1 is closed by LOADING the missing facts from the flight source, never by
+    # moving the forecast start earlier. (If those facts are genuinely unavailable — e.g. as_of is a future
+    # date the flight source has not reached — a gap is the honest result, not something to paper over.)
+    #
+    # Keep the ACTUALS' Contract Year on the SAME anchor (as_of) as the forecast, so both halves of the
+    # report bucket into identical contract years and powerbi.z_dates_acys (anchored on the first forecast
+    # date = as_of) agrees. In a normal run the panel already assembled the scope's actuals with the as_of
+    # anchor, so this is a no-op; it also realigns any actuals left over from a prior request at a different
+    # as_of. Same day-precise rule as _insert_sql: CY = year-1 iff (month,day) <= (as_of.month, as_of.day).
     await session.execute(text(
         'UPDATE forecast.acys_actuals SET "Contract Year" = '
         '\'CY\' || (extract(year from "Date")::int - CASE WHEN '
