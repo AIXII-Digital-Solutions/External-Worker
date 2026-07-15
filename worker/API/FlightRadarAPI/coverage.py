@@ -3,8 +3,10 @@
 flightradar.flightsummary_coverage records, per registration, which [covered_from, covered_to] date
 ranges have already been fetched from FR24 (so whatever flights exist for them are in flightsummary).
 The forecast panel fetches only the request window MINUS this ledger (the missing ranges), then records
-each fetched range — even if it returned no flights — so it is never re-fetched. This bounds FR24 token
-spend to genuinely-new date ranges.
+each fetched range so it is never re-fetched. Coverage advances only to where flights ACTUALLY landed;
+an EMPTY range is finalized (recorded covered anyway, to bound token spend) ONLY once it is older than
+COVERAGE_REVALIDATE_DAYS — the recent tail stays re-fetchable so a lagging source or late flights are
+caught. This keeps the ledger from ever running ahead of the real data and blocking the catch-up fetch.
 
 Two phases, kept SEPARATE so the panel can show them as distinct steps:
   * plan_missing_ranges  — STEP 1 "searching": pure DB/planning, spends NO API budget. Seeds the ledger,
@@ -29,6 +31,13 @@ from API.FlightRadarAPI.FlightSummary import fetch_all_ranges
 logger = setup_logger("fr24_coverage")
 
 _TBL = "flightradar.flightsummary_coverage"
+
+# The trailing window (this many days back from today-1) is NEVER finalized as "covered" on an EMPTY fetch:
+# a source that lags the clock, or late-arriving flights, must be re-fetched until the data actually shows
+# up. Days OLDER than this that came back empty ARE finalized (they will never gain data), so token spend
+# stays bounded. Without this, one empty fetch of a recent range records it "covered" and permanently blocks
+# the catch-up (the bug: ledger claimed coverage to 14-Jul while flightsummary held data only to 30-Jun).
+COVERAGE_REVALIDATE_DAYS = 2
 
 
 class _BudgetReached(Exception):
@@ -214,9 +223,23 @@ async def fetch_planned_ranges(db_client, plan, total_requests: int, time_budget
         except Exception as e:
             logger.warning("FR24 fetch %s [%s..%s] failed: %s", grp_regs, gf, gt, e)
             continue  # leave un-recorded so it retries next run
+        # Advance the ledger only to where flights ACTUALLY landed — never past the real data. Days beyond
+        # the last real flight are finalized (recorded covered even though empty) ONLY once they are older
+        # than the revalidate window; the recent tail stays uncovered so it is re-fetched until data arrives.
+        # This stops an empty fetch from claiming coverage of recent/future-of-the-source days and silently
+        # blocking the trailing catch-up, while still bounding token spend on genuinely-empty old ranges.
+        finalize_to = date.today() - timedelta(days=1 + COVERAGE_REVALIDATE_DAYS)
         async with db_client.session("flightradar") as s:
             for reg in grp_regs:
-                await _record(s, reg, gf, gt)
+                actual_to = (await s.execute(text(
+                    "SELECT max(first_seen::date) FROM flightradar.flightsummary "
+                    "WHERE reg = :r AND first_seen::date BETWEEN :f AND :t"),
+                    {"r": reg, "f": gf, "t": gt})).scalar()
+                settled = min(gt, finalize_to)          # finalize (even if empty) no later than here
+                record_to = settled if actual_to is None else max(actual_to, settled)
+                record_to = min(record_to, gt)
+                if record_to >= gf:
+                    await _record(s, reg, gf, record_to)
             await s.commit()
         ranges_fetched += 1
         tail_days += ((gt - gf).days + 1) * len(grp_regs)
