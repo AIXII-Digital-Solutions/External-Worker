@@ -423,7 +423,7 @@ first_flight AS (   -- the tail's first observed flight DATE (else its delivery 
 span AS (
     SELECT l.*, coalesce(f.ff, l.deliv) life_start,
            date_trunc('month', coalesce(f.ff, l.deliv))::date start_m,
-           date_trunc('month', :as_of::date)::date end_m
+           date_trunc('month', CAST(:as_of AS date))::date end_m
     FROM live l LEFT JOIN first_flight f ON f.reg = l.reg
 ),
 cells AS (   -- (tail, month, Contract Year) presence cells over the span; the anchor month splits into two CYs
@@ -461,7 +461,7 @@ FROM cells2 c
 LEFT JOIN flown f ON f.reg = c.reg AND f.mon = c.mon AND f.cy = c.cy
 WHERE f.reg IS NULL
   AND c.cdate >= c.life_start::date          -- not before the tail's first flight / delivery
-  AND c.cdate <= :as_of::date                -- not after the request 'now'
+  AND c.cdate <= CAST(:as_of AS date)        -- not after the request 'now'
 """
 
 
