@@ -599,7 +599,7 @@ SELECT
     -- recorded delivery date (an order flying early in its delivery month; or Cirium carrying a delivery date
     -- LATER than the tail's real first operations), and a negative age is meaningless. NULL delivery -> NULL age
     -- (unknown, not 0): GREATEST ignores NULL, so guard it explicitly rather than collapse unknown to brand-new.
-    CASE WHEN p."Delivery Date" IS NULL THEN NULL
+    CASE WHEN p."Delivery Date" IS NULL OR p."Date" IS NULL THEN NULL
          ELSE round(GREATEST(p."Date" - p."Delivery Date", 0)::numeric / 365.25, 2) END,
     p."Data Type",
     o.country, o.city, o.airport_name,
