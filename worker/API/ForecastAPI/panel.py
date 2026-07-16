@@ -387,7 +387,7 @@ WITH latest_rev AS (
     SELECT DISTINCT ON (plan_type) id FROM cirium.aircraftrevision
     ORDER BY plan_type, to_date(period,'MM-YYYY') DESC, id DESC
 ),
-live AS (   -- authoritative LIVE tail (In Service / Storage), one row per registration
+cirium_live AS (   -- owned LIVE tail (In Service / Storage), one row per registration
     SELECT DISTINCT ON (ca."Registration")
            ca."Registration" reg, ca."Operator" op, ca."Master Series" ms, ca."Manufacturer" mf,
            ca."Aircraft Sub Series" ss, ca."Primary Usage" pu, ca."Indicative Market Value (US$m)" av,
@@ -400,6 +400,22 @@ live AS (   -- authoritative LIVE tail (In Service / Storage), one row per regis
           WHERE ca2."Registration" = ca."Registration" AND (ca2.revision_id, ca2.id) > (ca.revision_id, ca.id))
     ORDER BY ca."Registration", ca.revision_id DESC, ca.id DESC
 ),
+carry AS (   -- CARRY-FORWARD: tails that flew as :op in the LAST actual month but are NOT in the owned live
+             -- fleet (wet-lease / sister-airline / not-yet-In-Service). This is exactly the forecast's `sup`
+             -- set, so a tail the forecast carries forward does not first VANISH from the actuals and then
+             -- reappear in the forecast. Attributes come from the tail's most recent flight.
+    SELECT DISTINCT ON (aa."Registration")
+           aa."Registration" reg, aa."Operator" op, aa."Master Series" ms, aa."Manufacturer" mf,
+           aa."Aircraft Sub Series" ss, aa."Primary Usage" pu, aa."Agreed Value" av, aa."Total Seats" seats,
+           aa."Delivery Date" deliv, aa."Lease Type" lt, aa."Lease Dry Wet" ldw, aa."Operational Lessor" ol
+    FROM forecast.acys_actuals aa
+    WHERE aa."Date" IS NOT NULL {scope_sql}
+      AND date_trunc('month', aa."Date") = (SELECT date_trunc('month', max("Date"))
+          FROM forecast.acys_actuals WHERE "Date" IS NOT NULL {scope_sql})
+      AND aa."Registration" NOT IN (SELECT reg FROM cirium_live)
+    ORDER BY aa."Registration", aa."Date" DESC
+),
+live AS (SELECT * FROM cirium_live UNION ALL SELECT * FROM carry),
 first_flight AS (   -- the tail's first observed flight DATE (else its delivery date) bounds the span start
     SELECT "Registration" reg, min("Date") ff
     FROM forecast.acys_actuals WHERE "Date" IS NOT NULL {scope_sql} GROUP BY 1
@@ -583,7 +599,7 @@ SELECT
     -- recorded delivery date (an order flying early in its delivery month; or Cirium carrying a delivery date
     -- LATER than the tail's real first operations), and a negative age is meaningless. NULL delivery -> NULL age
     -- (unknown, not 0): GREATEST ignores NULL, so guard it explicitly rather than collapse unknown to brand-new.
-    CASE WHEN p."Delivery Date" IS NULL THEN NULL
+    CASE WHEN p."Delivery Date" IS NULL OR p."Date" IS NULL THEN NULL
          ELSE round(GREATEST(p."Date" - p."Delivery Date", 0)::numeric / 365.25, 2) END,
     p."Data Type",
     o.country, o.city, o.airport_name,
