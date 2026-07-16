@@ -371,24 +371,32 @@ fleet AS (
     UNION ALL
     SELECT * FROM sup
 ),
-routes AS (   -- route pool for this (month, sub-fleet), scoped by the tier chosen from pool richness (above)
+routes AS (   -- route pool for this (month, sub-fleet), scoped by the tier chosen from pool richness (above).
+              -- One row per template flight, so a route flown N times weighs N. Ordered PSEUDO-RANDOMLY
+              -- (md5(id)) NOT chronologically: gen samples the first N*k rows, so a chronological order would
+              -- take only the template month's first N*k flights (its opening days = a handful of routes), while
+              -- a hash order makes those N*k rows a REPRESENTATIVE, frequency-proportional sample of the pool.
     SELECT "IATA Origin" io, "IATA Destination" idd, "IATA Destination Actual" ida,
            "ICAO Origin" ico, "ICAO Destination" icd, "ICAO Destination Actual" ica,
            "Circle Distance" cd, "Flight Time" ft, "Actual Distance FR" adf, "Flight Time FR" ftf,
-           row_number() OVER (ORDER BY id) rn
+           row_number() OVER (ORDER BY md5(id::text)) rn
     FROM forecast.acys_actuals
     WHERE "Operator" = :op AND "Date" IS NOT NULL
       {route_where} {scope}
 ),
 nr AS (SELECT count(*)::int c FROM routes),
-gen AS (   -- every active aircraft × :k flights, cycling the route pool
-    SELECT f.reg, f.mseries, f.manuf, f.usage, f.av, f.seats, f.deliv, f.ltype, f.ldw, f.lessor,
+gen AS (   -- every active aircraft × :k flights. The route is picked by the GLOBAL flight index (0..N*k-1),
+           -- NOT by g alone: with `(g-1) % nr.c` EVERY aircraft flew the SAME first k pool rows, so the whole
+           -- fleet was pinned onto a handful of routes (one route could get N_aircraft x its early-pool count
+           -- -> hundreds of flights/month on ONE route). Cycling the GLOBAL index spreads the N*k flights across
+           -- the pool proportionally to each route's template frequency, and across aircraft.
+    SELECT fg.reg, fg.mseries, fg.manuf, fg.usage, fg.av, fg.seats, fg.deliv, fg.ltype, fg.ldw, fg.lessor,
            r.io, r.idd, r.ida, r.ico, r.icd, r.ica, r.cd, r.ft, r.adf, r.ftf,
-           (row_number() OVER () - 1) AS rn
-    FROM fleet f
-    CROSS JOIN generate_series(1, :k) g          -- :k flights per aircraft this month
+           fg.gi AS rn
+    FROM (SELECT f.*, (row_number() OVER () - 1) AS gi     -- global 0-based flight index over fleet x :k
+          FROM fleet f CROSS JOIN generate_series(1, :k) g) fg
     CROSS JOIN nr
-    JOIN routes r ON nr.c > 0 AND r.rn = ((g - 1) % nr.c) + 1   -- cycle the route pool
+    JOIN routes r ON nr.c > 0 AND r.rn = (fg.gi % nr.c) + 1
 ),
 s AS (   -- SPREAD the flights across the month's days (current month: from today) so the DAY-PRECISE
          -- Contract Year splits the anchor month exactly like the actuals (Jul→Jul window, not Aug→Jul)
