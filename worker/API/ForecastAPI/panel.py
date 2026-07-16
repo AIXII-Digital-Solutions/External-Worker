@@ -400,7 +400,7 @@ cirium_live AS (   -- owned LIVE tail (In Service / Storage), one row per regist
           WHERE ca2."Registration" = ca."Registration" AND (ca2.revision_id, ca2.id) > (ca.revision_id, ca.id))
     ORDER BY ca."Registration", ca.revision_id DESC, ca.id DESC
 ),
-carry AS (   -- CARRY-FORWARD: tails that flew as :op in the LAST actual month but are NOT in the owned live
+carry AS (   -- CARRY-FORWARD: tails that flew as the operator in the LAST actual month but are NOT in owned live
              -- fleet (wet-lease / sister-airline / not-yet-In-Service). This is exactly the forecast's `sup`
              -- set, so a tail the forecast carries forward does not first VANISH from the actuals and then
              -- reappear in the forecast. Attributes come from the tail's most recent flight.
