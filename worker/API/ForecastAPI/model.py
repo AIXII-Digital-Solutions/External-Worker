@@ -36,6 +36,13 @@ LEVEL_L = 3           # trailing months for the deseasonalized recent level (pre
 SEAS_K = 6.0          # seasonal-factor shrinkage toward 1.0 by month support
 FRONTIER_FRAC = 0.6   # a recent month is "complete" if its flights ≥ this × the trailing-window median
 FRONTIER_WINDOW = 9   # trailing months the frontier threshold is measured against
+# The last few months of the flight source are typically FR24-INCOMPLETE (ingestion lag) — their volume is
+# undercounted, so their DESEASONALIZED value sits below the true level. A plain median of the last LEVEL_L
+# months would inherit that undercount and drag the WHOLE forecast ~20-30% too low (flat + negative growth vs
+# the complete actuals). The robust level (see _robust_level) estimates the level from the recent COMPLETE
+# months only: months within LEVEL_COMPLETE_FRAC of a high-quantile reference of the window.
+LEVEL_WINDOW = 9          # recent months the level is estimated over
+LEVEL_COMPLETE_FRAC = 0.85  # a window month counts toward the level iff its deseasonalized volume ≥ this × ref
 # NOTE: there is deliberately NO idle-aircraft retirement and NO growth cap. The fleet comes straight from
 # Cirium's latest revision (delivery-dated), and per the product rule we never PREDICT that an aircraft
 # retires — an in-service tail keeps flying to the horizon (invariant: future aircraft never leave). A dead
@@ -85,8 +92,45 @@ def _days_in_month(first_of_month: date) -> int:
     return (_add_months(first_of_month, 1) - first_of_month).days
 
 
+def _quantile(xs, q):
+    """Simple index-based quantile (no interpolation) — robust for tiny samples, avoids statistics edge cases."""
+    s = sorted(xs)
+    if not s:
+        return 0.0
+    return s[min(len(s) - 1, int(q * len(s)))]
+
+
+def _robust_level_and_mask(des):
+    """Recent per-sub-fleet level (deseasonalized flights), robust to FR24-INCOMPLETE recent months, plus the
+    boolean mask marking WHICH series months were counted as COMPLETE. Incomplete months are undercounted, so
+    their deseasonalized value sits BELOW the true level; a plain median of the last LEVEL_L would inherit the
+    undercount. Instead: over the recent LEVEL_WINDOW, take a HIGH quantile as the complete-month reference
+    (complete months dominate the top), keep the window months within LEVEL_COMPLETE_FRAC of it, and take the
+    MEDIAN of those. The mask lets the caller draw the fleet `base` from the SAME complete months, so the
+    per-aircraft rate (level/base) is not diluted by fleet GROWTH between the complete period and the frontier
+    (a growing sub-fleet has fewer tails in the complete window than at the frontier). With <3 months of
+    history there is nothing to filter — fall back to the plain last-LEVEL_L median/months."""
+    n = len(des)
+    mask = [False] * n
+    lo = max(0, n - LEVEL_WINDOW)
+    recent_idx = list(range(lo, n))
+    if len(recent_idx) < 3:
+        for i in recent_idx[-LEVEL_L:]:
+            mask[i] = True
+        return st.median(des[-LEVEL_L:]), mask
+    ref = _quantile([des[i] for i in recent_idx], 0.75)
+    complete_idx = [i for i in recent_idx if des[i] >= LEVEL_COMPLETE_FRAC * ref]
+    if not complete_idx:
+        for i in recent_idx[-LEVEL_L:]:
+            mask[i] = True
+        return st.median(des[-LEVEL_L:]), mask
+    for i in complete_idx:
+        mask[i] = True
+    return st.median([des[i] for i in complete_idx]), mask
+
+
 def _fit(series):
-    """series = sorted [(cal_month, flights)] (≤ frontier) → (level, seasonal[1..12])."""
+    """series = sorted [(cal_month, flights)] (≤ frontier) → (level, seasonal[1..12], complete_mask)."""
     by_cal = defaultdict(list)
     for c, f in series:
         by_cal[c].append(f)
@@ -100,7 +144,8 @@ def _fit(series):
         else:
             seas[c] = 1.0
     des = [f / seas[c] for c, f in series]
-    return st.median(des[-LEVEL_L:]), seas
+    level, mask = _robust_level_and_mask(des)
+    return level, seas, mask
 
 
 def _horizon_month(as_of: date) -> date:
@@ -150,8 +195,12 @@ def _plan(rows, fc_start: date, as_of: date):
         s_tr = [(mn, fl, tl) for mn, fl, tl in s if mn <= frontier and fl]
         if not s_tr:
             continue
-        level, seas = _fit([(mn.month, fl) for mn, fl, _ in s_tr])
-        base = st.median([tl for _, _, tl in s_tr[-LEVEL_L:]]) or 1   # typical flown-tail count for the sub-fleet
+        level, seas, mask = _fit([(mn.month, fl) for mn, fl, _ in s_tr])
+        # base = typical flown-tail count, taken from the SAME complete months the level came from (mask), so
+        # the per-aircraft rate (level/base) is not diluted by fleet growth between the complete window and the
+        # frontier — a growing sub-fleet (all the neo deliveries) had fewer tails when complete than at June.
+        ct = [tl for (_, _, tl), keep in zip(s_tr, mask) if keep]
+        base = (st.median(ct) if ct else st.median([tl for _, _, tl in s_tr[-LEVEL_L:]])) or 1
         fits[sf] = (level, seas, base)
         sf_hist[sf] = [(mn, fl) for mn, fl, _ in s_tr]
 
