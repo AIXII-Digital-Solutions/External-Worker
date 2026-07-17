@@ -13,7 +13,7 @@ Per sub-fleet (Master Series), from acys_actuals FLIGHTS (Date NOT NULL):
 Forward fleet from the STUB rows (Date NULL, Delivery Date > frontier): per sub-fleet, aircraft arriving by
 month m. Forecast month m: flights_hat_sf(m) = level_sf × seasonal_sf[cal(m)] × growth_sf(m), where
 growth_sf(m) = (base_fleet_sf + delivered_by_m_sf) / base_fleet_sf (capped) — the monthly VOLUME. The per-flight
-STRUCTURE (routes) comes from a YEAR-ROBUST route pool for cal(m) (see _robust_routes_cte): each route weighted
+STRUCTURE (routes) comes from a YEAR-ROBUST route pool for cal(m) (see _pool_tier1_sql): each route weighted
 by the median of its per-year counts in that calendar month, one-off single-year bursts dropped, so a spike
 that occurred in only one occurrence of a month is NOT replayed into every forecast year. Window: history
 HISTORY_START → coverage frontier; forecast frontier+1 → as_of + FORECAST_HORIZON_YEARS. Signed v1 limits: no
@@ -345,130 +345,223 @@ _DELIVERED = f"""CASE WHEN {_ORDER}
                  ELSE (ca."Delivery Date" IS NULL OR ca."Delivery Date" <= :m_end) END"""
 
 
-# ── Route pool (structure) ───────────────────────────────────────────────────────────────────────────────
+# ── Route pool + fleet PRECOMPUTE (the forecast step's performance backbone) ───────────────────────────
+# The model INSERTs once per (forecast month x sub-fleet) — 185 statements for a 27-month Air Arabia run.
+# Building the route pool and the Cirium fleet INSIDE that statement re-scanned forecast.acys_actuals (301k
+# operator rows) THREE times and cirium.ciriumaircrafts several more times PER STATEMENT: measured 5.3 s each,
+# 974 s total = 94% of the whole request (the `forecast_step_timings` ledger shows the step going 120 s -> 1097 s
+# when the tier cascade + the year-robust pool were added). Both are loop-INVARIANT: the pool depends only on
+# (sub-fleet, calendar month) and the fleet only on the sub-fleet — the delivery cutoff :m_end is a cheap
+# per-month filter over ~180 fleet rows. So both are materialised ONCE into TEMP tables and each per-month
+# INSERT becomes a small indexed read of them. Identical output, ~2 orders of magnitude less work.
+#
 # The pool is a BAG of route rows sampled proportionally by `gen`; a route's WEIGHT (row count) sets its share
 # of the forecast month. Tier 1 makes that weight ROBUST ACROSS YEARS so a ONE-OFF burst (a geopolitical /
 # wet-lease / incomplete-month spike that appears in only one occurrence of a calendar month) is NOT replayed
-# into every forecast year, while a RECURRING seasonal pattern (present every year) is kept — exactly the
-# product rule "repeat it only if it recurs".
-def _robust_routes_cte(scope: str) -> str:
-    """Tier-1 route pool: the sub-fleet's TYPICAL network for calendar month :cal_month, robust to one-off
-    spikes WITHOUT killing genuinely new-but-sustained routes. TWO robustness rules combine:
-      (A) SPAN GATE — a route must have operated across ≥2 calendar years globally (any month). A route confined
-          to a SINGLE calendar year is a one-off burst (the intra-Pakistan KHI-ISB routes, only Apr-Jul 2026)
-          and is dropped outright; a route spanning ≥2 years is established and passes.
-      (B) MEDIAN with gap-zeros — for a passing route, weight = MEDIAN of its per-YEAR flight counts in this
-          calendar month, padding a 0 for every candidate year FROM its first appearance onward that it was NOT
-          flown (years before it existed are excluded, so a new sustained route is not penalised for pre-existence
-          zeros). So a spike year is out-voted by the normal years, while a discontinued route decays to 0.
-    Together:
-      * a route flown every year, one year spiking (Pakistan Jun 250/255/255/600) -> passes (A), median 255;
-      * a single-year one-off burst (KHI-ISB, 2026 only)                          -> fails (A), dropped;
-      * an old route flown a few years then discontinued                          -> passes (A), median -> 0;
-      * a NEW route sustained since it appeared (Morocco, 2025->2026)              -> passes (A), median ~level.
-    Each surviving route is expanded into round(typical) bag rows (pseudo-random order) so `gen` samples it in
-    proportion to its typical frequency — same bag mechanics, only the WEIGHTS are now robust and no single
-    (possibly incomplete or anomalous) template month drives the structure."""
-    return f"""routes AS (
-    WITH occ AS (   -- per distinct route × YEAR: flights this sub-fleet flew it in calendar month :cal_month
-        SELECT "IATA Origin" io, "IATA Destination" idd, "IATA Destination Actual" ida,
-               "ICAO Origin" ico, "ICAO Destination" icd, "ICAO Destination Actual" ica,
-               extract(year from "Date")::int yr, count(*) c
-        FROM forecast.acys_actuals
-        WHERE "Operator" = :op AND "Date" IS NOT NULL AND {_KEY_SF} = :sf
-          AND extract(month from "Date")::int = :cal_month {scope}
-        GROUP BY 1, 2, 3, 4, 5, 6, 7
-    ),
-    span AS (   -- per route: GLOBAL year span across ALL months (single-year-burst gate). A route confined to
-                -- ONE calendar year (the intra-Pakistan KHI-ISB burst — only Apr-Jul 2026, absent 2023-2025) is
-                -- a one-off and is EXCLUDED; a route operated across ≥2 calendar years is established (recurring,
-                -- or a sustained NEW network like Morocco 2025->2026) and is kept.
-        SELECT "IATA Origin" io, "IATA Destination" idd, "IATA Destination Actual" ida,
-               "ICAO Origin" ico, "ICAO Destination" icd, "ICAO Destination Actual" ica,
-               min(extract(year from "Date")::int) gy0, max(extract(year from "Date")::int) gy1
-        FROM forecast.acys_actuals
-        WHERE "Operator" = :op AND "Date" IS NOT NULL AND {_KEY_SF} = :sf {scope}
-        GROUP BY 1, 2, 3, 4, 5, 6
-    ),
-    rte AS (   -- per route: FIRST-seen year (so gaps are only padded AFTER it appears) + representative metrics
-        SELECT "IATA Origin" io, "IATA Destination" idd, "IATA Destination Actual" ida,
-               "ICAO Origin" ico, "ICAO Destination" icd, "ICAO Destination Actual" ica,
-               min(extract(year from "Date")::int) first_yr,
-               percentile_cont(0.5) WITHIN GROUP (ORDER BY "Circle Distance")    cd,
-               percentile_cont(0.5) WITHIN GROUP (ORDER BY "Flight Time")        ft,
-               percentile_cont(0.5) WITHIN GROUP (ORDER BY "Actual Distance FR") adf,
-               percentile_cont(0.5) WITHIN GROUP (ORDER BY "Flight Time FR")     ftf
-        FROM forecast.acys_actuals
-        WHERE "Operator" = :op AND "Date" IS NOT NULL AND {_KEY_SF} = :sf
-          AND extract(month from "Date")::int = :cal_month {scope}
-        GROUP BY 1, 2, 3, 4, 5, 6
-    ),
-    cy AS (SELECT DISTINCT yr FROM occ),   -- the candidate years (this sub-fleet's occurrences of the cal month)
-    grid AS (   -- route × candidate years FROM its first-seen year onward: a GAP year -> 0 (dilutes a one-off),
-                -- years BEFORE the route existed excluded (a NEW sustained route keeps its level, not diluted).
-                -- The span JOIN drops routes confined to a single calendar year (one-off bursts) entirely.
-        SELECT r.io, r.idd, r.ida, r.ico, r.icd, r.ica, cy.yr, coalesce(o.c, 0) c
-        FROM rte r
-        JOIN span sp ON sp.io  IS NOT DISTINCT FROM r.io  AND sp.idd IS NOT DISTINCT FROM r.idd
-                    AND sp.ida IS NOT DISTINCT FROM r.ida AND sp.ico IS NOT DISTINCT FROM r.ico
-                    AND sp.icd IS NOT DISTINCT FROM r.icd AND sp.ica IS NOT DISTINCT FROM r.ica
-                    AND sp.gy1 > sp.gy0
-        CROSS JOIN cy
-        LEFT JOIN occ o
-          ON o.io  IS NOT DISTINCT FROM r.io  AND o.idd IS NOT DISTINCT FROM r.idd
-         AND o.ida IS NOT DISTINCT FROM r.ida AND o.ico IS NOT DISTINCT FROM r.ico
-         AND o.icd IS NOT DISTINCT FROM r.icd AND o.ica IS NOT DISTINCT FROM r.ica
-         AND o.yr = cy.yr
-        WHERE cy.yr >= r.first_yr
-    ),
-    typ AS (   -- robust typical count per route = median of the (gap-padded) per-year counts since first seen
-        SELECT io, idd, ida, ico, icd, ica,
-               percentile_cont(0.5) WITHIN GROUP (ORDER BY c) tc
-        FROM grid GROUP BY 1, 2, 3, 4, 5, 6
-    )
-    SELECT t.io, t.idd, t.ida, t.ico, t.icd, t.ica, r.cd, r.ft, r.adf, r.ftf,
-           row_number() OVER (ORDER BY md5(coalesce(t.io,'') || '>' || coalesce(t.idd,'') || '#' || gs::text)) rn
-    FROM typ t
-    JOIN rte r ON r.io  IS NOT DISTINCT FROM t.io  AND r.idd IS NOT DISTINCT FROM t.idd
-              AND r.ida IS NOT DISTINCT FROM t.ida AND r.ico IS NOT DISTINCT FROM t.ico
-              AND r.icd IS NOT DISTINCT FROM t.icd AND r.ica IS NOT DISTINCT FROM t.ica
-    CROSS JOIN LATERAL generate_series(1, round(t.tc)::int) gs
-)"""
+# into every forecast year, while a RECURRING seasonal pattern is kept — the product rule "repeat it only if
+# it recurs".
+
+# One row per pool member. (tier, k, cm) identifies the pool; `rn` is 1..N WITHIN that pool, which is what
+# `gen` cycles through with (global_flight_index % pool_size) + 1.
+#   tier 1 -> k = sub-series, cm = calendar month   (the year-robust seasonal pool)
+#   tier 2 -> k = sub-series, cm = 0                (raw all-history: robust pool degenerate)
+#   tier 3 -> k = master series, cm = 0             (raw all-history: sub-series sparse everywhere)
+_POOL_DDL = """
+DROP TABLE IF EXISTS fc_pool_tmp;
+CREATE TEMP TABLE fc_pool_tmp (
+    tier smallint NOT NULL,
+    k    text     NOT NULL,
+    cm   smallint NOT NULL,
+    io text, idd text, ida text, ico text, icd text, ica text,
+    cd double precision, ft double precision, adf double precision, ftf double precision,
+    rn integer NOT NULL
+);
+"""
+
+_POOL_INDEX = "CREATE INDEX ON fc_pool_tmp (tier, k, cm, rn)"
+
+_FLEET_DDL = """
+DROP TABLE IF EXISTS fc_fleet_tmp;
+CREATE TEMP TABLE fc_fleet_tmp (
+    sf text NOT NULL, reg text, mseries text, manuf text, usage text,
+    av double precision, seats double precision, deliv date,
+    ltype text, ldw text, lessor text,
+    is_order boolean NOT NULL, is_sup boolean NOT NULL
+);
+"""
+
+_FLEET_INDEX = "CREATE INDEX ON fc_fleet_tmp (sf)"
+
+# The six route-identity columns, and the NOT-DISTINCT-FROM join on them (NULLs must match NULLs).
+_RCOLS = ("io", "idd", "ida", "ico", "icd", "ica")
 
 
-def _raw_routes_cte(where: str, scope: str) -> str:
-    """Tier-2/3 fallback pool: the raw all-history bag (one row per flight, pseudo-random order). Used only when
-    the robust seasonal pool is degenerate (a thin / brand-new sub-fleet) where there is too little history to
-    tell a one-off from a recurring route anyway, so the broad all-history network is the safest structure."""
-    return f"""routes AS (
-    SELECT "IATA Origin" io, "IATA Destination" idd, "IATA Destination Actual" ida,
-           "ICAO Origin" ico, "ICAO Destination" icd, "ICAO Destination Actual" ica,
-           "Circle Distance" cd, "Flight Time" ft, "Actual Distance FR" adf, "Flight Time FR" ftf,
-           row_number() OVER (ORDER BY md5(id::text)) rn
-    FROM forecast.acys_actuals
-    WHERE "Operator" = :op AND "Date" IS NOT NULL {where} {scope}
-)"""
+def _rjoin(a: str, b: str) -> str:
+    return " AND ".join(f"{a}.{c} IS NOT DISTINCT FROM {b}.{c}" for c in _RCOLS)
 
 
-def _insert_sql(scope: str, tier: int) -> str:
-    """One (forecast month, sub-fleet) INSERT into acys_forecast. EVERY active Cirium-fleet aircraft of the
-    sub-fleet (latest revision, delivered ≤ :m_end — nothing retires; future deliveries appear once due)
-    flies :k flights, each taking a route from the route pool. Aircraft attributes (value / seats / lease /
-    delivery) come from Cirium; the merge step later projects the Agreed Value.
-
-    The FLEET is always the target sub-series (:sf). The ROUTE POOL is chosen by `tier` (decided in
-    run_forecast_model from how many DISTINCT routes each source has, so a degenerate pool cannot pin an
-    aircraft's whole month onto one long-haul route — 36x Toulouse-Sharjah = 226 h/mo):
-      tier 1 — :sf, calendar month :cal_month, YEAR-ROBUST (median across years, one-off spikes dropped)
-      tier 2 — :sf across ALL history               (robust seasonal pool too sparse: < _MIN_ROUTE_POOL routes)
-      tier 3 — :ms_key (master series) ALL history  (the sub-series itself is too sparse everywhere)
+def _pool_tier1_sql(scope: str) -> str:
+    """Build the TIER-1 pool for EVERY (sub-series, calendar month) in ONE pass (this used to be re-derived per
+    forecast month, 185x). Semantics are unchanged from the per-execute version — TWO robustness rules:
+      (A) SPAN GATE — a route must have operated across >= 2 calendar years globally (any month). A route
+          confined to a SINGLE calendar year is a one-off burst (the intra-Pakistan KHI-ISB routes, only
+          Apr-Jul 2026) and is dropped outright; a route spanning >= 2 years is established and passes.
+      (B) MEDIAN with gap-zeros — for a passing route, weight = MEDIAN of its per-YEAR flight counts in that
+          calendar month, padding a 0 for every candidate year FROM its first appearance onward that it was
+          NOT flown (years before it existed are excluded, so a new sustained route is not penalised for
+          pre-existence zeros). A spike year is out-voted by the normal years; a discontinued route decays to 0.
+    Each surviving route is expanded into round(typical) bag rows in pseudo-random (md5) order, so `gen` samples
+    it in proportion to its typical frequency. `rn` is numbered WITHIN each (sub-series, calendar month) pool,
+    exactly as the old per-execute `row_number() OVER (ORDER BY md5(...))` did.
     """
-    if tier == 1:
-        routes_cte = _robust_routes_cte(scope)
-    elif tier == 2:
-        routes_cte = _raw_routes_cte(f'AND {_KEY_SF} = :sf', scope)
-    else:
-        routes_cte = _raw_routes_cte(f'AND {_KEY_MS} = :ms_key', scope)
+    return f"""
+INSERT INTO fc_pool_tmp (tier, k, cm, io, idd, ida, ico, icd, ica, cd, ft, adf, ftf, rn)
+WITH base AS (
+    SELECT {_KEY_SF} sf,
+           extract(month from "Date")::int cm, extract(year from "Date")::int yr,
+           "IATA Origin" io, "IATA Destination" idd, "IATA Destination Actual" ida,
+           "ICAO Origin" ico, "ICAO Destination" icd, "ICAO Destination Actual" ica,
+           "Circle Distance" cd, "Flight Time" ft, "Actual Distance FR" adf, "Flight Time FR" ftf
+    FROM forecast.acys_actuals
+    WHERE "Operator" = :op AND "Date" IS NOT NULL {scope}
+),
+occ AS (   -- per (sub-series, calendar month, route, YEAR): how many flights
+    SELECT sf, cm, io, idd, ida, ico, icd, ica, yr, count(*) c
+    FROM base GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
+),
+span AS (  -- per (sub-series, route): GLOBAL year span across ALL months — the single-year-burst gate
+    SELECT sf, io, idd, ida, ico, icd, ica, min(yr) gy0, max(yr) gy1
+    FROM base GROUP BY 1, 2, 3, 4, 5, 6, 7
+),
+rte AS (   -- per (sub-series, calendar month, route): first-seen year + representative (median) metrics
+    SELECT sf, cm, io, idd, ida, ico, icd, ica, min(yr) first_yr,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY cd)  cd,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY ft)  ft,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY adf) adf,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY ftf) ftf
+    FROM base GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+),
+cy AS (    -- the candidate years per (sub-series, calendar month)
+    SELECT sf, cm, array_agg(DISTINCT yr) yrs FROM base GROUP BY 1, 2
+),
+grid AS (  -- route x candidate years FROM its first-seen year onward; a GAP year -> 0 (dilutes a one-off)
+    SELECT r.sf, r.cm, r.io, r.idd, r.ida, r.ico, r.icd, r.ica, y.yr, coalesce(o.c, 0) c
+    FROM rte r
+    JOIN span sp ON sp.sf = r.sf AND {_rjoin('sp', 'r')} AND sp.gy1 > sp.gy0
+    JOIN cy ON cy.sf = r.sf AND cy.cm = r.cm
+    CROSS JOIN LATERAL unnest(cy.yrs) AS y(yr)
+    LEFT JOIN occ o ON o.sf = r.sf AND o.cm = r.cm AND o.yr = y.yr AND {_rjoin('o', 'r')}
+    WHERE y.yr >= r.first_yr
+),
+typ AS (   -- robust typical count per route = median of the (gap-padded) per-year counts since first seen
+    SELECT sf, cm, io, idd, ida, ico, icd, ica,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY c) tc
+    FROM grid GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+)
+SELECT 1, t.sf, t.cm, t.io, t.idd, t.ida, t.ico, t.icd, t.ica, r.cd, r.ft, r.adf, r.ftf,
+       row_number() OVER (PARTITION BY t.sf, t.cm
+                          ORDER BY md5(coalesce(t.io,'') || '>' || coalesce(t.idd,'') || '#' || gs::text))
+FROM typ t
+JOIN rte r ON r.sf = t.sf AND r.cm = t.cm AND {_rjoin('r', 't')}
+CROSS JOIN LATERAL generate_series(1, round(t.tc)::int) gs
+"""
+
+
+def _pool_raw_sql(scope: str, tier: int) -> str:
+    """Build the TIER-2 (sub-series) / TIER-3 (master series) fallback pools: the raw all-history bag, one row
+    per flight, pseudo-random (md5) order, `rn` numbered within each key's pool. Used only where the robust
+    seasonal pool is degenerate (a thin / brand-new sub-fleet) — there is too little history to tell a one-off
+    from a recurring route anyway, so the broad all-history network is the safest structure. Only the keys the
+    run actually needs are built (:keys), so a fat all-history bag is never materialised for nothing."""
+    key = _KEY_SF if tier == 2 else _KEY_MS
+    return f"""
+INSERT INTO fc_pool_tmp (tier, k, cm, io, idd, ida, ico, icd, ica, cd, ft, adf, ftf, rn)
+SELECT {tier}, {key}, 0,
+       "IATA Origin", "IATA Destination", "IATA Destination Actual",
+       "ICAO Origin", "ICAO Destination", "ICAO Destination Actual",
+       "Circle Distance", "Flight Time", "Actual Distance FR", "Flight Time FR",
+       row_number() OVER (PARTITION BY {key} ORDER BY md5(id::text))
+FROM forecast.acys_actuals
+WHERE "Operator" = :op AND "Date" IS NOT NULL AND {key} = ANY(:keys) {scope}
+"""
+
+
+def _fleet_build_sql(scope: str) -> str:
+    """Materialise the operator's WHOLE forecast fleet once (all sub-series, no month cutoff). Previously this
+    ran inside every per-month INSERT, re-scanning Cirium with correlated NOT EXISTS anti-joins 185 times.
+
+    Dedup keys are (sub-series, identity) — NOT identity alone — which reproduces EXACTLY what the old
+    per-execute `WHERE ... = :sf` + `DISTINCT ON (identity)` did: the winner was chosen within one sub-series'
+    subset. The `_DELIVERED` (:m_end) test is NOT applied here; instead `is_order` is stored and the cheap
+    per-month filter is applied at read time (see _insert_sql), because that is the only month-dependent part.
+    `is_sup` marks the carry-forward tails, which the old `sup` CTE fed into `fleet` with NO delivery test at
+    all — the flag preserves that exactly.
+    """
+    return f"""
+INSERT INTO fc_fleet_tmp (sf, reg, mseries, manuf, usage, av, seats, deliv, ltype, ldw, lessor,
+                          is_order, is_sup)
+WITH latest AS ({_LATEST_CTE}),
+owned_regs AS (   -- every registration in the operator's OWN Cirium fleet (any sub-series) — never supplemented
+    SELECT ca."Registration" reg FROM cirium.ciriumaircrafts ca
+    WHERE ca."Operator" = :op AND ca.revision_id IN (SELECT mr FROM latest)
+      AND {_ALLOWED} AND {_NOT_DEAD}
+),
+cirium_fleet AS (   -- one row per (sub-series, airframe); the delivery cutoff is applied per month at read time
+    SELECT DISTINCT ON (coalesce(nullif(ca."Aircraft Sub Series",''),'NA'), {_IDENT})
+           coalesce(nullif(ca."Aircraft Sub Series",''),'NA') AS sf,
+           {_REG_OUT} AS reg,
+           ca."Master Series" mseries, ca."Manufacturer" manuf,
+           ca."Primary Usage" usage, ca."Indicative Market Value (US$m)" av, ca."Number of Seats" seats,
+           ca."Delivery Date" deliv, ca."Lease Type" ltype, ca."Lease Dry / Wet" ldw,
+           ca."Operational Lessor" lessor,
+           ({_ORDER}) AS is_order, false AS is_sup
+    FROM cirium.ciriumaircrafts ca
+    WHERE ca."Operator" = :op AND ca.revision_id IN (SELECT mr FROM latest)
+      AND {_ALLOWED}
+      AND {_NOT_DEAD}
+      AND {_HAS_KEY} {scope}
+    -- The tie-break is NOT cosmetic: Cirium carries SEVERAL rows for one airframe inside the SAME revision
+    -- (A6-ARF twice with two Delivery Dates; A6-ARI as both a delivered aircraft and a leftover order).
+    -- Delivered beats order, then newest id — one aircraft, one identity, whole horizon.
+    ORDER BY coalesce(nullif(ca."Aircraft Sub Series",''),'NA'), {_IDENT}, {_PREFER_DELIVERED}, ca.id DESC
+),
+sup AS (   -- carry-forward: tails that OPERATED for the operator in the last actual month but are NOT in the
+           -- owned Cirium fleet (sister-airline / wet-lease airframes flying under this brand). Without this
+           -- they vanish at the actuals->forecast seam even though they were just flying. Identity is the real
+           -- registration; attributes come from the tail's most recent actual flight; they are already
+           -- delivered (they just flew), so they fly EVERY forecast month (is_sup bypasses the cutoff). Wet
+           -- leases keep ldw='Wet', so the INSERT still zeroes their Agreed Value — only activity is projected.
+           -- This set MUST match run_forecast_model's fleet_deliv supplement exactly, or Active Fleet vs rows
+           -- disagree.
+    SELECT DISTINCT ON (coalesce(nullif(aa."Aircraft Sub Series",''),'NA'), aa."Registration")
+           coalesce(nullif(aa."Aircraft Sub Series",''),'NA') AS sf,
+           aa."Registration" AS reg,
+           aa."Master Series" mseries, aa."Manufacturer" manuf,
+           aa."Primary Usage" usage, aa."Agreed Value" av, aa."Total Seats" seats,
+           aa."Delivery Date" deliv, aa."Lease Type" ltype, aa."Lease Dry Wet" ldw,
+           aa."Operational Lessor" lessor,
+           false AS is_order, true AS is_sup
+    FROM forecast.acys_actuals aa
+    WHERE aa."Operator" = :op AND aa."Date" IS NOT NULL AND aa."Date" >= :sup_since
+      AND aa."Registration" NOT IN (SELECT reg FROM owned_regs) {scope}
+    ORDER BY coalesce(nullif(aa."Aircraft Sub Series",''),'NA'), aa."Registration", aa."Date" DESC
+)
+SELECT * FROM cirium_fleet
+UNION ALL
+SELECT * FROM sup
+"""
+
+
+def _insert_sql() -> str:
+    """One (forecast month, sub-fleet) INSERT into acys_forecast. EVERY active fleet aircraft of the sub-fleet
+    flies :k flights, each taking a route from the route pool. Both the fleet and the pool were materialised
+    ONCE (see _fleet_build_sql / _pool_tier1_sql / _pool_raw_sql), so this statement now only does the
+    month-specific work: pick the delivered aircraft, cycle the pool, spread the flights over the month's days.
+
+    The delivery cutoff (`:m_end`) is the only month-dependent fleet rule — nothing retires, future deliveries
+    appear once due. `is_sup` tails (carry-forward) bypass it, exactly as the old `sup` CTE did. The pool is
+    addressed by (:tier, :pool_key, :pool_cm), the tier having been decided in run_forecast_model.
+    """
     return f"""
 INSERT INTO forecast.acys_forecast
     ("Registration","Period","Date","Time Departed","Time Landed",
@@ -478,58 +571,17 @@ INSERT INTO forecast.acys_forecast
      "Contract Year","Circle Distance","Flight Time",
      "Agreed Value","Total Seats","Total PAX","Actual Distance FR","Flight Time FR",
      "Delivery Date","Lease Type","Lease Dry Wet","Operational Lessor")
-WITH latest AS ({_LATEST_CTE}),
-owned_regs AS (   -- every registration in the operator's OWN Cirium fleet (any sub-series) — never supplemented
-    SELECT ca."Registration" reg FROM cirium.ciriumaircrafts ca
-    WHERE ca."Operator" = :op AND ca.revision_id IN (SELECT mr FROM latest)
-      AND {_ALLOWED} AND {_NOT_DEAD}
+WITH fleet AS (   -- the sub-fleet's aircraft that are in the fleet at :m_end (an ORDER joins ON its delivery
+                  -- month; an in-service tail with no delivery date is already flying; carry-forward always in)
+    SELECT reg, mseries, manuf, usage, av, seats, deliv, ltype, ldw, lessor
+    FROM fc_fleet_tmp
+    WHERE sf = :sf
+      AND (is_sup
+           OR CASE WHEN is_order THEN deliv <= :m_end
+                   ELSE (deliv IS NULL OR deliv <= :m_end) END)
 ),
-cirium_fleet AS (   -- active aircraft of this sub-fleet at :m_end (delivered by then; future deliveries included)
-    SELECT DISTINCT ON ({_IDENT})
-           {_REG_OUT} AS reg,
-           ca."Master Series" mseries, ca."Manufacturer" manuf,
-           ca."Primary Usage" usage, ca."Indicative Market Value (US$m)" av, ca."Number of Seats" seats,
-           ca."Delivery Date" deliv, ca."Lease Type" ltype, ca."Lease Dry / Wet" ldw,
-           ca."Operational Lessor" lessor
-    FROM cirium.ciriumaircrafts ca
-    WHERE ca."Operator" = :op AND ca.revision_id IN (SELECT mr FROM latest)
-      AND coalesce(nullif(ca."Aircraft Sub Series",''),'NA') = :sf
-      AND {_ALLOWED}
-      AND {_NOT_DEAD}
-      AND {_HAS_KEY}
-      AND {_DELIVERED} {scope}
-    -- The tie-break is NOT cosmetic: Cirium carries SEVERAL rows for one airframe inside the SAME revision
-    -- (A6-ARF twice with two Delivery Dates; A6-ARI as both a delivered aircraft and a leftover order).
-    -- With no tie-break the DISTINCT ON pick is arbitrary, and since this query re-runs PER forecast month
-    -- the same aircraft could resolve to a different row (different Delivery Date / value / seats) from
-    -- month to month. Delivered beats order, then newest id — one aircraft, one identity, whole horizon.
-    ORDER BY {_IDENT}, {_PREFER_DELIVERED}, ca.id DESC
-),
-sup AS (   -- carry-forward: tails that OPERATED for :op in the last actual month but are NOT in the owned
-           -- Cirium fleet (sister-airline / wet-lease airframes flying under this brand). Without this they
-           -- vanish at the actuals->forecast seam even though they were just flying. Identity is the real
-           -- registration; attributes come from the tail's most recent actual flight; they are already
-           -- delivered (they just flew), so they fly EVERY forecast month. Wet leases keep ldw='Wet', so the
-           -- INSERT still zeroes their Agreed Value — only their flight activity is projected. This set MUST
-           -- match run_forecast_model's fleet_deliv supplement exactly, or Active Fleet vs rows disagree.
-    SELECT DISTINCT ON (aa."Registration")
-           aa."Registration" AS reg,
-           aa."Master Series" mseries, aa."Manufacturer" manuf,
-           aa."Primary Usage" usage, aa."Agreed Value" av, aa."Total Seats" seats,
-           aa."Delivery Date" deliv, aa."Lease Type" ltype, aa."Lease Dry Wet" ldw,
-           aa."Operational Lessor" lessor
-    FROM forecast.acys_actuals aa
-    WHERE aa."Operator" = :op AND aa."Date" IS NOT NULL AND aa."Date" >= :sup_since
-      AND coalesce(nullif(aa."Aircraft Sub Series",''),'NA') = :sf
-      AND aa."Registration" NOT IN (SELECT reg FROM owned_regs) {scope}
-    ORDER BY aa."Registration", aa."Date" DESC
-),
-fleet AS (
-    SELECT * FROM cirium_fleet
-    UNION ALL
-    SELECT * FROM sup
-),
-{routes_cte},
+routes AS (SELECT io, idd, ida, ico, icd, ica, cd, ft, adf, ftf, rn
+           FROM fc_pool_tmp WHERE tier = :tier AND k = :pool_key AND cm = :pool_cm),
 nr AS (SELECT count(*)::int c FROM routes),
 gen AS (   -- every active aircraft × :k flights. The route is picked by the GLOBAL flight index (0..N*k-1),
            -- NOT by g alone: with `(g-1) % nr.c` EVERY aircraft flew the SAME first k pool rows, so the whole
@@ -675,51 +727,27 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         fleet_deliv[r[0]].append(r[2])
         sf_master.setdefault(r[0], r[1])
 
-    # Route-pool richness, to pick the route-pool tier per (month, sub-fleet) in the loop (see _insert_sql):
-    #  * sf_robust_routes[(sf, cal_month)] = how many routes SURVIVE the year-robust tier-1 filter, mirroring the
-    #    pool exactly: a route counts iff (a) it spans ≥2 calendar years globally (gy1 > gy0 — so a single-year
-    #    one-off burst is excluded) AND (b) it is flown in ≥ HALF the candidate years SINCE it first appeared in
-    #    that calendar month (present_yrs*2 >= candidate years >= its first-seen year — so a sporadic/discontinued
-    #    route drops out while a new-but-sustained route survives). So the tier decision and the tier-1 pool agree
-    #    and tier 1 is never chosen with an empty pool.
-    #  * sf_all_routes[sf] = distinct routes across ALL history (tier 2 fallback).
-    # Below _MIN_ROUTE_POOL the pool is degenerate and we broaden it (tier 2, then master all-history tier 3).
+    # ── PRECOMPUTE (see the _POOL_DDL / _fleet_build_sql block above) ──────────────────────────────────
+    # The route pool and the fleet are LOOP-INVARIANT, but used to be rebuilt inside each of the ~185 per-month
+    # INSERTs (measured: 2,906 ms per INSERT, of which 2,878 ms was this re-derivation and only 28 ms real work).
+    # Build them ONCE here. TEMP tables live for the connection, survive the commits below, and are dropped at
+    # the end; the DROP IF EXISTS guards a pooled connection that still carries them from an earlier run.
+    for stmt in _POOL_DDL.strip().split(";"):
+        if stmt.strip():
+            await session.execute(text(stmt))
+    await session.execute(text(_pool_tier1_sql(scope_sql)), {"op": operator, **sp})
+    await session.execute(text(_POOL_INDEX))
+
+    # Route-pool richness, to pick the tier per (sub-fleet, calendar month):
+    #  * the TIER-1 count is read straight OFF the built pool — it is by definition "how many distinct routes
+    #    does this pool actually contain", so the decision and the pool can never disagree and tier 1 is never
+    #    chosen with a degenerate pool. (This also replaces a separate ~2.5 s occ/span/cy re-scan that only
+    #    APPROXIMATED the survivor count with a present_yrs*2 >= n_years proxy.)
+    #  * sf_all_routes[sf] = distinct routes across ALL history (the tier-2 fallback's richness).
+    # Below _MIN_ROUTE_POOL a pool is degenerate and we broaden it (tier 2, then master all-history tier 3).
     sf_robust_routes, sf_all_routes = {}, {}
     for r in (await session.execute(text(
-            f'''WITH occ AS (
-                    SELECT {_KEY_SF} sf, extract(month from "Date")::int cm,
-                           "IATA Origin" io, "IATA Destination" idd, "IATA Destination Actual" ida,
-                           "ICAO Origin" ico, "ICAO Destination" icd, "ICAO Destination Actual" ica,
-                           min(extract(year from "Date")::int) first_yr,
-                           count(DISTINCT extract(year from "Date")::int) present_yrs
-                    FROM forecast.acys_actuals
-                    WHERE "Operator" = :op AND "Date" IS NOT NULL {scope_sql}
-                    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8),
-                span AS (
-                    SELECT {_KEY_SF} sf,
-                           "IATA Origin" io, "IATA Destination" idd, "IATA Destination Actual" ida,
-                           "ICAO Origin" ico, "ICAO Destination" icd, "ICAO Destination Actual" ica,
-                           min(extract(year from "Date")::int) gy0, max(extract(year from "Date")::int) gy1
-                    FROM forecast.acys_actuals
-                    WHERE "Operator" = :op AND "Date" IS NOT NULL {scope_sql}
-                    GROUP BY 1, 2, 3, 4, 5, 6, 7),
-                cy AS (
-                    SELECT {_KEY_SF} sf, extract(month from "Date")::int cm,
-                           array_agg(DISTINCT extract(year from "Date")::int) yrs
-                    FROM forecast.acys_actuals
-                    WHERE "Operator" = :op AND "Date" IS NOT NULL {scope_sql} GROUP BY 1, 2)
-                SELECT o.sf, o.cm, count(*) FILTER (
-                           WHERE sp.gy1 > sp.gy0
-                             AND o.present_yrs * 2 >=
-                                 (SELECT count(*) FROM unnest(cy.yrs) y WHERE y >= o.first_yr)) robust
-                FROM occ o
-                JOIN cy ON cy.sf = o.sf AND cy.cm = o.cm
-                JOIN span sp ON sp.sf = o.sf
-                    AND sp.io  IS NOT DISTINCT FROM o.io  AND sp.idd IS NOT DISTINCT FROM o.idd
-                    AND sp.ida IS NOT DISTINCT FROM o.ida AND sp.ico IS NOT DISTINCT FROM o.ico
-                    AND sp.icd IS NOT DISTINCT FROM o.icd AND sp.ica IS NOT DISTINCT FROM o.ica
-                GROUP BY 1, 2'''),
-            {"op": operator, **sp})).all():
+            'SELECT k, cm, count(DISTINCT (io, idd)) n FROM fc_pool_tmp WHERE tier = 1 GROUP BY 1, 2'))).all():
         sf_robust_routes[(r[0], r[1])] = r[2]
     for r in (await session.execute(text(
             f'SELECT {_KEY_SF} sf, count(DISTINCT ("IATA Origin","IATA Destination")) n '
@@ -728,7 +756,34 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
             {"op": operator, **sp})).all():
         sf_all_routes[r[0]] = r[1]
 
-    sql = {t: _insert_sql(scope_sql, tier=t) for t in (1, 2, 3)}
+    # Decide the pool for every (sub-fleet, CALENDAR month) the loop can ask for — the tier depends on nothing
+    # else, so this hoists the decision out of the 185-iteration loop and tells us which tier-2 / tier-3 pools
+    # are actually needed. Only those get built (a raw all-history bag is never materialised for nothing).
+    pool_choice = {}     # (sf, cal_month) -> (tier, pool_key, pool_cm)
+    for sf_k in sorted(fleet_deliv):
+        ms_k = sf_master.get(sf_k) or "NA"
+        for cmn in sorted({fm.month for fm in fmonths}):
+            if sf_robust_routes.get((sf_k, cmn), 0) >= _MIN_ROUTE_POOL:
+                pool_choice[(sf_k, cmn)] = (1, sf_k, cmn)
+            elif sf_all_routes.get(sf_k, 0) >= _MIN_ROUTE_POOL:
+                pool_choice[(sf_k, cmn)] = (2, sf_k, 0)
+            else:
+                pool_choice[(sf_k, cmn)] = (3, ms_k, 0)
+    for tier_n in (2, 3):
+        keys = sorted({key for (t, key, _) in pool_choice.values() if t == tier_n})
+        if keys:
+            await session.execute(text(_pool_raw_sql(scope_sql, tier_n)),
+                                  {"op": operator, "keys": keys, **sp})
+
+    for stmt in _FLEET_DDL.strip().split(";"):
+        if stmt.strip():
+            await session.execute(text(stmt))
+    await session.execute(text(_fleet_build_sql(scope_sql)),
+                          {"op": operator, "sup_since": sup_since, **sp})
+    await session.execute(text(_FLEET_INDEX))
+    await session.commit()
+
+    sql = _insert_sql()
     total, coeff = 0, []
     nfm = max(1, len(fmonths))
     # Iterate the FLEET, not the history: a sub-series can be in the fleet with no history of its own (a new
@@ -754,23 +809,17 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
                 fr = fr_ms
             else:
                 continue   # neither the sub-series nor its master series has any history -> nothing to fit
-            # Route-pool tier: prefer the sub-series' YEAR-ROBUST seasonal pool (tier 1, one-off spikes dropped),
-            # but broaden if it is degenerate so an aircraft is not pinned onto one long-haul route for a whole
-            # month (see _insert_sql / _MIN_ROUTE_POOL). Decision keys on the forecast month's CALENDAR month.
-            if sf_robust_routes.get((sf, m.month), 0) >= _MIN_ROUTE_POOL:
-                pool_tier = 1
-            elif sf_all_routes.get(sf, 0) >= _MIN_ROUTE_POOL:
-                pool_tier = 2
-            else:
-                pool_tier = 3
-            params = {"op": operator, "sf": sf, "ms_key": ms, "hist_key": hist_key, "template_month": tm,
-                      "cal_month": m.month,
-                      "m_end": m_end, "k": int(k), "sup_since": sup_since,
+            # Route pool: already decided per (sub-fleet, calendar month) and materialised in fc_pool_tmp above,
+            # so the statement just addresses it by (tier, key, calendar month) — no re-derivation.
+            pool_tier, pool_key, pool_cm = pool_choice[(sf, m.month)]
+            params = {"op": operator, "sf": sf,
+                      "tier": pool_tier, "pool_key": pool_key, "pool_cm": pool_cm,
+                      "m_end": m_end, "k": int(k),
                       "period": m.strftime("%m-%Y"), "year": m.year, "month": m.month,
                       "start_day": start_day, "day_span": day_span,
                       "anchor_month": as_of.month, "anchor_day": as_of.day,
-                      "pax_factor": FORECAST_PAX_LOAD_FACTOR, **sp}
-            res = await session.execute(text(sql[pool_tier]), params)
+                      "pax_factor": FORECAST_PAX_LOAD_FACTOR}
+            res = await session.execute(text(sql), params)
             total += res.rowcount or 0
             coeff.append({"op": operator, "ms": sf_master.get(sf), "sf": sf, "hk": hist_key,
                           "fm": m, "cm": m.month,
@@ -799,6 +848,16 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         await session.commit()
     except Exception as e:
         logger.warning("forecast coefficients write failed for %s: %s", operator, e)
+
+    # Drop the precompute scratch: the session's connection goes back to the pool, and a stale fc_pool_tmp /
+    # fc_fleet_tmp would otherwise be visible to whatever runs on it next (the DROP IF EXISTS at build time
+    # already guards correctness — this just frees the temp space promptly).
+    try:
+        await session.execute(text("DROP TABLE IF EXISTS fc_pool_tmp"))
+        await session.execute(text("DROP TABLE IF EXISTS fc_fleet_tmp"))
+        await session.commit()
+    except Exception as e:
+        logger.warning("forecast temp cleanup failed for %s: %s", operator, e)
 
     logger.info("forecast_model: %s → %d forecast rows over %d months (frontier %s)",
                 operator, total, len(fmonths), frontier)
