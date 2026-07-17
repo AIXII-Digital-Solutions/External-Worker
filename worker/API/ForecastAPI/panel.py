@@ -104,28 +104,29 @@ def _geo_lookup(iata_expr: str, icao_expr: str) -> str:
     lat / lon, take the value from the lowest-priority source that has it non-empty. Priority:
     main.virtual_airport_list by IATA (1) -> flightradar.airports by IATA (2) -> main.airports by
     IATA (3) -> main.airports by ICAO (4). Per-field (not per-row) so a high-priority source that
-    has coordinates but an empty city does not shadow a populated city from the next source."""
+    has coordinates but an empty city does not shadow a populated city from the next source.
+
+    The pick is PRECOMPUTED — see the Core-API migration `airport_geo_matviews`. This used to resolve ONE
+    airport with a 4-way UNION + sort + array_agg PER ROW: twice in _assemble_sql (~301k flights) and twice in
+    _merge_sql (~566k rows) = ~1.7M resolutions of the same ~350 airports per request, 5.4 s of the assemble
+    alone. It is now two index probes into matviews holding the already-resolved pick.
+
+    The split is EXACT, not an approximation: priority 4 is the ONLY ICAO-keyed source and it is LAST, so
+    "first non-null over 1,2,3,4" is identical to "coalesce(first non-null over 1,2,3, the value from 4)" —
+    precisely airport_geo_by_iata (priorities 1-3) coalesced onto airport_geo_by_icao (priority 4). Same
+    signature and the same five output columns, so every call site is unchanged.
+
+    run_forecast_panel REFRESHes both matviews at the start of the transform step (~0.8 s), so the geography
+    can never go stale behind an updated airport reference."""
     return f"""(
-        SELECT
-            (array_agg(city         ORDER BY pri) FILTER (WHERE city         IS NOT NULL))[1] AS city,
-            (array_agg(country      ORDER BY pri) FILTER (WHERE country      IS NOT NULL))[1] AS country,
-            (array_agg(airport_name ORDER BY pri) FILTER (WHERE airport_name IS NOT NULL))[1] AS airport_name,
-            (array_agg(lat          ORDER BY pri) FILTER (WHERE lat          IS NOT NULL))[1] AS lat,
-            (array_agg(lon          ORDER BY pri) FILTER (WHERE lon          IS NOT NULL))[1] AS lon
-        FROM (
-            SELECT nullif("City",'') AS city, nullif("Country",'') AS country,
-                   nullif("Airport Name",'') AS airport_name, "Latitude" AS lat, "Longitude" AS lon, 1 AS pri
-              FROM main.virtual_airport_list WHERE "IATA Code" = {iata_expr}
-            UNION ALL
-            SELECT nullif(city,''), nullif(country_name,''), nullif(name,''), lat, lon, 2
-              FROM flightradar.airports WHERE iata = {iata_expr}
-            UNION ALL
-            SELECT nullif(city,''), nullif(country,''), nullif(name,''), latitude, longitude, 3
-              FROM main.airports WHERE iata = {iata_expr}
-            UNION ALL
-            SELECT nullif(city,''), nullif(country,''), nullif(name,''), latitude, longitude, 4
-              FROM main.airports WHERE icao = {icao_expr}
-        ) s
+        SELECT coalesce(i.city,         c.city)         AS city,
+               coalesce(i.country,      c.country)      AS country,
+               coalesce(i.airport_name, c.airport_name) AS airport_name,
+               coalesce(i.lat,          c.lat)          AS lat,
+               coalesce(i.lon,          c.lon)          AS lon
+        FROM (SELECT 1) _one
+        LEFT JOIN flightradar.airport_geo_by_iata i ON i.iata = {iata_expr}
+        LEFT JOIN flightradar.airport_geo_by_icao c ON c.icao = {icao_expr}
     )"""
 
 
@@ -844,6 +845,11 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         await _ck()
         await reporter.enter("transform")
         async with db_client.session(_DB) as s:
+            # The airport geography pick is precomputed (see _geo_lookup / the airport_geo_matviews migration).
+            # Refresh it first (~0.8 s over ~104k reference rows) so it can never lag an updated airport
+            # reference — the assemble and the merge below both read it instead of resolving per row.
+            for _mv in ("airport_geo_by_iata", "airport_geo_by_icao"):
+                await s.execute(text(f"REFRESH MATERIALIZED VIEW flightradar.{_mv}"))
             res = await s.execute(text(_assemble_sql(a5_where)), base)
             history_rows = res.rowcount
             # Repair (not drop) broken Circle Distance / Flight Time in the just-assembled facts from the
