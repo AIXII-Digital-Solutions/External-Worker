@@ -33,7 +33,11 @@ logger = setup_logger("forecast_model")
 
 HISTORY_START = date(2022, 7, 1)
 LEVEL_L = 3           # trailing months for the deseasonalized recent level (predictive: 9.7% MAPE)
-SEAS_K = 6.0          # seasonal-factor shrinkage toward 1.0 by month support
+SEAS_K = 3.0          # seasonal-factor shrinkage toward 1.0 by month support. Lowered 6->3 so seasonality is
+                      # VISIBLE (forecast month-of-year amplitude ~6.7%->9.8%, ~40% of the actual ~24%). 3 is
+                      # the safe floor: below it a THIN/growing sub-fleet (the neo ramp 1->10 tails) overfits
+                      # its early low months as a seasonal trough (factor -> 0.5-0.67); at 3 the widest spread
+                      # is the stable A320-232, so no ramp-as-season artefact. (measured via the SEAS_K sweep)
 FRONTIER_FRAC = 0.6   # a recent month is "complete" if its flights ≥ this × the trailing-window median
 FRONTIER_WINDOW = 9   # trailing months the frontier threshold is measured against
 # The last few months of the flight source are typically FR24-INCOMPLETE (ingestion lag) — their volume is
