@@ -556,7 +556,8 @@ def _insert_sql() -> str:
     """One (forecast month, sub-fleet) INSERT into acys_forecast. EVERY active fleet aircraft of the sub-fleet
     flies :k flights, each taking a route from the route pool. Both the fleet and the pool were materialised
     ONCE (see _fleet_build_sql / _pool_tier1_sql / _pool_raw_sql), so this statement now only does the
-    month-specific work: pick the delivered aircraft, cycle the pool, spread the flights over the month's days.
+    month-specific work: pick the delivered aircraft, cycle the pool, and date the flights (see `s` — the
+    forecast is MONTHLY, so a month's flights carry ONE date; only the anchor month keeps two, for the CY split).
 
     The delivery cutoff (`:m_end`) is the only month-dependent fleet rule — nothing retires, future deliveries
     appear once due. `is_sup` tails (carry-forward) bypass it, exactly as the old `sup` CTE did. The pool is
@@ -596,9 +597,27 @@ gen AS (   -- every active aircraft × :k flights. The route is picked by the GL
     CROSS JOIN nr
     JOIN routes r ON nr.c > 0 AND r.rn = (fg.gi % nr.c) + 1
 ),
-s AS (   -- SPREAD the flights across the month's days (current month: from today) so the DAY-PRECISE
-         -- Contract Year splits the anchor month exactly like the actuals (Jul→Jul window, not Aug→Jul)
-    SELECT gen.*, make_date(:year, :month, (:start_day + (rn % :day_span))::int) AS fdate FROM gen
+s AS (   -- The forecast is a MONTHLY projection, so every flight of a month carries ONE date instead of a
+         -- fabricated spread across the month's days — that spread implied a daily precision the model does
+         -- not have (k is fitted per MONTH). The ACTUALS keep their real per-flight dates; only the forecast
+         -- collapses.
+         -- The ANCHOR month is the exception: the Contract-Year boundary runs THROUGH it, so it gets TWO dates
+         -- — the CY that ENDS (:day_lo) and the CY that STARTS (:day_hi) — and the flights split between them
+         -- in exactly the day-proportional ratio the old spread produced: `rn % :day_span` still yields the
+         -- flight's virtual day, and :split_day decides which side it falls on. CY totals are unchanged; only
+         -- the stamped date is. For a NON-anchor month the caller sets :day_lo = :day_hi (one date) and
+         -- :split_day = the last covered day, so the branch is a no-op.
+         -- The caller (run_forecast_model) also clamps both days into the month's covered span, so a partial
+         -- first / horizon month can never date a flight outside the days it actually covers — see there for
+         -- why that clamp can never flip a Contract Year.
+    -- NB: both CASE branches are bind params, so without an explicit CAST Postgres resolves the CASE to
+    -- `text` and make_date(unknown, unknown, text) does not exist. CAST(... AS int) — never `:day_lo::int`,
+    -- which the SQLAlchemy bind regex mis-parses (see the :as_of::date incident).
+    SELECT gen.*,
+           make_date(:year, :month,
+               CASE WHEN (:start_day + (rn % :day_span)) <= :split_day
+                    THEN CAST(:day_lo AS int) ELSE CAST(:day_hi AS int) END) AS fdate
+    FROM gen
 )
 SELECT
     s.reg, :period, s.fdate, NULL, NULL,
@@ -812,11 +831,30 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
             # Route pool: already decided per (sub-fleet, calendar month) and materialised in fc_pool_tmp above,
             # so the statement just addresses it by (tier, key, calendar month) — no re-derivation.
             pool_tier, pool_key, pool_cm = pool_choice[(sf, m.month)]
+            # MONTHLY forecast dating (the actuals keep their real per-flight dates; see _insert_sql's `s`).
+            # A month collapses to ONE date, except the ANCHOR month, which the Contract-Year boundary cuts in
+            # two. Decided here rather than in SQL because every input is already known in Python — and because
+            # comparing two untyped bind params in SQL (:month = :anchor_month) makes Postgres unable to deduce
+            # their type at all ("inconsistent types deduced for parameter").
+            #   split_day — a flight whose virtual day is <= this belongs to the CY that ENDS
+            #   day_lo / day_hi — the date stamped on each side (equal for a non-anchor month => no split)
+            # Both days are clamped into the month's COVERED span, so a partial first / horizon month never
+            # dates a flight outside itself. The clamp cannot flip a CY: if the anchor day sits outside the
+            # span then every virtual day is already on one and the same side of it.
+            def _clamp(d: int, _lo=start_day, _hi=end_day) -> int:
+                return min(max(d, _lo), _hi)
+            if m.month == as_of.month:                       # the anchor month — the CY boundary runs through it
+                split_day = as_of.day
+                day_lo, day_hi = _clamp(as_of.day), _clamp(as_of.day + 1)
+            else:                                            # any other month — one date, branch is a no-op
+                split_day = end_day
+                day_lo = day_hi = _clamp(as_of.day + 1)
             params = {"op": operator, "sf": sf,
                       "tier": pool_tier, "pool_key": pool_key, "pool_cm": pool_cm,
                       "m_end": m_end, "k": int(k),
                       "period": m.strftime("%m-%Y"), "year": m.year, "month": m.month,
                       "start_day": start_day, "day_span": day_span,
+                      "split_day": split_day, "day_lo": day_lo, "day_hi": day_hi,
                       "anchor_month": as_of.month, "anchor_day": as_of.day,
                       "pax_factor": FORECAST_PAX_LOAD_FACTOR}
             res = await session.execute(text(sql), params)
