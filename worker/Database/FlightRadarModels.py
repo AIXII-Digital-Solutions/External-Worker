@@ -11,11 +11,25 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 
 class FlightSummary(Base):
+    # INDEXING POLICY (measured, do not "restore" index=True without evidence): this table is 8.3M rows and
+    # is INSERT-heavy (the FR24 ingest), so every extra index is paid on every write. pg_stat_user_indexes
+    # over a 19-day sample decided what stays:
+    #   kept   reg 763k scans · orig_iata 291k · first_seen 110 · dest_iata 11 · operating_as 8 · painted_as 1
+    #   DROPPED (0 scans, 803 MB total): callsign, type, orig_icao, dest_icao, dest_icao_actual,
+    #          datetime_takeoff, datetime_landed, last_seen
+    # Why those are genuinely unreachable, not merely unpopular:
+    #   * orig_icao / dest_icao / dest_icao_actual are only ever used as `nullif(col,'') IS NOT NULL`
+    #     (ForecastAPI/panel.py _assemble_sql) — a predicate no btree can serve.
+    #   * datetime_takeoff / datetime_landed / last_seen are SELECTed and computed with, never filtered;
+    #     the composite ix_flightsummary_reg_takeoff below carries the one takeoff lookup that exists.
+    #   * callsign is only an FR24 request parameter; the dedup filters fr24_id, served by the unique key.
     __table_args__ = (
         # natural flight key (the app already de-dups on this before insert)
         UniqueConstraint("fr24_id", "flight", "reg", "callsign", name="uq_flightsummary_natural"),
         # "all flights of this aircraft over time"
         Index("ix_flightsummary_reg_takeoff", "reg", "datetime_takeoff"),
+        # the assemble's window: WHERE reg IN (...) AND first_seen > lo AND first_seen < hi
+        Index("ix_flightsummary_reg_first_seen", "reg", "first_seen"),
         # created_at is inherited from BaseMixin -> index via __table_args__ (time-range scans)
         Index("ix_flightradar_flightsummary_created_at", "created_at"),
     )
@@ -23,25 +37,25 @@ class FlightSummary(Base):
     fr24_id: Mapped[str] = mapped_column(String, nullable=True)
     flight: Mapped[str] = mapped_column(String, nullable=True)
 
-    callsign: Mapped[str] = mapped_column(String, nullable=True, index=True)
+    callsign: Mapped[str] = mapped_column(String, nullable=True)
     operating_as: Mapped[str] = mapped_column(String, nullable=True, index=True)
     painted_as: Mapped[str] = mapped_column(String, nullable=True, index=True)
 
-    type: Mapped[str] = mapped_column(String, nullable=True, index=True)
+    type: Mapped[str] = mapped_column(String, nullable=True)
     reg: Mapped[str] = mapped_column(String, nullable=True, index=True)
 
-    orig_icao: Mapped[str] = mapped_column(String, nullable=True, index=True)
+    orig_icao: Mapped[str] = mapped_column(String, nullable=True)
     orig_iata: Mapped[str] = mapped_column(String, nullable=True, index=True)
 
-    datetime_takeoff: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    datetime_takeoff: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     runway_takeoff: Mapped[str] = mapped_column(String, nullable=True)
 
-    dest_icao: Mapped[str] = mapped_column(String, nullable=True, index=True)
+    dest_icao: Mapped[str] = mapped_column(String, nullable=True)
     dest_iata: Mapped[str] = mapped_column(String, nullable=True, index=True)
-    dest_icao_actual: Mapped[str] = mapped_column(String, nullable=True, index=True)
+    dest_icao_actual: Mapped[str] = mapped_column(String, nullable=True)
     dest_iata_actual: Mapped[str] = mapped_column(String, nullable=True, index=True)
 
-    datetime_landed: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    datetime_landed: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     runway_landed: Mapped[str] = mapped_column(String, nullable=True)
 
     flight_time: Mapped[int] = mapped_column(Integer, nullable=True)
@@ -52,7 +66,7 @@ class FlightSummary(Base):
     hex: Mapped[str] = mapped_column(String, nullable=True)
 
     first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
-    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     flight_ended: Mapped[bool] = mapped_column(Boolean, nullable=True)
 
 
@@ -70,6 +84,11 @@ class LivePositions(Base):
         # latest position per aircraft (the flightradar.current_positions view: skip-scan over reg +
         # backward index scan per reg for ORDER BY timestamp DESC LIMIT 1)
         Index("ix_livepositions_reg_timestamp", "reg", "timestamp"),
+        # Same measured policy as FlightSummary above — this is the hottest write path in the platform (the
+        # live poll appends continuously), so an unread index is pure insert cost. Summed over ALL partitions
+        # (per-partition counts lie: a fresh month always reads 0): kept reg_timestamp 54.6k scans · reg 30.5k
+        # · reg_flight_created_at 9.9k · type 6 · operating_as 1. DROPPED at 0 scans everywhere: callsign,
+        # orig_icao, orig_iata, dest_icao, dest_iata, painted_as.
         # append-only + time-ordered -> BRIN on created_at is ~KB (vs MB btree) and great for
         # historical "over a period" range scans. (btree here was unused: scans ~= 0.)
         Index("ix_livepositions_created_at_brin", "created_at", postgresql_using="brin"),
@@ -88,7 +107,7 @@ class LivePositions(Base):
     flight: Mapped[str] = mapped_column(String, nullable=True)
     hex: Mapped[str] = mapped_column(String, nullable=True)
 
-    callsign: Mapped[str] = mapped_column(String, nullable=True, index=True)
+    callsign: Mapped[str] = mapped_column(String, nullable=True)
 
     lat: Mapped[float] = mapped_column(Float, nullable=True)
     lon: Mapped[float] = mapped_column(Float, nullable=True)
@@ -103,15 +122,15 @@ class LivePositions(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, primary_key=True)
     source: Mapped[str] = mapped_column(String, nullable=True)
 
-    orig_icao: Mapped[str] = mapped_column(String, nullable=True, index=True)
-    orig_iata: Mapped[str] = mapped_column(String, nullable=True, index=True)
-    dest_icao: Mapped[str] = mapped_column(String, nullable=True, index=True)
-    dest_iata: Mapped[str] = mapped_column(String, nullable=True, index=True)
+    orig_icao: Mapped[str] = mapped_column(String, nullable=True)
+    orig_iata: Mapped[str] = mapped_column(String, nullable=True)
+    dest_icao: Mapped[str] = mapped_column(String, nullable=True)
+    dest_iata: Mapped[str] = mapped_column(String, nullable=True)
 
     type: Mapped[str] = mapped_column(String, nullable=True, index=True)
     reg: Mapped[str] = mapped_column(String, nullable=True, index=True)
     operating_as: Mapped[str] = mapped_column(String, nullable=True, index=True)
-    painted_as: Mapped[str] = mapped_column(String, nullable=True, index=True)
+    painted_as: Mapped[str] = mapped_column(String, nullable=True)
 
     eta: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
 
