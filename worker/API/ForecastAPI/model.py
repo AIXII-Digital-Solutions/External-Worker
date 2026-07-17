@@ -8,7 +8,8 @@ into acys_actuals with Date NULL); the per-flight STRUCTURE comes from replicati
 month — so the grouped "# Of Flights" and the summed metrics stay faithful.
 
 Per sub-fleet (Master Series), from acys_actuals FLIGHTS (Date NOT NULL):
-  * seasonal[cal] = shrunk month-of-year factor; level = median of last LEVEL_L deseasonalized months.
+  * seasonal[cal] = shrunk month-of-year factor; level = median of the recent COMPLETE deseasonalized
+    months (see _robust_level_and_mask).
   * base_fleet    = median flown-tail count of the last few months ≤ frontier.
 Forward fleet from the STUB rows (Date NULL, Delivery Date > frontier): per sub-fleet, aircraft arriving by
 month m. Forecast month m: flights_hat_sf(m) = level_sf × seasonal_sf[cal(m)] × growth_sf(m), where
@@ -16,7 +17,9 @@ growth_sf(m) = (base_fleet_sf + delivered_by_m_sf) / base_fleet_sf (capped) — 
 STRUCTURE (routes) comes from a YEAR-ROBUST route pool for cal(m) (see _pool_tier1_sql): each route weighted
 by the median of its per-year counts in that calendar month, one-off single-year bursts dropped, so a spike
 that occurred in only one occurrence of a month is NOT replayed into every forecast year. Window: history
-HISTORY_START → coverage frontier; forecast frontier+1 → as_of + FORECAST_HORIZON_YEARS. Signed v1 limits: no
+`history_start` → coverage frontier; forecast frontier+1 → as_of + `horizon_years`. Every tuning knob named
+here is a RUNTIME parameter read from service.forecast_profiles — see params.py / forecast_params.py.
+Signed v1 limits: no
 calendar trend beyond fleet growth; low route-structure confidence for thin sub-fleets; a brand-new sub-fleet
 with deliveries but no prior flights has no level and is not forecast.
 """
@@ -27,26 +30,25 @@ from datetime import date, timedelta
 from sqlalchemy import text
 
 from Config import setup_logger
-from settings import FORECAST_HORIZON_YEARS, FORECAST_PAX_LOAD_FACTOR
+
+from .params import ForecastParams
 
 logger = setup_logger("forecast_model")
 
-HISTORY_START = date(2022, 7, 1)
-LEVEL_L = 3           # trailing months for the deseasonalized recent level (predictive: 9.7% MAPE)
-SEAS_K = 3.0          # seasonal-factor shrinkage toward 1.0 by month support. Lowered 6->3 so seasonality is
-                      # VISIBLE (forecast month-of-year amplitude ~6.7%->9.8%, ~40% of the actual ~24%). 3 is
-                      # the safe floor: below it a THIN/growing sub-fleet (the neo ramp 1->10 tails) overfits
-                      # its early low months as a seasonal trough (factor -> 0.5-0.67); at 3 the widest spread
-                      # is the stable A320-232, so no ramp-as-season artefact. (measured via the SEAS_K sweep)
-FRONTIER_FRAC = 0.6   # a recent month is "complete" if its flights ≥ this × the trailing-window median
-FRONTIER_WINDOW = 9   # trailing months the frontier threshold is measured against
-# The last few months of the flight source are typically FR24-INCOMPLETE (ingestion lag) — their volume is
-# undercounted, so their DESEASONALIZED value sits below the true level. A plain median of the last LEVEL_L
-# months would inherit that undercount and drag the WHOLE forecast ~20-30% too low (flat + negative growth vs
-# the complete actuals). The robust level (see _robust_level) estimates the level from the recent COMPLETE
-# months only: months within LEVEL_COMPLETE_FRAC of a high-quantile reference of the window.
-LEVEL_WINDOW = 9          # recent months the level is estimated over
-LEVEL_COMPLETE_FRAC = 0.85  # a window month counts toward the level iff its deseasonalized volume ≥ this × ref
+# The tuning knobs are NOT constants here any more. They live in `service.forecast_profiles` (portal-editable),
+# are typed/bounded/defaulted/documented by `forecast_params.SPEC`, and reach this module as a frozen
+# `ForecastParams` (see params.py). The panel loads the profile ONCE per run and threads it through: every
+# function below that used to read a module constant now takes `p`.
+#
+# What each knob means, and the measurements behind its default, are documented in forecast_params.SPEC and
+# nowhere else — so the portal's tooltip and this module can never tell a different story.
+#
+# `_DEFAULTS` exists only so a direct caller (a script, an experiment) can use these helpers without building
+# a profile. The panel ALWAYS passes an explicit `p`.
+_DEFAULTS = ForecastParams.defaults()
+
+# Re-exported: the panel shares the same history floor for its assemble step.
+HISTORY_START = _DEFAULTS.history_start
 # NOTE: there is deliberately NO idle-aircraft retirement and NO growth cap. The fleet comes straight from
 # Cirium's latest revision (delivery-dated), and per the product rule we never PREDICT that an aircraft
 # retires — an in-service tail keeps flying to the horizon (invariant: future aircraft never leave). A dead
@@ -68,12 +70,6 @@ GROUP BY 1, 2
 
 _KEY_SF = """coalesce(nullif("Aircraft Sub Series",''),'NA')"""
 _KEY_MS = """coalesce(nullif("Master Series",''),'NA')"""
-
-# Minimum DISTINCT routes a route pool must have before it is trusted as-is. Below this, the pool is
-# "degenerate" (e.g. a barely-flown new type whose seasonal template month holds a single long-haul route),
-# and _insert_sql's tier cascade broadens it (sub-series all-history -> master all-history). Keeps one
-# aircraft from being pinned onto one route for a whole month (36x Toulouse-Sharjah = 226 flight-hours).
-_MIN_ROUTE_POOL = 5
 
 # DEPRECATED (unused): the fleet + future deliveries now come from the reference (§ run_forecast_model),
 # not from Date-NULL stub rows. Kept only to avoid churn; sub-fleet key would be "Aircraft Sub Series".
@@ -104,36 +100,41 @@ def _quantile(xs, q):
     return s[min(len(s) - 1, int(q * len(s)))]
 
 
-def _robust_level_and_mask(des):
+def _robust_level_and_mask(des, p: ForecastParams = _DEFAULTS):
     """Recent per-sub-fleet level (deseasonalized flights), robust to FR24-INCOMPLETE recent months, plus the
     boolean mask marking WHICH series months were counted as COMPLETE. Incomplete months are undercounted, so
-    their deseasonalized value sits BELOW the true level; a plain median of the last LEVEL_L would inherit the
-    undercount. Instead: over the recent LEVEL_WINDOW, take a HIGH quantile as the complete-month reference
-    (complete months dominate the top), keep the window months within LEVEL_COMPLETE_FRAC of it, and take the
-    MEDIAN of those. The mask lets the caller draw the fleet `base` from the SAME complete months, so the
-    per-aircraft rate (level/base) is not diluted by fleet GROWTH between the complete period and the frontier
-    (a growing sub-fleet has fewer tails in the complete window than at the frontier). With <3 months of
-    history there is nothing to filter — fall back to the plain last-LEVEL_L median/months."""
+    their deseasonalized value sits BELOW the true level; a plain median of the last `level_l` would inherit
+    the undercount. Instead: over the recent `level_window`, take a HIGH quantile as the complete-month
+    reference (complete months dominate the top), keep the window months within `level_complete_frac` of it,
+    and take the MEDIAN of those. The mask lets the caller draw the fleet `base` from the SAME complete months,
+    so the per-aircraft rate (level/base) is not diluted by fleet GROWTH between the complete period and the
+    frontier (a growing sub-fleet has fewer tails in the complete window than at the frontier). With <3 months
+    of history there is nothing to filter — fall back to the plain last-`level_l` median/months.
+
+    The reference is measured INSIDE the window, so the window has to be long enough to still CONTAIN complete
+    months: if every month in it is undercounted, the reference is undercounted too, the filter passes
+    everything and the level collapses. That is why `level_window` must stay well clear of the ingestion lag —
+    see its SPEC entry for the measured cliff."""
     n = len(des)
     mask = [False] * n
-    lo = max(0, n - LEVEL_WINDOW)
+    lo = max(0, n - p.level_window)
     recent_idx = list(range(lo, n))
     if len(recent_idx) < 3:
-        for i in recent_idx[-LEVEL_L:]:
+        for i in recent_idx[-p.level_l:]:
             mask[i] = True
-        return st.median(des[-LEVEL_L:]), mask
+        return st.median(des[-p.level_l:]), mask
     ref = _quantile([des[i] for i in recent_idx], 0.75)
-    complete_idx = [i for i in recent_idx if des[i] >= LEVEL_COMPLETE_FRAC * ref]
+    complete_idx = [i for i in recent_idx if des[i] >= p.level_complete_frac * ref]
     if not complete_idx:
-        for i in recent_idx[-LEVEL_L:]:
+        for i in recent_idx[-p.level_l:]:
             mask[i] = True
-        return st.median(des[-LEVEL_L:]), mask
+        return st.median(des[-p.level_l:]), mask
     for i in complete_idx:
         mask[i] = True
     return st.median([des[i] for i in complete_idx]), mask
 
 
-def _fit(series):
+def _fit(series, p: ForecastParams = _DEFAULTS):
     """series = sorted [(cal_month, flights)] (≤ frontier) → (level, seasonal[1..12], complete_mask)."""
     by_cal = defaultdict(list)
     for c, f in series:
@@ -143,20 +144,20 @@ def _fit(series):
     seas = {}
     for c in range(1, 13):
         if c in cal_med:
-            w = len(by_cal[c]) / (len(by_cal[c]) + SEAS_K)
+            w = len(by_cal[c]) / (len(by_cal[c]) + p.seas_k)
             seas[c] = max(w * (cal_med[c] / base) + (1 - w), 0.10)
         else:
             seas[c] = 1.0
     des = [f / seas[c] for c, f in series]
-    level, mask = _robust_level_and_mask(des)
+    level, mask = _robust_level_and_mask(des, p)
     return level, seas, mask
 
 
-def _horizon_month(as_of: date) -> date:
-    return date(as_of.year + FORECAST_HORIZON_YEARS, as_of.month, 1)
+def _horizon_month(as_of: date, p: ForecastParams = _DEFAULTS) -> date:
+    return date(as_of.year + p.horizon_years, as_of.month, 1)
 
 
-def _month_span(m: date, fc_start: date, as_of: date):
+def _month_span(m: date, fc_start: date, as_of: date, p: ForecastParams = _DEFAULTS):
     """Days of month `m` the forecast covers. TWO anchors: the FIRST forecast month starts on `fc_start` (the
     day AFTER the last fact — so there is NO gap between facts and forecast), and the HORIZON month
     (as_of + horizon) ends on the CY anchor day `as_of.day`; every month between is full. proration =
@@ -166,11 +167,11 @@ def _month_span(m: date, fc_start: date, as_of: date):
     # clamp both anchor days to the month length so the day-spread never emits an out-of-range date (a 29-Feb
     # as_of whose horizon Feb has 28 days would otherwise make_date(year,2,29) and crash the INSERT).
     start_day = min(fc_start.day, dim) if m == date(fc_start.year, fc_start.month, 1) else 1
-    end_day = min(as_of.day, dim) if m == _horizon_month(as_of) else dim
+    end_day = min(as_of.day, dim) if m == _horizon_month(as_of, p) else dim
     return start_day, end_day, max(1, end_day - start_day + 1), dim
 
 
-def _plan(rows, fc_start: date, as_of: date):
+def _plan(rows, fc_start: date, as_of: date, p: ForecastParams = _DEFAULTS):
     """Fit level×seasonal per sub-fleet on months ≤ the coverage frontier, then plan the forecast months
     from `fc_start`'s month (the day after the last fact) to the horizon (as_of + horizon). The Contract Year
     is cut on the as_of day, which may sit LATER than fc_start. Returns (frontier, forecast_months, plan, fits) where
@@ -189,9 +190,9 @@ def _plan(rows, fc_start: date, as_of: date):
     if not months:
         return None, [], {}, {}
 
-    trailing = [by_mon[m] for m in months[-FRONTIER_WINDOW:]]
+    trailing = [by_mon[m] for m in months[-p.frontier_window:]]
     med = st.median(trailing) if trailing else 0
-    complete = [m for m in months if by_mon[m] >= med * FRONTIER_FRAC]
+    complete = [m for m in months if by_mon[m] >= med * p.frontier_frac]
     frontier = max(complete) if complete else months[-1]
 
     fits, sf_hist = {}, {}
@@ -199,21 +200,21 @@ def _plan(rows, fc_start: date, as_of: date):
         s_tr = [(mn, fl, tl) for mn, fl, tl in s if mn <= frontier and fl]
         if not s_tr:
             continue
-        level, seas, mask = _fit([(mn.month, fl) for mn, fl, _ in s_tr])
+        level, seas, mask = _fit([(mn.month, fl) for mn, fl, _ in s_tr], p)
         # base = typical flown-tail count, taken from the SAME complete months the level came from (mask), so
         # the per-aircraft rate (level/base) is not diluted by fleet growth between the complete window and the
         # frontier — a growing sub-fleet (all the neo deliveries) had fewer tails when complete than at June.
         ct = [tl for (_, _, tl), keep in zip(s_tr, mask) if keep]
-        base = (st.median(ct) if ct else st.median([tl for _, _, tl in s_tr[-LEVEL_L:]])) or 1
+        base = (st.median(ct) if ct else st.median([tl for _, _, tl in s_tr[-p.level_l:]])) or 1
         fits[sf] = (level, seas, base)
         sf_hist[sf] = [(mn, fl) for mn, fl, _ in s_tr]
 
     fmonths, plan = [], {}
     first_month = date(fc_start.year, fc_start.month, 1)
     m = first_month
-    horizon = _horizon_month(as_of)
+    horizon = _horizon_month(as_of, p)
     while m <= horizon:
-        _, _, day_span, dim = _month_span(m, fc_start, as_of)
+        _, _, day_span, dim = _month_span(m, fc_start, as_of, p)
         prorate = day_span / dim                    # covered-days fraction (1.0 except current & final months)
         # The FIRST forecast month is partial (covers fc_start.day..month-end) and its proration can be tiny
         # (a late-month fc_start -> a day or two). For a low-volume sub-fleet round() would then give k=0, and
@@ -645,16 +646,20 @@ def _contract_year(d: date, anchor: date) -> str:
 
 async def run_forecast_model(*, session, operator: str, as_of: date,
                              scope_where: str | None = None, scope_params: dict | None = None,
+                             params: ForecastParams | None = None,
                              on_progress=None) -> dict:
     """Populate forecast.acys_forecast for `operator`, restricted to the request scope. Returns counts.
+    `params` is the run's tuning profile (see params.py) — the panel loads it once and passes it for every
+    operator, so a multi-operator run cannot straddle a portal edit made halfway through.
     `on_progress(fraction)` (async, optional) is called after each forecast month, so a single-operator
     run still shows movement across the step instead of freezing at the band floor."""
+    p = params or _DEFAULTS
     scope_sql = f"AND ({scope_where})" if scope_where else ""
     sp = dict(scope_params or {})
 
     # The forecast pivots on the REQUEST date `as_of` — that is the "today" of the export. Facts are
     # everything BEFORE it (the panel fetches the flight history up to as_of-1 and assembles it with
-    # `first_seen < as_of`); the forecast runs from as_of forward to as_of + FORECAST_HORIZON_YEARS. We do
+    # `first_seen < as_of`); the forecast runs from as_of forward to as_of + `horizon_years`. We do
     # NOT shift the anchor to the last available actual: the request date decides where the forecast starts,
     # and any hole up to as_of-1 is closed by LOADING the missing facts from the flight source, never by
     # moving the forecast start earlier. (If those facts are genuinely unavailable — e.g. as_of is a future
@@ -673,7 +678,7 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         f'WHERE "Date" IS NOT NULL {scope_sql}'),
         {"am": as_of.month, "ad": as_of.day, "op": operator, **sp})
 
-    base_params = {"op": operator, "start": HISTORY_START, **sp}
+    base_params = {"op": operator, "start": p.history_start, **sp}
 
     async def _hist(key: str):
         return [dict(r._mapping) for r in (await session.execute(
@@ -691,7 +696,7 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
     # forecast START = the day AFTER the last fact, so there is NO gap between facts and forecast; the CY
     # stays anchored on the REQUEST date `as_of` (which may be LATER — the CY is simply cut on the as_of day).
     # The assemble step caps facts at `first_seen < as_of`, so last_fact <= as_of-1 and fc_start <= as_of;
-    # the forecast then runs fc_start .. (as_of + FORECAST_HORIZON_YEARS).
+    # the forecast then runs fc_start .. (as_of + `horizon_years`).
     last_fact = (await session.execute(text(
         'SELECT max("Date") FROM forecast.acys_actuals '
         f'WHERE "Operator" = :op AND "Date" IS NOT NULL {scope_sql}'),
@@ -703,8 +708,8 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
     # into the forecast fleet so they do not vanish at the seam (see _insert_sql's `sup` CTE).
     sup_since = last_fact.replace(day=1) if last_fact is not None else fc_start
 
-    frontier, fmonths, plan_sf, fits_sf = _plan(rows_sf, fc_start, as_of)
-    fr_ms, fm_ms, plan_ms, fits_ms = _plan(rows_ms, fc_start, as_of)
+    frontier, fmonths, plan_sf, fits_sf = _plan(rows_sf, fc_start, as_of, p)
+    fr_ms, fm_ms, plan_ms, fits_ms = _plan(rows_ms, fc_start, as_of, p)
     fmonths = sorted(set(fmonths) | set(fm_ms))
 
     # Fleet delivery dates per sub-fleet (latest revision) — the active-fleet count and the coefficients.
@@ -763,7 +768,7 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
     #    chosen with a degenerate pool. (This also replaces a separate ~2.5 s occ/span/cy re-scan that only
     #    APPROXIMATED the survivor count with a present_yrs*2 >= n_years proxy.)
     #  * sf_all_routes[sf] = distinct routes across ALL history (the tier-2 fallback's richness).
-    # Below _MIN_ROUTE_POOL a pool is degenerate and we broaden it (tier 2, then master all-history tier 3).
+    # Below `min_route_pool` a pool is degenerate and we broaden it (tier 2, then master all-history tier 3).
     sf_robust_routes, sf_all_routes = {}, {}
     for r in (await session.execute(text(
             'SELECT k, cm, count(DISTINCT (io, idd)) n FROM fc_pool_tmp WHERE tier = 1 GROUP BY 1, 2'))).all():
@@ -782,9 +787,9 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
     for sf_k in sorted(fleet_deliv):
         ms_k = sf_master.get(sf_k) or "NA"
         for cmn in sorted({fm.month for fm in fmonths}):
-            if sf_robust_routes.get((sf_k, cmn), 0) >= _MIN_ROUTE_POOL:
+            if sf_robust_routes.get((sf_k, cmn), 0) >= p.min_route_pool:
                 pool_choice[(sf_k, cmn)] = (1, sf_k, cmn)
-            elif sf_all_routes.get(sf_k, 0) >= _MIN_ROUTE_POOL:
+            elif sf_all_routes.get(sf_k, 0) >= p.min_route_pool:
                 pool_choice[(sf_k, cmn)] = (2, sf_k, 0)
             else:
                 pool_choice[(sf_k, cmn)] = (3, ms_k, 0)
@@ -809,7 +814,7 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
     # type arriving), and it must still be forecast — off its master series' history.
     for fi, m in enumerate(fmonths):
         m_end = _add_months(m, 1) - timedelta(days=1)          # last day of the forecast month (delivery cutoff)
-        start_day, end_day, day_span, dim = _month_span(m, fc_start, as_of)
+        start_day, end_day, day_span, dim = _month_span(m, fc_start, as_of, p)
         prorate = day_span / dim
         for sf in sorted(fleet_deliv):
             active = sum(1 for d in fleet_deliv.get(sf, []) if d is None or d <= m_end)
@@ -856,7 +861,7 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
                       "start_day": start_day, "day_span": day_span,
                       "split_day": split_day, "day_lo": day_lo, "day_hi": day_hi,
                       "anchor_month": as_of.month, "anchor_day": as_of.day,
-                      "pax_factor": FORECAST_PAX_LOAD_FACTOR}
+                      "pax_factor": p.pax_load_factor}
             res = await session.execute(text(sql), params)
             total += res.rowcount or 0
             coeff.append({"op": operator, "ms": sf_master.get(sf), "sf": sf, "hk": hist_key,
