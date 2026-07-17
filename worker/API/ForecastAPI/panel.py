@@ -26,7 +26,7 @@ Assemble (acys_actuals) — per FLIGHT:
   * derived (2.4): Contract Year (fiscal window anchored at the REQUEST date's month/day, labelled by
     its START year); Circle Distance = GREAT-CIRCLE (haversine, km) between origin & destination coords;
     Flight Time = Time Landed - Time Departed, in DECIMAL HOURS (6.51 = 6h31m — NOT an interval, so it
-    sums/averages straight in BI); Total PAX = Total Seats * FORECAST_PAX_LOAD_FACTOR (0.8).
+    sums/averages straight in BI); Total PAX = Total Seats * the profile's `pax_load_factor` (default 0.8).
   * DROP a flight whose ICAO Origin is empty OR whose ICAO Destination (actual or planned) is empty.
   * The flight LOWER BOUND is always the start of CY2022 (make_date(2022, anchor_month, anchor_day)) —
     flights that would land in CY2021 are excluded.
@@ -55,16 +55,25 @@ from datetime import date, timedelta
 from sqlalchemy import text
 
 from Config import setup_logger
-from settings import (FORECAST_PAX_LOAD_FACTOR, FORECAST_ASSEMBLE_ETA_SECONDS,
+from settings import (FORECAST_ASSEMBLE_ETA_SECONDS,
                       FORECAST_MERGE_ETA_SECONDS, FORECAST_FETCH_BUDGET_SECONDS,
                       FR24_SECONDS_PER_REQUEST_EST, FORECAST_PROGRESS_HEARTBEAT_SECONDS,
                       FORECAST_PROGRESS_MIN_INTERVAL_SECONDS, FORECAST_CALIB_WINDOW_DAYS,
                       FORECAST_BOOT_SEARCH_SECONDS, FORECAST_BOOT_FORECAST_PER_OP_SECONDS)
 from status import publish_status
 
+from .params import load_params
+
 logger = setup_logger("forecast_panel")
 
-HISTORY_START = date(2022, 7, 1)   # Period >= 07-2022 (2.2) and flightsummary first_seen >= this
+# The history floor and the PAX load factor are now RUNTIME parameters (service.forecast_profiles, resolved
+# per run by load_params) — they used to be a module constant here and an env var in settings respectively,
+# and the constant was duplicated in model.py, so the two could silently disagree. `HISTORY_START` is kept as
+# a module attribute only because ForecastAPI/__init__ re-exports it; it is the DEFAULT, and no code path in
+# this module reads it any more — every use goes through `params.history_start`.
+from .forecast_params import defaults as _param_defaults   # noqa: E402  (kept next to what it explains)
+
+HISTORY_START = _param_defaults()["history_start"]
 _DB = "cirium"   # any aviation logical name -> the physical aixii DB (cirium/flightradar/main/forecast)
 _REQUEST_TYPE = "ACYS"   # this Cirium×FR24 panel algorithm — stamped on the forecast_last_requests row
 
@@ -662,18 +671,25 @@ def _scope(operator, registrations):
 
 async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                              operator: str | None = None, registrations: list[str] | None = None,
-                             as_of: date | None = None) -> dict:
+                             as_of: date | None = None, profile: str | None = None) -> dict:
     """Run the forecast panel for ONE request (operator and/or registrations), publishing a status
-    per step. acys_actuals accumulates (this scope refreshed); acys_forecast/acys_summary per-request."""
+    per step. acys_actuals accumulates (this scope refreshed); acys_forecast/acys_summary per-request.
+    `profile` names a row in service.forecast_profiles; omitted, the default profile is used."""
     if not operator and not registrations:
         raise ValueError("provide operator and/or registrations")
     as_of = as_of or date.today()
     a5_where, hist_delete, final_scope, scope_params, label = _scope(operator, registrations)
 
-    base = {"start_date": HISTORY_START, "as_of": as_of,
+    # Load the tuning profile ONCE, up front, and use it for every step of this run. Reloading it per step (or
+    # per operator) would let a portal edit landing mid-run split the output — actuals assembled at one
+    # pax_load_factor, the forecast projected at another. One run, one parameter set.
+    params, profile_label = await load_params(db_client, profile=profile)
+    logger.info("forecast panel: профиль параметров %r", profile_label)
+
+    base = {"start_date": params.history_start, "as_of": as_of,
             "anchor_month": as_of.month, "anchor_day": as_of.day,
             "cy2022_floor": _cy2022_floor(as_of),   # leap-safe CY2022 lower bound for _assemble_sql
-            "pax_factor": FORECAST_PAX_LOAD_FACTOR, **scope_params}
+            "pax_factor": params.pax_load_factor, **scope_params}
 
     # ── Progress + ETA: an honest, self-calibrating FIVE-step model (no hardcoded step weights) ──────
     # Pending steps are estimated from a moving average of past runs (forecast_step_timings) scaled by
@@ -908,7 +924,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                 # requests) so a registrations-scoped run does not forecast sibling tails
                 fr = await run_forecast_model(session=s, operator=op, as_of=as_of,
                                               scope_where=final_scope, scope_params=scope_params,
-                                              on_progress=_fc_prog)
+                                              params=params, on_progress=_fc_prog)
             forecast_rows += fr.get("forecast_rows", 0)
             await reporter.tick(idx + 1, n_ops)
         d = await reporter.complete()

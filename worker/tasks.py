@@ -81,7 +81,8 @@ async def refresh_subscription(ctx, subscription_id: str | None = None):
 # NOT @status_task-wrapped: it publishes its OWN sequential per-step statuses (validating ->
 # preparing -> fr24 check -> assembling -> merging -> done) so the portal can render progress live.
 async def forecast_panel(ctx, operator: str | None = None, registrations: list[str] | None = None,
-                         as_of: str | None = None, correlation_id=None, **_):
+                         as_of: str | None = None, profile: str | None = None,
+                         correlation_id=None, **_):
     from datetime import date
     _as_of = date.fromisoformat(as_of) if as_of else None
     await run_forecast_panel(
@@ -92,6 +93,7 @@ async def forecast_panel(ctx, operator: str | None = None, registrations: list[s
         operator=operator,
         registrations=registrations,
         as_of=_as_of,
+        profile=profile,      # names a service.forecast_profiles row; None -> the default profile
     )
 
 
