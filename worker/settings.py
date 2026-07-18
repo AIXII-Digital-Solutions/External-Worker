@@ -83,11 +83,21 @@ AIRLABS_API_URL: str = "https://airlabs.co/api/v9/"
 FLIGHT_RADAR_URL: str = require_env("FLIGHT_RADAR_URL", "https://fr24api.flightradar24.com/api")
 FLIGHT_RADAR_API_KEY: str = require_env("FLIGHT_RADAR_API_KEY")
 FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS: float = _rate("FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS", 60 / 90)
-FLIGHT_RADAR_RANGE_DAYS: int = require_env("FLIGHT_RADAR_RANGE_DAYS", 14)
-FLIGHT_RADAR_MAX_REG_PER_BATCH: int = require_env("FLIGHT_RADAR_MAX_REG_PER_BATCH", 15)
-# Forecast coverage ledger: a per-tail no-fly gap of >= this many days is treated as a MISSING range
-# (fetched from FR24), shorter gaps are folded into the covered span. Bootstrap threshold.
-FLIGHT_RADAR_COVERAGE_GAP_DAYS: int = require_env("FLIGHT_RADAR_COVERAGE_GAP_DAYS", 7)
+FLIGHT_RADAR_RANGE_DAYS: int = int(require_env("FLIGHT_RADAR_RANGE_DAYS", 14))
+FLIGHT_RADAR_MAX_REG_PER_BATCH: int = int(require_env("FLIGHT_RADAR_MAX_REG_PER_BATCH", 15))
+# How many FR24 requests may be IN FLIGHT at once. Requests are still globally paced to
+# FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS (a shared limiter), so this does NOT raise the request RATE — it hides
+# FR24's per-request network latency so the paced rate is actually reached instead of (rate ⊕ latency)
+# serialised. Kept at/below the DB pool headroom (pool 10 + overflow 20); each in-flight request uses one
+# pooled session. 1 = the old fully-serial behaviour.
+FLIGHT_RADAR_MAX_CONCURRENCY: int = int(require_env("FLIGHT_RADAR_MAX_CONCURRENCY", 6))
+# Forecast coverage ledger — how the fold treats a no-fly gap BETWEEN two flight days when deciding what is
+# already "seen". A run of empty days LONGER than this is a MISSING range (fetched once to confirm/find data,
+# then recorded); a run this short or shorter is assumed seen (we hold data on both sides). Default 1 = find
+# EVERY empty range (assume nothing) — thorough, costs only extra 0-token requests on the first reconciliation
+# of a tail; raise it to trade completeness for a faster first run. Does NOT affect token cost (empty gaps
+# return no rows) nor recurring runs (fetched gaps are recorded and skipped thereafter).
+FLIGHT_RADAR_COVERAGE_GAP_DAYS: int = int(require_env("FLIGHT_RADAR_COVERAGE_GAP_DAYS", 1))
 # Forecast progress/ETA — self-calibrating (forecast_step_timings moving average). These are BOOTSTRAP
 # SEEDS only: used for a step that has no ledger history yet (first runs), then never again once that
 # step records a real timing. One data request takes ~0.5-15s (per-request seed); the two DB-step seeds

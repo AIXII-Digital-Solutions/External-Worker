@@ -1,4 +1,5 @@
 import asyncio
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List
@@ -10,12 +11,39 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from Config import setup_logger
 from settings import FLIGHT_RADAR_HEADERS, FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS, \
-    FLIGHT_RADAR_MAX_REG_PER_BATCH, FLIGHT_RADAR_RANGE_DAYS, FLIGHT_RADAR_URL, FLIGHT_RADAR_PATH
+    FLIGHT_RADAR_MAX_REG_PER_BATCH, FLIGHT_RADAR_RANGE_DAYS, FLIGHT_RADAR_URL, FLIGHT_RADAR_PATH, \
+    FLIGHT_RADAR_MAX_CONCURRENCY
 from Database import DatabaseClient
 from Database.Models import FlightSummary
 from Utils import parse_dt, ensure_naive_utc, write_csv, parse_date_or_datetime, performance_timer
 
 logger = setup_logger("flightradar")
+
+
+class _RateLimiter:
+    """Spaces the START of every FR24 request by at least `min_interval` seconds — GLOBALLY across all
+    concurrent fetchers, not per-task. This is what lets requests run concurrently (to hide FR24's network
+    latency) while never exceeding the API's request RATE: with N tasks in flight, the limiter still hands
+    out one start-slot per interval, so the effective rate is the same ceiling as the old serial pre-sleep
+    (default 90/min) — it is simply actually reached instead of being (rate ⊕ latency)-serialised.
+
+    A monotonic-time cursor, not a real token bucket: no bursting, exact even pacing. `min_interval <= 0`
+    disables pacing entirely."""
+
+    def __init__(self, min_interval: float):
+        self._min = max(0.0, float(min_interval))
+        self._next = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        if self._min <= 0:
+            return
+        async with self._lock:
+            now = time.monotonic()
+            wait = self._next - now
+            self._next = (now if wait < 0 else self._next) + self._min
+        if wait > 0:
+            await asyncio.sleep(wait)
 
 
 async def fetch_date_range(
@@ -28,8 +56,15 @@ async def fetch_date_range(
         storage_mode: str = "db",
         csv_path: Optional[str] = None,
         on_request=None,
+        limiter: Optional["_RateLimiter"] = None,
+        client: Optional[DatabaseClient] = None,
 ) -> List[dict] | None:
-    client: DatabaseClient = DatabaseClient()
+    # Reuse the caller's DatabaseClient (one pooled engine shared by all concurrent units); only build a
+    # throwaway one if called standalone. Creating a fresh DatabaseClient per unit would spin up a NEW engine
+    # + pool per request and leak it (never disposed) — harmless-ish when serial, but under concurrency it
+    # churns many pools and can exhaust Postgres connections.
+    if client is None:
+        client = DatabaseClient()
 
     logger.debug("[Flight Summary] Starting query Fetch Date Range")
 
@@ -54,7 +89,12 @@ async def fetch_date_range(
             if callsigns:
                 params["callsigns"] = ",".join(callsigns)
 
-            await asyncio.sleep(FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS)
+            # Global inter-request pacing (shared across all concurrent fetchers). Falls back to a plain
+            # sleep when called without a limiter (the __main__/direct callers), preserving old behaviour.
+            if limiter is not None:
+                await limiter.acquire()
+            else:
+                await asyncio.sleep(FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS)
 
             async with http.get(f"{FLIGHT_RADAR_URL}/flight-summary/full", headers=FLIGHT_RADAR_HEADERS,
                                 params=params) as resp:
@@ -233,32 +273,58 @@ async def fetch_all_ranges(
         1
     )
 
-    async with aiohttp.ClientSession() as http:
-        total_iterations = max_len * len(date_ranges)
-        current_iteration = 0
+    # Each (batch × date-range) is one independent unit: its pagination is serial internally, but different
+    # units share nothing (own DB session per fetch_date_range, one concurrency-safe aiohttp session, inserts
+    # idempotent via uq_flightsummary_natural). So we run up to FLIGHT_RADAR_MAX_CONCURRENCY units at once to
+    # hide FR24 latency, while a SHARED _RateLimiter keeps the global request rate at the same ceiling as the
+    # old serial pre-sleep. Net effect: the paced rate is actually reached instead of (rate ⊕ latency).
+    units = [(get_batch(registration_batches, b), get_batch(icao_batches, b),
+              get_batch(callsigns_batches, b), rs, re)
+             for b in range(max_len) for (rs, re) in date_ranges]
 
-        for batch_index in range(max_len):
-            reg_batch = get_batch(registration_batches, batch_index)
-            icao_batch = get_batch(icao_batches, batch_index)
-            callsign_batch = get_batch(callsigns_batches, batch_index)
-            logger.debug(
-                f"\n[Flight Summary] Processing a batch {current_iteration + 1} out of {total_iterations}")
+    limiter = _RateLimiter(FLIGHT_RADAR_SECONDS_BETWEEN_REQUESTS)
+    sem = asyncio.Semaphore(max(1, FLIGHT_RADAR_MAX_CONCURRENCY))
+    connector = aiohttp.TCPConnector(limit=max(1, FLIGHT_RADAR_MAX_CONCURRENCY), ttl_dns_cache=300)
 
-            for i, (range_start, range_end) in enumerate(date_ranges):
-                logger.debug(f"[Flight Summary] Range {i + 1} out of {len(date_ranges)}")
-                current_iteration += 1
+    async with aiohttp.ClientSession(connector=connector) as http:
+        async def _run_unit(reg_batch, icao_batch, callsign_batch, range_start, range_end):
+            async with sem:
+                return await fetch_date_range(
+                    icao=icao_batch, regs=reg_batch, range_from=range_start, range_to=range_end,
+                    http=http, storage_mode=storage_mode, csv_path=csv_path,
+                    callsigns=callsign_batch, on_request=on_request, limiter=limiter, client=client,
+                )
 
-                flights.append(await fetch_date_range(
-                    icao=icao_batch,
-                    regs=reg_batch,
-                    range_from=range_start,
-                    range_to=range_end,
-                    http=http,
-                    storage_mode=storage_mode,
-                    csv_path=csv_path,
-                    callsigns=callsign_batch,
-                    on_request=on_request,
-                ))
+        # The control-flow signals raised from on_request; imported lazily to avoid a circular import
+        # (coverage imports this module at load time). Preferred over a generic error so a run that trips the
+        # budget AND hits an unrelated error in the same step still takes the budget/retry branch.
+        from API.FlightRadarAPI.coverage import _BudgetReached, JobCancelled
+
+        tasks = [asyncio.create_task(_run_unit(*u)) for u in units]
+        if not tasks:
+            return flights
+        # Stop the whole fetch the moment a unit raises (budget reached / job cancelled / unexpected error) —
+        # matching the old serial loop, which aborted the call on the first exception. FIRST_EXCEPTION also
+        # returns when ALL finish cleanly. We RE-RAISE the ORIGINAL single exception (never an ExceptionGroup),
+        # so fetch_planned_ranges' `except _BudgetReached / JobCancelled / Exception` keep working. The
+        # try/finally guarantees NO child task is left orphaned — not only when a unit raises, but also if
+        # this coroutine is cancelled externally (worker shutdown / ARQ abort), which asyncio.wait does NOT
+        # clean up on its own.
+        try:
+            done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+            # Retrieve EVERY finished exception (so none is "never retrieved"), then prefer a control-flow
+            # signal over a generic error; the choice is deterministic instead of set-iteration order.
+            exceptions = [t.exception() for t in done if not t.cancelled() and t.exception() is not None]
+            first_exc = next((e for e in exceptions if isinstance(e, (_BudgetReached, JobCancelled))),
+                             exceptions[0] if exceptions else None)
+            if first_exc is not None:
+                raise first_exc
+            flights.extend(t.result() for t in tasks)
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         logger.info("[Flight Summary] Query Fetch All Ranges completed")
 
