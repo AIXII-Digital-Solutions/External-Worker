@@ -9,13 +9,19 @@ COVERAGE_REVALIDATE_DAYS — the recent tail stays re-fetchable so a lagging sou
 caught. This keeps the ledger from ever running ahead of the real data and blocking the catch-up fetch.
 
 Two phases, kept SEPARATE so the panel can show them as distinct steps:
-  * plan_missing_ranges  — STEP 1 "searching": pure DB/planning, spends NO API budget. Seeds the ledger,
-                           computes each tail's missing ranges, clusters them into batched groups.
+  * plan_missing_ranges  — STEP 1 "searching": pure DB/planning, spends NO API budget. Folds in what we
+                           already hold, computes each tail's missing ranges, clusters them into batches.
   * fetch_planned_ranges — STEP 2 "fetching": spends API budget, newest-first, records each range.
 
-Bootstrap (a reg with no ledger row yet): seed the ledger from the reg's existing flightsummary days,
-coalescing no-fly gaps shorter than FLIGHT_RADAR_COVERAGE_GAP_DAYS into a covered span. Longer internal
-gaps stay UNCOVERED and get fetched once (then recorded, so a genuinely-empty stretch is not re-fetched).
+THE TOKEN INVARIANT: we never re-fetch a day we already have data for. FR24 bills per RETURNED ROW, before
+our de-dup, so re-fetching a covered range re-pays for rows we own. plan_missing_ranges therefore complements
+the request window against (ledger ∪ the tail's own flightsummary days) — so a range whose data we hold is
+never planned, even if the LEDGER never recorded it (a partial/empty ledger over bulk-loaded history would
+otherwise re-bill the whole company). A never-fetched tail has no data to fold, so its window is fetched in
+full — genuinely-new data is still paid for, which is the point. The tail's data-days are coalesced across
+no-fly gaps shorter than FLIGHT_RADAR_COVERAGE_GAP_DAYS (we hold data on both sides, so the tiny gap is
+assumed seen); the ledger's OWN gaps are never bridged (a genuinely un-fetched stretch stays fetchable). The
+fold is capped at the finalize cut, so the recent tail stays re-fetchable for late-arriving flights.
 """
 import time
 from datetime import date, timedelta
@@ -107,19 +113,25 @@ async def _covered(session, reg):
     return [(r[0], r[1]) for r in rows]
 
 
-async def _seed_if_absent(session, reg, gap_days):
-    """Seed the ledger from existing flightsummary days if the reg has no ledger rows yet."""
-    if (await session.execute(text(f"SELECT 1 FROM {_TBL} WHERE reg = :r LIMIT 1"), {"r": reg})).first():
-        return
-    days = (await session.execute(
-        text("SELECT DISTINCT first_seen::date FROM flightradar.flightsummary WHERE reg = :r ORDER BY 1"),
-        {"r": reg})).scalars().all()
-    if not days:
-        return  # no data -> no coverage; the whole window is a gap
-    for f, t in _coalesce([(d, d) for d in days], max_gap_days=gap_days):
-        await session.execute(
-            text(f"INSERT INTO {_TBL}(reg, covered_from, covered_to) VALUES (:r, :f, :t) "
-                 "ON CONFLICT (reg, covered_from) DO NOTHING"), {"r": reg, "f": f, "t": t})
+async def _data_days(session, regs, w_start, w_end, up_to):
+    """The days each reg ALREADY has flightsummary rows on, within [w_start, min(w_end, up_to)] — one bulk
+    query for the whole batch. A day with data is, by definition, already fetched: including it in the
+    covered set makes re-billing it structurally impossible, no matter what the ledger says. Capped at
+    `up_to` (the finalize cut) so the recent tail is NOT folded — recent days stay re-fetchable to catch
+    late-arriving flights (same window the ledger's empty-finalization respects)."""
+    hi = min(w_end, up_to)
+    out: dict = {}
+    if hi < w_start or not regs:
+        return out
+    rows = (await session.execute(text(
+        "SELECT reg, first_seen::date AS d "
+        "FROM flightradar.flightsummary "
+        "WHERE reg = ANY(:regs) AND first_seen::date BETWEEN :f AND :t "
+        "GROUP BY reg, first_seen::date ORDER BY 1, 2"),
+        {"regs": list(regs), "f": w_start, "t": hi})).all()
+    for reg, d in rows:
+        out.setdefault(reg, []).append(d)
+    return out
 
 
 async def _record(session, reg, f, t):
@@ -140,14 +152,23 @@ async def plan_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_d
                               on_progress=None, should_cancel=None) -> dict:
     """STEP 1 (spends NO API budget): plan what must be fetched.
 
-    Seed each tail's coverage ledger if absent, compute its MISSING date ranges within [w_start, w_end],
-    and GROUP tails by an identical (from, to) gap so tails sharing a range (typically the common trailing
-    gap) are fetched in ONE batched request. Near-identical ranges (±_MERGE_TOL_DAYS) are merged into
+    For each tail, complement [w_start, w_end] against (ledger ∪ days we already hold) to get its MISSING
+    ranges, then GROUP tails by an identical (from, to) gap so tails sharing a range (typically the common
+    trailing gap) are fetched in ONE batched request. Near-identical ranges (±_MERGE_TOL_DAYS) are merged into
     batched clusters, newest first. Returns {plan, total_requests, regs, groups}.
     `on_progress(done, total)` reports tails planned (for the live step-1 fraction)."""
     gap_days = FLIGHT_RADAR_COVERAGE_GAP_DAYS if gap_days is None else gap_days
     regs = [r for r in regs if r]   # drop NULL/empty registrations — cannot be fetched from FR24
     total = len(regs)
+
+    # The days each tail ALREADY holds are folded into its covered set below, so a range we already have is
+    # never re-planned (hence never re-billed) — regardless of whether the ledger recorded it. This is the
+    # token guarantee: on a partial/empty ledger over data we hold, the plan collapses to genuinely-missing
+    # ranges only; a never-fetched tail (no data) folds nothing and is fetched in full, as it should be.
+    # Folded only up to the finalize cut (recent tail stays re-fetchable for late flights).
+    finalize_cut = date.today() - timedelta(days=1 + COVERAGE_REVALIDATE_DAYS)
+    async with db_client.session("flightradar") as s:
+        data_days = await _data_days(s, regs, w_start, w_end, finalize_cut)
 
     groups: dict = {}   # (gf, gt) -> [regs]
     for i, reg in enumerate(regs):
@@ -155,10 +176,15 @@ async def plan_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_d
             raise JobCancelled()
         try:
             async with db_client.session("flightradar") as s:
-                await _seed_if_absent(s, reg, gap_days)
-                await s.commit()
                 covered = await _covered(s, reg)
-            for gf, gt in _complement(covered, w_start, w_end):
+            # Bridge only the DATA-days with gap_days (short no-fly gaps between real flights — we hold data on
+            # both sides, so assuming the tiny gap is "seen" is safe and saves empty requests). Do NOT bridge
+            # the ledger's own gaps: a gap between two ledger ranges is a genuinely un-fetched stretch and must
+            # stay fetchable — so union with the ledger at gap=1 (touching/overlapping only). Mirrors the old
+            # bootstrap seed, but applied every run and to the plan directly.
+            data_ranges = _coalesce([(d, d) for d in data_days.get(reg, ())], max_gap_days=gap_days)
+            folded = _coalesce(covered + data_ranges, max_gap_days=1)
+            for gf, gt in _complement(folded, w_start, w_end):
                 groups.setdefault((gf, gt), []).append(reg)
         except JobCancelled:
             raise
@@ -209,9 +235,14 @@ async def fetch_planned_ranges(db_client, plan, total_requests: int, time_budget
             incomplete = True
             break
         try:
-            # end_date is EXCLUSIVE-of-next-day so a single-day gap has from < to (FR24 else 400s).
+            # Upper bound = END of gt (gt 23:59:59), NOT the next day's midnight. The old `gt + 1 day` made
+            # the request's flight_datetime_to land on the NEXT calendar day, so a gap ending on real-yesterday
+            # asked FR24 for TODAY (00:00:00) — a day the source cannot return yet (today is incomplete). Using
+            # gt's end-of-day keeps from < to for a single-day gap (FR24 400s on from == to) while never
+            # emitting today. gt is already <= today-1 (the plan's w_end), so the max queried instant is
+            # yesterday 23:59:59.
             await fetch_all_ranges(start_date=gf.isoformat(),
-                                   end_date=(gt + timedelta(days=1)).isoformat(),
+                                   end_date=f"{gt.isoformat()} 23:59:59",
                                    registrations=list(grp_regs), storage_mode="db",
                                    on_request=_on_request)
         except _BudgetReached:
