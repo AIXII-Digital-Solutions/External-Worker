@@ -945,14 +945,20 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
 
         # ── 10/10 Rendering report — refresh the report rollup, record the run, finalise the dataset. ─
         await reporter.enter("rendering")
-        # acys_summary_grouped is a MATERIALIZED view (the report reads a physical rollup instead of
-        # re-aggregating acys_summary_by_day on every query), so it MUST be refreshed now that
-        # acys_summary_by_day has just been filled — otherwise the report still serves the PREVIOUS run.
-        # Not best-effort: a stale rollup is a wrong report, so let it fail loudly.
-        # Only an owner (or a member of the owning role) may REFRESH: the matview is owned by
-        # grp_aviation_write, which this connection's role belongs to.
+        # The report reads FOUR materialized views instead of re-aggregating on every query, so all four MUST
+        # be refreshed now that acys_summary_by_day has just been filled — otherwise the report still serves
+        # the PREVIOUS run. Refresh in DEPENDENCY ORDER (each matview reads the one before it): grouped reads
+        # acys_summary_by_day; grouped_by_reg reads grouped; aircraft_information reads grouped_by_reg;
+        # z_dates_acys reads acys_summary_by_day. Plain (non-CONCURRENT) REFRESH — brief ACCESS EXCLUSIVE, as
+        # grouped always used. Not best-effort: a stale rollup is a wrong report, so let it fail loudly.
+        # Only an owner (or a member of the owning role) may REFRESH: all four are owned by grp_aviation_write,
+        # which this connection's role belongs to.
         async with db_client.session(_DB) as s:
-            await s.execute(text("REFRESH MATERIALIZED VIEW forecast.acys_summary_grouped"))
+            for _mv in ("forecast.acys_summary_grouped",
+                        "forecast.acys_summary_grouped_by_reg",
+                        "forecast.aircraft_information",
+                        "powerbi.z_dates_acys"):
+                await s.execute(text(f"REFRESH MATERIALIZED VIEW {_mv}"))
             await s.commit()
         # best-effort: never fail a good run
         try:
