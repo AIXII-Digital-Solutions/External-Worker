@@ -642,6 +642,16 @@ def _cy2022_floor(as_of: date) -> date:
         return date(2022, as_of.month, 28)
 
 
+def _minus_one_month(d: date) -> date:
+    """One calendar month earlier, day-clamped to the target month's length. Used as a delivery-date buffer:
+    an aircraft occasionally starts flying a few weeks before its recorded delivery date, so the per-tail
+    fetch window opens a month ahead of delivery to catch that."""
+    y, m = (d.year, d.month - 1) if d.month > 1 else (d.year - 1, 12)
+    dim = [31, 29 if y % 4 == 0 and (y % 100 != 0 or y % 400 == 0) else 28,
+           31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]
+    return date(y, m, min(d.day, dim))
+
+
 def _scope(operator, registrations):
     """Return (a5_where, hist_delete_sql, final_scope, scope_params, label) for the request.
 
@@ -684,7 +694,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
     # per operator) would let a portal edit landing mid-run split the output — actuals assembled at one
     # pax_load_factor, the forecast projected at another. One run, one parameter set.
     params, profile_label = await load_params(db_client, profile=profile)
-    logger.info("forecast panel: профиль параметров %r", profile_label)
+    logger.info("forecast panel: parameter profile %r", profile_label)
 
     base = {"start_date": params.history_start, "as_of": as_of,
             "anchor_month": as_of.month, "anchor_day": as_of.day,
@@ -821,9 +831,20 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         # ranges that cannot exist. (`_complement` fetches [w_start, w_end] inclusive, so the last queried
         # day is exactly today-1.)
         w_end = date.today() - timedelta(days=1)
+        # Per-tail fetch window: open it a MONTH before each tail's Cirium delivery date, not at the global
+        # w_start. A tail that entered service after w_start has no data before delivery, so fetching that
+        # pre-delivery stretch is thousands of 0-token requests confirming emptiness — this skips them. Tails
+        # with no delivery date (wet-lease / sisters not in the current roster) keep the global w_start.
+        async with db_client.session(_DB) as s:
+            deliv_rows = (await s.execute(text(
+                'SELECT "Registration" AS reg, min("Delivery Date")::date AS deliv '
+                'FROM cirium.ciriumaircrafts '
+                'WHERE "Registration" = ANY(:regs) AND "Delivery Date" IS NOT NULL '
+                'GROUP BY "Registration"'), {"regs": list(scope_regs)})).all()
+        reg_starts = {r.reg: _minus_one_month(r.deliv) for r in deliv_rows if r.deliv}
         plan_info = await plan_missing_ranges(
             db_client, list(scope_regs),
-            w_start=_cy2022_floor(as_of), w_end=w_end,
+            w_start=_cy2022_floor(as_of), w_end=w_end, reg_starts=reg_starts,
             on_progress=_plan_progress, should_cancel=_cancelled)
         d = await reporter.complete()
         await cal.record("coverage", d, n_regs, {"regs": n_regs, "groups": plan_info["groups"]})

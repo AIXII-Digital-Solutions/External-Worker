@@ -52,8 +52,8 @@ class ForecastParams:
 _SPEC_KEYS, _FIELD_NAMES = set(SPEC), {f.name for f in fields(ForecastParams)}
 if _SPEC_KEYS != _FIELD_NAMES:
     raise RuntimeError(
-        f"ForecastParams расходится с SPEC: только в спеке {_SPEC_KEYS - _FIELD_NAMES}, "
-        f"только в датаклассе {_FIELD_NAMES - _SPEC_KEYS}")
+        f"ForecastParams diverges from SPEC: spec-only {_SPEC_KEYS - _FIELD_NAMES}, "
+        f"dataclass-only {_FIELD_NAMES - _SPEC_KEYS}")
 
 _SELECT = ("SELECT name, model_version, params FROM forecast_profiles "
            "WHERE enabled AND {where} LIMIT 1")
@@ -79,19 +79,19 @@ async def load_params(db_client, *, profile: str | None = None) -> tuple[Forecas
     except Exception as e:
         if profile:
             raise
-        logger.warning("forecast_profiles недоступна (%s) — беру параметры по умолчанию", e)
-        return ForecastParams.defaults(), "defaults (профиль недоступен)"
+        logger.warning("forecast_profiles unavailable (%s) — using default parameters", e)
+        return ForecastParams.defaults(), "defaults (profile unavailable)"
 
     if row is None:
         if profile:
-            raise ForecastParamError(f"профиль прогноза {profile!r} не найден или выключен")
-        logger.warning("нет профиля по умолчанию в forecast_profiles — беру параметры по умолчанию")
-        return ForecastParams.defaults(), "defaults (профиль по умолчанию отсутствует)"
+            raise ForecastParamError(f"forecast profile {profile!r} not found or disabled")
+        logger.warning("no default profile in forecast_profiles — using default parameters")
+        return ForecastParams.defaults(), "defaults (no default profile)"
 
     name, version, overrides = row[0], row[1], row[2] or {}
     p = ForecastParams.from_overrides(overrides, model_version=version)
     if overrides:
-        logger.info("профиль прогноза %r (%s): переопределения %s", name, version, overrides)
+        logger.info("forecast profile %r (%s): overrides %s", name, version, overrides)
     return p, name
 
 
