@@ -957,6 +957,8 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             for _mv in ("forecast.acys_summary_grouped",
                         "forecast.acys_summary_grouped_by_reg",
                         "forecast.aircraft_information",
+                        "forecast.acys_origin_bucket",       # slicer lookups — read grouped, so AFTER it
+                        "forecast.acys_destination_bucket",
                         "powerbi.z_dates_acys"):
                 await s.execute(text(f"REFRESH MATERIALIZED VIEW {_mv}"))
             await s.commit()
