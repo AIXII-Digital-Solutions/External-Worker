@@ -72,9 +72,11 @@ class DatabaseClient:
         engine = self._get_engine(db_name)
         mode = "CONCURRENTLY " if concurrently else ""
         async with engine.connect() as conn:
-            await conn.execution_options(isolation_level="AUTOCOMMIT").execute(
-                text(f"REFRESH MATERIALIZED VIEW {mode}{qualified_view}")
-            )
+            # AsyncConnection.execution_options is a COROUTINE in SQLAlchemy 2.0 — it must be awaited before
+            # .execute (else `.execute` is looked up on the coroutine object -> AttributeError). It returns
+            # the connection with AUTOCOMMIT applied, so REFRESH runs outside any transaction.
+            conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+            await conn.execute(text(f"REFRESH MATERIALIZED VIEW {mode}{qualified_view}"))
 
     async def dispose(self):
         for engine in self._engines.values():
