@@ -24,6 +24,7 @@ assumed seen); the ledger's OWN gaps are never bridged (a genuinely un-fetched s
 fold is capped at the finalize cut, so the recent tail stays re-fetchable for late-arriving flights.
 """
 import time
+from collections import defaultdict
 from datetime import date, timedelta
 from math import ceil
 
@@ -54,30 +55,48 @@ class JobCancelled(Exception):
     """Raised from the per-request callback when the user requested cancellation of this job."""
 
 
-_MERGE_TOL_DAYS = 1   # gap-keys whose endpoints are within this many days are fetched as ONE batch
-
-
 def _estimate_requests(gf: date, gt: date) -> int:
     """Estimate the FR24 requests a gap costs: one per FLIGHT_RADAR_RANGE_DAYS-day chunk (>= 1)."""
     return max(1, ceil(((gt - gf).days + 1) / FLIGHT_RADAR_RANGE_DAYS))
 
 
-def _cluster_groups(groups: dict, tol_days: int):
-    """Merge (from, to) gap-keys whose BOTH endpoints are within `tol_days` of a cluster anchor into
-    one batched cluster. Returns [(gf_union, gt_union, [regs]), ...]: the union range is fetched once
-    for ALL the cluster's tails (e.g. trailing gaps [01-31..] and [02-01..] become a single request).
-    Recording the union per tail is correct — the batched request covers that union for every tail."""
-    clusters = []   # [anchor_gf, anchor_gt, gf_min, gt_max, set(regs)]
-    for gf, gt in sorted(groups):
-        regs = groups[(gf, gt)]
-        for cl in clusters:
-            if abs((gf - cl[0]).days) <= tol_days and abs((gt - cl[1]).days) <= tol_days:
-                cl[2], cl[3] = min(cl[2], gf), max(cl[3], gt)
-                cl[4].update(regs)
-                break
+def _segment_groups(groups: dict):
+    """Decompose the tails' missing intervals into MAXIMAL (from, to, [regs]) fetch groups so each request
+    carries as many tails AND as wide a range as possible without ever re-fetching a day a tail already has.
+
+    A line sweep over the timeline: every elementary date-segment is assigned EXACTLY the set of tails missing
+    it, then consecutive segments carrying the same tail-set are merged. Consequences (exactly the intended
+    behaviour):
+      * tails missing the SAME range are fetched together in one group;
+      * tails whose ranges only OVERLAP split at the overlap boundaries — the shared part becomes one group
+        for all of them, each private remainder its own group — so no tail re-pays for a day it already holds;
+      * a fleet never fetched (all tails missing the whole window) collapses to a SINGLE group of all tails
+        over the whole window, chunked 14 days × 15 tails — not one-reg-one-day fragments.
+
+    `groups` is {(gf, gt): [regs]} — one entry per tail's each missing interval. The 14-day / 15-tail chunking
+    and newest-first ordering happen in the caller. Runs in O(events log events)."""
+    starts, ends = defaultdict(list), defaultdict(list)   # date -> tails; end key is EXCLUSIVE (gt + 1 day)
+    for (gf, gt), regs in groups.items():
+        starts[gf].extend(regs)
+        ends[gt + timedelta(days=1)].extend(regs)
+
+    active, out, prev = set(), [], None
+    for d in sorted(set(starts) | set(ends)):
+        if prev is not None and active:
+            out.append([prev, d - timedelta(days=1), frozenset(active)])
+        for reg in ends.get(d, ()):        # ends before starts, so a same-day hand-off keeps the tail active
+            active.discard(reg)
+        for reg in starts.get(d, ()):
+            active.add(reg)
+        prev = d
+
+    merged = []   # coalesce touching segments that carry an identical tail-set
+    for s, e, rs in out:
+        if merged and merged[-1][2] == rs and (s - merged[-1][1]).days == 1:
+            merged[-1][1] = e
         else:
-            clusters.append([gf, gt, gf, gt, set(regs)])
-    return [(cl[2], cl[3], sorted(cl[4])) for cl in clusters]
+            merged.append([s, e, rs])
+    return [(s, e, sorted(rs)) for s, e, rs in merged]
 
 
 def _coalesce(ranges, max_gap_days):
@@ -149,15 +168,22 @@ async def _record(session, reg, f, t):
 
 
 async def plan_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_days: int = None,
-                              on_progress=None, should_cancel=None) -> dict:
+                              on_progress=None, should_cancel=None, reg_starts: dict = None) -> dict:
     """STEP 1 (spends NO API budget): plan what must be fetched.
 
-    For each tail, complement [w_start, w_end] against (ledger ∪ days we already hold) to get its MISSING
-    ranges, then GROUP tails by an identical (from, to) gap so tails sharing a range (typically the common
-    trailing gap) are fetched in ONE batched request. Near-identical ranges (±_MERGE_TOL_DAYS) are merged into
-    batched clusters, newest first. Returns {plan, total_requests, regs, groups}.
+    For each tail, complement [its start, w_end] against (ledger ∪ days we already hold) to get its MISSING
+    ranges, then `_segment_groups` decomposes all tails' missing intervals into MAXIMAL (from, to, [tails])
+    fetch groups — each request carries as many tails and as wide a range as possible, tails sharing a range
+    batch together, overlaps split so no day is re-fetched. Sorted newest-first. Returns
+    {plan, total_requests, regs, groups}.
+
+    `reg_starts` optionally gives a PER-TAIL window start (e.g. delivery-date − buffer): the tail's window
+    becomes [max(w_start, reg_starts[reg]), w_end]. This skips the empty pre-delivery stretch of a tail that
+    entered service after w_start — a big fleet of young aircraft would otherwise spend thousands of 0-token
+    requests confirming those pre-delivery windows empty. Tails absent from the map use the global w_start.
     `on_progress(done, total)` reports tails planned (for the live step-1 fraction)."""
     gap_days = FLIGHT_RADAR_COVERAGE_GAP_DAYS if gap_days is None else gap_days
+    reg_starts = reg_starts or {}
     regs = [r for r in regs if r]   # drop NULL/empty registrations — cannot be fetched from FR24
     total = len(regs)
 
@@ -184,7 +210,10 @@ async def plan_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_d
             # bootstrap seed, but applied every run and to the plan directly.
             data_ranges = _coalesce([(d, d) for d in data_days.get(reg, ())], max_gap_days=gap_days)
             folded = _coalesce(covered + data_ranges, max_gap_days=1)
-            for gf, gt in _complement(folded, w_start, w_end):
+            ws = max(w_start, reg_starts.get(reg, w_start))   # per-tail start (delivery − buffer), never < w_start
+            if ws > w_end:
+                continue   # delivered after the window (no data can exist yet) — nothing to fetch
+            for gf, gt in _complement(folded, ws, w_end):
                 groups.setdefault((gf, gt), []).append(reg)
         except JobCancelled:
             raise
@@ -196,7 +225,7 @@ async def plan_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_d
             except Exception:
                 pass
 
-    plan = _cluster_groups(groups, _MERGE_TOL_DAYS)
+    plan = _segment_groups(groups)
     plan.sort(key=lambda c: c[1], reverse=True)
     total_requests = sum(_estimate_requests(gf, gt) * ceil(len(rs) / FLIGHT_RADAR_MAX_REG_PER_BATCH)
                          for gf, gt, rs in plan)

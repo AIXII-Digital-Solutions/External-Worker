@@ -34,86 +34,88 @@ MODEL_VERSION = "acys-v1"
 # type: "int" | "float" | "date". min/max are INCLUSIVE and enforced by resolve().
 # label/description are what the portal shows; group orders the form into sections.
 SPEC: dict[str, dict] = {
-    # ── История ───────────────────────────────────────────────────────────────────────────────────
+    # ── History ─────────────────────────────────────────────────────────────────────────────────────
     "history_start": {
-        "type": "date", "default": "2022-07-01", "group": "История",
-        "label": "Начало истории",
-        "description": "Факты раньше этой даты не участвуют в прогнозе вообще. Жёсткая отсечка: "
-                       "не позволяет затянуть в модель пост-ковидный разгон 2021-2022.",
+        "type": "date", "default": "2022-07-01", "group": "History",
+        "label": "History start",
+        "description": "Facts before this date do not take part in the forecast at all. A hard cutoff: it "
+                       "keeps the post-COVID 2021-2022 ramp-up from being pulled into the model.",
     },
-    # ── Уровень (объём) ───────────────────────────────────────────────────────────────────────────
+    # ── Level (volume) ──────────────────────────────────────────────────────────────────────────────
     "level_window": {
-        "type": "int", "default": 15, "min": 3, "max": 36, "group": "Уровень (объём)",
-        "label": "Окно уровня, мес",
-        "description": "Сколько последних месяцев рассматривается при оценке уровня. Внутри окна остаются "
-                       "только ПОЛНЫЕ месяцы (см. «порог полноты»). Окно должно быть заметно длиннее "
-                       "отставания загрузки FR24 (сейчас ~5 мес), иначе в нём не останется ни одного полного "
-                       "месяца, эталон полноты будет взят из недогруженных, фильтр ослепнет и уровень "
-                       "занизится. Замерено бэктестом с симуляцией отставания: 3->22.6%, 6->20.9%, "
-                       "9->12.9%, 12->12.9%, 15->12.6%, 18->12.6%, 24->13.5% wMAPE. Обрыв между 6 и 9; "
-                       "плато 9-18; 24 уже тянет устаревший режим. 15 стоит по центру плато.",
+        "type": "int", "default": 15, "min": 3, "max": 36, "group": "Level (volume)",
+        "label": "Level window, months",
+        "description": "How many recent months are considered when estimating the level. Only COMPLETE "
+                       "months inside the window are kept (see 'month completeness threshold'). The window "
+                       "must be clearly longer than the FR24 ingestion lag (~5 months now), otherwise it "
+                       "holds no complete month, the completeness reference is taken from undercounted "
+                       "months, the filter goes blind and the level is understated. Measured by a backtest "
+                       "simulating the lag: 3->22.6%, 6->20.9%, 9->12.9%, 12->12.9%, 15->12.6%, 18->12.6%, "
+                       "24->13.5% wMAPE. Cliff between 6 and 9; plateau 9-18; 24 starts pulling in the stale "
+                       "regime. 15 sits at the centre of the plateau.",
     },
     "level_complete_frac": {
-        "type": "float", "default": 0.85, "min": 0.1, "max": 1.0, "group": "Уровень (объём)",
-        "label": "Порог полноты месяца",
-        "description": "Месяц окна считается ПОЛНЫМ, если его десезонализированный объём >= этой доли от "
-                       "эталона (0.75-квантиль окна). Ниже — месяц считается недогруженным FR24 и в оценку "
-                       "уровня не идёт. Понизить = впустить недогруженные месяцы и занизить прогноз.",
+        "type": "float", "default": 0.85, "min": 0.1, "max": 1.0, "group": "Level (volume)",
+        "label": "Month completeness threshold",
+        "description": "A window month counts as COMPLETE if its deseasonalized volume >= this fraction of "
+                       "the reference (the window's 0.75-quantile). Below it, the month is treated as "
+                       "FR24-undercounted and excluded from the level. Lowering it = admit undercounted "
+                       "months and understate the forecast.",
     },
     "level_l": {
-        "type": "int", "default": 3, "min": 1, "max": 12, "group": "Уровень (объём)",
-        "label": "Запасное окно уровня, мес",
-        "description": "Используется ТОЛЬКО как аварийный откат: когда истории меньше 3 месяцев или ни один "
-                       "месяц окна не прошёл порог полноты. Тогда уровень = медиана последних N месяцев как "
-                       "есть, без фильтрации.",
+        "type": "int", "default": 3, "min": 1, "max": 12, "group": "Level (volume)",
+        "label": "Fallback level window, months",
+        "description": "Used ONLY as an emergency fallback: when there are fewer than 3 months of history, "
+                       "or no window month passed the completeness threshold. Then the level = median of the "
+                       "last N months as-is, unfiltered.",
     },
-    # ── Сезонность ────────────────────────────────────────────────────────────────────────────────
+    # ── Seasonality ─────────────────────────────────────────────────────────────────────────────────
     "seas_k": {
-        "type": "float", "default": 3.0, "min": 0.0, "max": 24.0, "group": "Сезонность",
-        "label": "Сглаживание сезонности",
-        "description": "Стягивает сезонный коэффициент к 1.0 тем сильнее, чем меньше месяцев его "
-                       "подтверждают: вес = n / (n + K). Больше K = ровнее прогноз. Меньше = виднее "
-                       "сезонность, но тонкий растущий под-флот начинает принимать свой ранний разгон за "
-                       "сезонный провал. 3 — проверенный нижний предел, ниже появляется этот артефакт.",
+        "type": "float", "default": 3.0, "min": 0.0, "max": 24.0, "group": "Seasonality",
+        "label": "Seasonality smoothing",
+        "description": "Shrinks the seasonal factor toward 1.0 the more strongly the fewer months support "
+                       "it: weight = n / (n + K). Larger K = flatter forecast. Smaller = more visible "
+                       "seasonality, but a thin growing sub-fleet starts mistaking its early ramp-up for a "
+                       "seasonal trough. 3 is the proven lower bound; below it this artefact appears.",
     },
-    # ── Граница полноты данных ────────────────────────────────────────────────────────────────────
+    # ── Data frontier ───────────────────────────────────────────────────────────────────────────────
     "frontier_frac": {
-        "type": "float", "default": 0.6, "min": 0.1, "max": 1.0, "group": "Граница данных",
-        "label": "Порог границы покрытия",
-        "description": "Месяц считается покрытым, если его объём >= этой доли от медианы окна границы. "
-                       "Последний покрытый месяц — граница (frontier): по неё фитится история, с неё+1 "
-                       "начинается прогноз.",
+        "type": "float", "default": 0.6, "min": 0.1, "max": 1.0, "group": "Data frontier",
+        "label": "Coverage frontier threshold",
+        "description": "A month counts as covered if its volume >= this fraction of the frontier-window "
+                       "median. The last covered month is the frontier: history is fit up to it, and the "
+                       "forecast starts at frontier+1.",
     },
     "frontier_window": {
-        "type": "int", "default": 9, "min": 3, "max": 36, "group": "Граница данных",
-        "label": "Окно границы покрытия, мес",
-        "description": "Сколько последних месяцев берётся в медиану, относительно которой меряется порог "
-                       "границы покрытия.",
+        "type": "int", "default": 9, "min": 3, "max": 36, "group": "Data frontier",
+        "label": "Coverage frontier window, months",
+        "description": "How many recent months go into the median against which the coverage frontier "
+                       "threshold is measured.",
     },
-    # ── Структура рейсов ──────────────────────────────────────────────────────────────────────────
+    # ── Route structure ─────────────────────────────────────────────────────────────────────────────
     "min_route_pool": {
-        "type": "int", "default": 5, "min": 1, "max": 100, "group": "Структура рейсов",
-        "label": "Мин. размер маршрутного пула",
-        "description": "Если у под-флота в шаблонном месяце меньше стольких различных маршрутов, пул "
-                       "считается вырожденным и расширяется каскадом (суб-серия за всю историю -> "
-                       "мастер-серия за всю историю). Защищает от «весь месяц один борт летает одним "
-                       "маршрутом».",
+        "type": "int", "default": 5, "min": 1, "max": 100, "group": "Route structure",
+        "label": "Min. route-pool size",
+        "description": "If a sub-fleet's template month holds fewer than this many distinct routes, the pool "
+                       "is treated as degenerate and broadened by a cascade (sub-series all-history -> "
+                       "master-series all-history). Guards against 'one aircraft flying one route the whole "
+                       "month'.",
     },
-    # ── Горизонт и метрики ────────────────────────────────────────────────────────────────────────
+    # ── Horizon ─────────────────────────────────────────────────────────────────────────────────────
     "horizon_years": {
-        "type": "int", "default": 2, "min": 1, "max": 10, "group": "Горизонт",
-        "label": "Горизонт прогноза, лет",
-        "description": "Прогноз строится от границы покрытия до (дата запроса + N лет). Последний месяц "
-                       "пропорционально урезается по дню запроса — это же задаёт конец контрактного года.",
+        "type": "int", "default": 2, "min": 1, "max": 10, "group": "Horizon",
+        "label": "Forecast horizon, years",
+        "description": "The forecast runs from the coverage frontier to (request date + N years). The final "
+                       "month is prorated by the request day — which also sets the end of the contract year.",
     },
     "pax_load_factor": {
-        "type": "float", "default": 0.8, "min": 0.1, "max": 1.0, "group": "Горизонт",
-        "label": "Коэффициент загрузки (PAX)",
-        "description": "Total PAX = Total Seats * этот коэффициент. Применяется и к фактам, и к прогнозу.",
+        "type": "float", "default": 0.8, "min": 0.1, "max": 1.0, "group": "Horizon",
+        "label": "PAX load factor",
+        "description": "Total PAX = Total Seats * this factor. Applied to both actuals and forecast.",
     },
 }
 
-GROUPS = ["История", "Уровень (объём)", "Сезонность", "Граница данных", "Структура рейсов", "Горизонт"]
+GROUPS = ["History", "Level (volume)", "Seasonality", "Data frontier", "Route structure", "Horizon"]
 
 
 class ForecastParamError(ValueError):
@@ -135,17 +137,17 @@ def _coerce(name: str, value):
         if t == "int":
             # reject a float that is not integral rather than silently truncating a portal typo
             if isinstance(value, float) and not value.is_integer():
-                raise ValueError(f"{value} — не целое")
+                raise ValueError(f"{value} is not an integer")
             if isinstance(value, bool):
-                raise ValueError("ожидалось число")
+                raise ValueError("expected a number")
             return int(value)
         if t == "float":
             if isinstance(value, bool):
-                raise ValueError("ожидалось число")
+                raise ValueError("expected a number")
             return float(value)
     except (TypeError, ValueError) as e:
-        raise ForecastParamError(f"{name}: не удалось прочитать как {t} — {value!r} ({e})") from e
-    raise ForecastParamError(f"{name}: неизвестный тип {t!r} в спецификации")
+        raise ForecastParamError(f"{name}: could not read as {t} — {value!r} ({e})") from e
+    raise ForecastParamError(f"{name}: unknown type {t!r} in the spec")
 
 
 def resolve(overrides: dict | None, *, model_version: str | None = None) -> dict:
@@ -158,20 +160,20 @@ def resolve(overrides: dict | None, *, model_version: str | None = None) -> dict
     """
     if model_version is not None and model_version != MODEL_VERSION:
         raise ForecastParamError(
-            f"профиль записан для версии модели {model_version!r}, текущая — {MODEL_VERSION!r}")
+            f"profile was written for model version {model_version!r}, current is {MODEL_VERSION!r}")
     out = defaults()
     for name, raw in (overrides or {}).items():
         if name not in SPEC:
-            raise ForecastParamError(f"неизвестный параметр {name!r}; допустимые: {sorted(SPEC)}")
+            raise ForecastParamError(f"unknown parameter {name!r}; allowed: {sorted(SPEC)}")
         if raw is None:                      # explicit null == "use the default"
             continue
         val = _coerce(name, raw)
         spec = SPEC[name]
         lo, hi = spec.get("min"), spec.get("max")
         if lo is not None and val < lo:
-            raise ForecastParamError(f"{name}: {val} меньше минимума {lo}")
+            raise ForecastParamError(f"{name}: {val} is below the minimum {lo}")
         if hi is not None and val > hi:
-            raise ForecastParamError(f"{name}: {val} больше максимума {hi}")
+            raise ForecastParamError(f"{name}: {val} is above the maximum {hi}")
         out[name] = val
     _cross_check(out)
     return out
@@ -181,8 +183,8 @@ def _cross_check(p: dict) -> None:
     """Constraints no single field's min/max can express."""
     if p["level_l"] > p["level_window"]:
         raise ForecastParamError(
-            f"level_l ({p['level_l']}) не может быть больше level_window ({p['level_window']}): "
-            "запасное окно не бывает шире основного")
+            f"level_l ({p['level_l']}) cannot exceed level_window ({p['level_window']}): "
+            "the fallback window is never wider than the main one")
 
 
 def describe() -> dict:
