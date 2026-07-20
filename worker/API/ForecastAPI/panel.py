@@ -1,6 +1,6 @@
 """Forecast data-prep panel — the production run (external-worker), with per-step status.
 
-Request modes: by **operator** and/or an explicit **registrations** list (UNION scope). Assembles
+Request modes: by one or more **operators** and/or an explicit **registrations** list (UNION scope). Assembles
 forecast.acys_actuals (Cirium × FR24, date-respecting) then merges into forecast.acys_summary
 (airport-enriched + route-grouped). Mirrors predictive/panel in Core-API (SQL vendored).
 
@@ -652,19 +652,19 @@ def _minus_one_month(d: date) -> date:
     return date(y, m, min(d.day, dim))
 
 
-def _scope(operator, registrations):
+def _scope(operators, registrations):
     """Return (a5_where, hist_delete_sql, final_scope, scope_params, label) for the request.
 
-    operator and registrations are COMBINABLE (either or both): the scope is the UNION —
-    the operator's tenure-scoped tails OR the explicit registrations. `ca."Operator"` uses the
+    operators (a LIST) and registrations are COMBINABLE (either or both): the scope is the UNION —
+    every listed operator's tenure-scoped tails OR the explicit registrations. `ca."Operator"` uses the
     array5 alias; the bare form (no alias) is reused for the acys_actuals DELETE and the final filter.
     """
     a5, bare, params, labels = [], [], {}, []
-    if operator:
-        a5.append('ca."Operator" = :scope_op')
-        bare.append('"Operator" = :scope_op')
-        params["scope_op"] = operator
-        labels.append(f"operator '{operator}'")
+    if operators:
+        a5.append('ca."Operator" = ANY(:scope_ops)')
+        bare.append('"Operator" = ANY(:scope_ops)')
+        params["scope_ops"] = list(operators)
+        labels.append(f"{len(operators)} operator(s): " + ", ".join(operators))
     if registrations:
         a5.append('ca."Registration" = ANY(:scope_regs)')
         bare.append('"Registration" = ANY(:scope_regs)')
@@ -680,15 +680,18 @@ def _scope(operator, registrations):
 
 
 async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
-                             operator: str | None = None, registrations: list[str] | None = None,
+                             operators: list[str] | None = None, registrations: list[str] | None = None,
                              as_of: date | None = None, profile: str | None = None) -> dict:
-    """Run the forecast panel for ONE request (operator and/or registrations), publishing a status
-    per step. acys_actuals accumulates (this scope refreshed); acys_forecast/acys_summary per-request.
-    `profile` names a row in service.forecast_profiles; omitted, the default profile is used."""
-    if not operator and not registrations:
-        raise ValueError("provide operator and/or registrations")
+    """Run the forecast panel for ONE request (one or more operators and/or a registrations list),
+    publishing a status per step. The scope is the UNION of every operator's tails and the explicit
+    registrations; each operator is forecast in turn (step 8). acys_actuals accumulates (this scope
+    refreshed); acys_forecast/acys_summary per-request. `profile` names a row in service.forecast_profiles;
+    omitted, the default profile is used."""
+    operators = [o for o in (operators or []) if o and o.strip()] or None
+    if not operators and not registrations:
+        raise ValueError("provide operators and/or registrations")
     as_of = as_of or date.today()
-    a5_where, hist_delete, final_scope, scope_params, label = _scope(operator, registrations)
+    a5_where, hist_delete, final_scope, scope_params, label = _scope(operators, registrations)
 
     # Load the tuning profile ONCE, up front, and use it for every step of this run. Reloading it per step (or
     # per operator) would let a portal edit landing mid-run split the output — actuals assembled at one
@@ -919,10 +922,11 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         # ── 8/10 Generating forecast — project forward per operator. ─────────────────────────────────
         await _ck()
         from API.ForecastAPI.model import run_forecast_model   # lazy: model imports panel helpers
-        # forecast per operator in scope: the explicit operator, else the operators of the scoped tails
+        # forecast per operator in scope: the explicit operators, else the operators of the scoped tails
+        # (registrations-only request). Multi-operator requests forecast each one in turn below.
         async with db_client.session(_DB) as s:
-            if operator:
-                fc_ops = [operator]
+            if operators:
+                fc_ops = list(operators)
             else:
                 fc_ops = (await s.execute(
                     text(f'SELECT DISTINCT "Operator" FROM forecast.acys_actuals WHERE {final_scope} '
@@ -990,7 +994,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                     text("INSERT INTO forecast_last_requests (request_type, request_params) "
                          "VALUES (:rt, CAST(:params AS jsonb))"),
                     {"rt": _REQUEST_TYPE, "params": json.dumps({
-                        "operator": operator,
+                        "operators": list(operators) if operators else None,
                         "registrations": list(registrations) if registrations else None,
                         "date": as_of.isoformat(),
                     })})

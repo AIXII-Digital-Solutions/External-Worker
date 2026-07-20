@@ -80,17 +80,20 @@ async def refresh_subscription(ctx, subscription_id: str | None = None):
 
 # NOT @status_task-wrapped: it publishes its OWN sequential per-step statuses (validating ->
 # preparing -> fr24 check -> assembling -> merging -> done) so the portal can render progress live.
-async def forecast_panel(ctx, operator: str | None = None, registrations: list[str] | None = None,
-                         as_of: str | None = None, profile: str | None = None,
-                         correlation_id=None, **_):
+async def forecast_panel(ctx, operators: list[str] | None = None, operator: str | None = None,
+                         registrations: list[str] | None = None, as_of: str | None = None,
+                         profile: str | None = None, correlation_id=None, **_):
     from datetime import date
     _as_of = date.fromisoformat(as_of) if as_of else None
+    # Accept both the new `operators` list and the legacy single `operator` (an in-flight enqueue from an
+    # older core-api during a rolling deploy) — merge into one list.
+    all_ops = list(operators or []) + ([operator] if operator else [])
     await run_forecast_panel(
         db_client=ctx["db_client"],
         redis=ctx.get("redis_client"),
         job_id=ctx.get("job_id") or "forecast_panel",
         ref="forecast_panel",
-        operator=operator,
+        operators=all_ops or None,
         registrations=registrations,
         as_of=_as_of,
         profile=profile,      # names a service.forecast_profiles row; None -> the default profile
