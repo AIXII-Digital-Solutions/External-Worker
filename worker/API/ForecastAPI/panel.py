@@ -1005,8 +1005,9 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         await cal.record("rendering", d, 1, {"final_rows": final_rows})
 
         summary = {
-            "mode": "+".join((["operator"] if operator else []) + (["registrations"] if registrations else [])),
-            "operator": operator, "registrations": list(registrations) if registrations else None,
+            "mode": "+".join((["operators"] if operators else []) + (["registrations"] if registrations else [])),
+            "operators": list(operators) if operators else None,
+            "registrations": list(registrations) if registrations else None,
             "as_of": as_of.isoformat(),
             "history_rows": history_rows, "future_aircraft": future_aircraft,
             "forecast_rows": forecast_rows, "final_rows": final_rows,
@@ -1027,7 +1028,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         except Exception:
             pass
         logger.info("forecast_panel cancelled (%s)", label)
-        return {"cancelled": True, "operator": operator,
+        return {"cancelled": True, "operators": list(operators) if operators else None,
                 "registrations": list(registrations) if registrations else None}
     except asyncio.CancelledError:
         # ARQ abort / worker shutdown: stop the heartbeat synchronously, publish 'cancelled' on a
