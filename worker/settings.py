@@ -124,6 +124,10 @@ FORECAST_BOOT_FORECAST_PER_OP_SECONDS: float = float(require_env("FORECAST_BOOT_
 # next run). The ARQ job timeout must exceed this budget + the assemble/merge time.
 FORECAST_FETCH_BUDGET_SECONDS: float = float(require_env("FORECAST_FETCH_BUDGET_SECONDS", 1500))
 FORECAST_JOB_TIMEOUT_SECONDS: int = int(require_env("FORECAST_JOB_TIMEOUT_SECONDS", 1800))
+# Cirium matview refreshes (delta/asg/all_/historical_) rebuild CONCURRENTLY over the full revision
+# history; with large full-fleet snapshots they exceed arq's default 300s job timeout (delta/plantype
+# time out). Give the heavy cirium refresh cron jobs their own longer timeout (main.py WorkerSettings).
+CIRIUM_REFRESH_JOB_TIMEOUT_SECONDS: int = int(require_env("CIRIUM_REFRESH_JOB_TIMEOUT_SECONDS", 1800))
 FLIGHT_RADAR_HEADERS: dict = {
     "Authorization": f"Bearer {FLIGHT_RADAR_API_KEY}",
     "Accept-Version": "v1",

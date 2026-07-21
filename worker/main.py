@@ -69,19 +69,31 @@ _CRON_JOBS = [
 ]
 
 
+# Cirium matview refreshes rebuild CONCURRENTLY over the full revision history; with large full-fleet
+# snapshots delta/plantype exceed arq's default 300s job timeout, so they get their own longer timeout.
+_CIRIUM_REFRESH_JOBS = {
+    "cron_refresh_delta", "cron_refresh_plantype_matviews",
+    "cron_asg_regs", "cron_collapse_revisions",
+}
+
+
+def _register_job(f):
+    """Wrap a task for ARQ registration, applying a longer job timeout where the default 300s is too short."""
+    # forecast_panel does a bounded FR24 fetch that can exceed 300s; user-triggered + cancellable, so
+    # max_tries=1 — never auto-retry on interruption/cancel (that is what turned a cancelled run back on).
+    if f is tasks.forecast_panel:
+        return func(f, name="forecast_panel", timeout=settings.FORECAST_JOB_TIMEOUT_SECONDS, max_tries=1)
+    if getattr(f, "__name__", None) in _CIRIUM_REFRESH_JOBS:
+        return func(f, name=f.__name__, timeout=settings.CIRIUM_REFRESH_JOB_TIMEOUT_SECONDS)
+    return f
+
+
 class WorkerSettings:
     redis_settings = get_redis_settings()
     queue_name = EXTERNAL_QUEUE
     # ON_DEMAND: enqueued by core-api. SCHEDULED: enqueued by the dispatcher / run-now —
-    # both must be registered here so ARQ can resolve them by name. forecast_panel does a bounded
-    # FR24 fetch that can exceed arq's default 300s job timeout, so it gets its own longer timeout.
-    # max_tries=1: it is user-triggered and cancellable — never auto-retry on interruption/cancel
-    # (that is what turned a cancelled run back on), the user re-triggers if they want it again.
-    functions = [
-        func(f, name="forecast_panel", timeout=settings.FORECAST_JOB_TIMEOUT_SECONDS, max_tries=1)
-        if f is tasks.forecast_panel else f
-        for f in (list(tasks.ON_DEMAND) + list(tasks.SCHEDULED))
-    ]
+    # both must be registered here so ARQ can resolve them by name.
+    functions = [_register_job(f) for f in (list(tasks.ON_DEMAND) + list(tasks.SCHEDULED))]
     cron_jobs = _CRON_JOBS if SCHEDULER_ENABLED else []
     max_jobs = MAX_JOBS                       # concurrent jobs per process (env MAX_JOBS)
     allow_abort_jobs = True                   # lets core-api POST /status/{job_id}/cancel abort a run
