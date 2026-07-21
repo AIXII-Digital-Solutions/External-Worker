@@ -122,8 +122,8 @@ FORECAST_BOOT_FORECAST_PER_OP_SECONDS: float = float(require_env("FORECAST_BOOT_
 # The FR24 fetch is BOUNDED per forecast run: after this many seconds the panel stops fetching and
 # proceeds with what it has (the coverage ledger keeps the fetched ranges; the rest are fetched on the
 # next run). The ARQ job timeout must exceed this budget + the assemble/merge time.
-FORECAST_FETCH_BUDGET_SECONDS: float = float(require_env("FORECAST_FETCH_BUDGET_SECONDS", 1500))
-FORECAST_JOB_TIMEOUT_SECONDS: int = int(require_env("FORECAST_JOB_TIMEOUT_SECONDS", 3600))
+FORECAST_FETCH_BUDGET_SECONDS: float = float(require_env("FORECAST_FETCH_BUDGET_SECONDS", 3600))
+FORECAST_JOB_TIMEOUT_SECONDS: int = int(require_env("FORECAST_JOB_TIMEOUT_SECONDS", 4200))
 # Cirium matview refreshes (delta/asg/all_/historical_) rebuild CONCURRENTLY over the full revision
 # history; with large full-fleet snapshots they exceed arq's default 300s job timeout (delta/plantype
 # time out). Give the heavy cirium refresh cron jobs their own longer timeout (main.py WorkerSettings).
