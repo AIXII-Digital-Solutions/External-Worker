@@ -21,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from Config import setup_logger
-from Queue import EXTERNAL_QUEUE
+from Queue import EXTERNAL_QUEUE, ROBOT_QUEUE
 from Database import ScheduleEntry
 
 logger = setup_logger("scheduler")
@@ -30,6 +30,16 @@ logger = setup_logger("scheduler")
 # Default schedule for each schedulable job — seeded into schedule_registry on startup
 # (insert-if-absent; operator edits via core-api are never overwritten).
 # Exactly one of interval_seconds / cron_expr should be set per entry.
+#
+# TIMEZONE: cron_expr is evaluated in UTC (the dispatcher advances next_run_at from
+# datetime.now(timezone.utc)). Operational target is Asia/Dubai (UTC+4, no DST), so a
+# Dubai wall-clock time T maps to cron hour (T - 4). The Monday-morning Cirium chain runs
+# after the scraper robot drops fresh files:
+#   05:00 Dubai  scrape robot  -> "0 1 * * 1"   (core:robot, seeded paused until deployed)
+#   06:00 Dubai  collapse      -> "0 2 * * *"   (daily; the Monday run leads the chain)
+#   07:00 Dubai  asg           -> "0 3 * * 1"
+#   07:30 Dubai  delta         -> "30 3 * * 1"
+#   08:00 Dubai  plantype      -> "0 4 * * 1"
 SCHEDULE_DEFAULTS = [
     {
         "name": "cron_live_flights",
@@ -40,11 +50,24 @@ SCHEDULE_DEFAULTS = [
         "description": "FlightRadar live-flights adaptive poll tick.",
     },
     {
+        "name": "cron_scrape_cirium",
+        "queue": ROBOT_QUEUE,               # dedicated queue consumed only by the scraper robot
+        "func_name": "scrape_cirium",
+        "interval_seconds": None,
+        "cron_expr": "0 1 * * 1",           # Mondays 05:00 Dubai (01:00 UTC) — before the refresh chain
+        "enabled": True,
+        "paused": True,                     # seeded PAUSED: the robot is a separate service; unpause
+                                            # via core-api /scheduler once the robot worker is deployed
+                                            # and consuming core:robot (else jobs pile up unconsumed).
+        "description": "Trigger the external Cirium scraper robot (uploads Commercial + "
+                       "Business&Helicopters exports to /files). Robot lives in its own repo.",
+    },
+    {
         "name": "cron_asg_regs",
         "queue": EXTERNAL_QUEUE,
         "func_name": "cron_asg_regs",
         "interval_seconds": None,
-        "cron_expr": "0 9 * * 1",           # Mondays 09:00
+        "cron_expr": "0 3 * * 1",           # Mondays 07:00 Dubai (03:00 UTC)
         "description": "Refresh cirium.asg + sync ASG registrations (Cirium -> main).",
     },
     {
@@ -52,9 +75,9 @@ SCHEDULE_DEFAULTS = [
         "queue": EXTERNAL_QUEUE,
         "func_name": "cron_refresh_delta",
         "interval_seconds": None,
-        "cron_expr": "30 9 * * 1",          # Mondays 09:30 — AFTER cron_asg_regs (09:00) so the
-                                            # two heavy ciriumaircrafts scans don't run together.
-                                            # Set to "0 9 * * 1" to refresh in parallel instead.
+        "cron_expr": "30 3 * * 1",          # Mondays 07:30 Dubai (03:30 UTC) — AFTER cron_asg_regs
+                                            # (07:00) so the two heavy ciriumaircrafts scans don't
+                                            # run together. Set to "0 3 * * 1" to refresh in parallel.
         "description": "Refresh cirium.delta materialized view (after the ASG refresh).",
     },
     {
@@ -62,8 +85,9 @@ SCHEDULE_DEFAULTS = [
         "queue": EXTERNAL_QUEUE,
         "func_name": "cron_collapse_revisions",
         "interval_seconds": None,
-        "cron_expr": "0 6 * * *",           # daily 06:00 — collapse any completed-month live
-                                            # revisions per plan_type (no-op until a month rolls over)
+        "cron_expr": "0 2 * * *",           # daily 06:00 Dubai (02:00 UTC) — collapse any completed-
+                                            # month live revisions per plan_type (no-op until a month
+                                            # rolls over). The Monday run leads the refresh chain.
         "description": "Collapse completed-month live Cirium revisions per plan_type "
                        "(cirium.collapse_completed_months) + refresh all_* matviews.",
     },
@@ -72,7 +96,7 @@ SCHEDULE_DEFAULTS = [
         "queue": EXTERNAL_QUEUE,
         "func_name": "cron_refresh_plantype_matviews",
         "interval_seconds": None,
-        "cron_expr": "0 10 * * 1",          # Mondays 10:00 — after asg (09:00) / delta (09:30)
+        "cron_expr": "0 4 * * 1",           # Mondays 08:00 Dubai (04:00 UTC) — after asg / delta
         "description": "Weekly refresh of cirium.all_* + historical_* aircraft-data matviews.",
     },
     {
@@ -130,7 +154,7 @@ async def seed_registry(db_client) -> None:
                     name=d["name"], queue=d["queue"], func_name=d["func_name"],
                     interval_seconds=d.get("interval_seconds"), cron_expr=d.get("cron_expr"),
                     description=d.get("description"),
-                    enabled=True, paused=False, run_now=False,
+                    enabled=d.get("enabled", True), paused=d.get("paused", False), run_now=False,
                 )
                 .on_conflict_do_nothing(index_elements=["name"])
             )
