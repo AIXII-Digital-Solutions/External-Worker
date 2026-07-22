@@ -13,6 +13,10 @@ from Config import DBSettings
 # Queue names (one per worker segment)
 FILE_QUEUE = "core:files"
 EXTERNAL_QUEUE = "core:external"
+# Dedicated queue for the external Cirium scraper robot (a separate service/repo). The
+# dispatcher enqueues scrape_cirium here; this worker never consumes it (its own queue_name
+# is EXTERNAL_QUEUE), so only the robot's ARQ worker picks it up.
+ROBOT_QUEUE = "core:robot"
 
 
 def get_redis_settings() -> RedisSettings:
@@ -26,4 +30,4 @@ def get_redis_settings() -> RedisSettings:
     )
 
 
-__all__ = ["FILE_QUEUE", "EXTERNAL_QUEUE", "get_redis_settings"]
+__all__ = ["FILE_QUEUE", "EXTERNAL_QUEUE", "ROBOT_QUEUE", "get_redis_settings"]
