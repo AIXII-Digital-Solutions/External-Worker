@@ -18,6 +18,11 @@ fastapi==0.136.1
 aiohttp==3.13.5
 orjson==3.11.9
 
+# zoneinfo data. AviationEdge returns naive LOCAL airport time, which the loader localises per
+# airport (API/AviationEdgeAPI/Timezones.py). Ships the IANA database with the venv so the
+# conversion does not depend on the host having /usr/share/zoneinfo (Windows never does).
+tzdata==2025.2
+
 # Scheduler dispatcher: parse cron_expr schedules in schedule_registry.
 # Optional at runtime — interval_seconds schedules work without it (dispatcher degrades
 # gracefully and logs a warning if a cron_expr row is present without croniter).
