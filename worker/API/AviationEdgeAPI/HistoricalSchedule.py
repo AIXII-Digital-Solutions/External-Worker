@@ -1,3 +1,12 @@
+"""AviationEdge ``flightsHistory`` loader -> ``aviationedge.historicalschedule``.
+
+TIMESTAMPS: the vendor returns naive LOCAL airport wall-clock time (``"2026-04-15t06:05:00.000"``),
+departure fields local to the DEPARTURE airport and arrival fields to the ARRIVAL one. Each is
+localised with its own airport's zone before storage — see ``Timezones.py``. Do NOT reintroduce
+``parse_dt``/``ensure_utc`` here: ``.astimezone()`` on a naive datetime silently interprets it in the
+HOST's zone, which is what mislabelled ~1.46M rows by -3h until core-api's
+``_admin/fix_aviationedge_timestamps.py`` repaired them.
+"""
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List
@@ -13,7 +22,12 @@ from settings import AVIATION_EDGE_API_KEY, AVIATION_EDGE_URL, AVIATION_EDGE_MAX
     AVIATION_EDGE_MAX_RANGE_DAYS, AVIATION_EDGE_PATH, AVIATION_EDGE_EXTRA_API_KEY
 from Database import DatabaseClient
 from Database.Models import HistoricalSchedule
-from Utils import parse_date_or_datetime, parse_dt, write_csv, performance_timer, ensure_utc
+from Utils import parse_date_or_datetime, write_csv, performance_timer
+
+try:
+    from .Timezones import load_zones, to_utc
+except ImportError:  # pragma: no cover - import shim for running as a script
+    from API.AviationEdgeAPI.Timezones import load_zones, to_utc
 
 
 logger = setup_logger("aviationedge_historical")
@@ -101,14 +115,23 @@ async def fetch_historical_schedule_chunk(
         airline_iata: Optional[str] = None,
         flight_num: Optional[str] = None,
         storage_mode: str = "db",
-        csv_path: Optional[Path] = None
+        csv_path: Optional[Path] = None,
+        zones: Optional[dict] = None
 ) -> int:
     """
     storage_mode:
         - db
         - csv
         - both
+
+    zones: IATA -> ZoneInfo (see Timezones.load_zones). AviationEdge returns naive LOCAL airport
+    time, so every timestamp is localised with the zone of ITS OWN endpoint — departure fields with
+    the departure airport's zone, arrival fields with the arrival airport's — and stored as UTC.
+    Passing zones=None loads them on demand (kept for standalone callers).
     """
+
+    if zones is None:
+        zones = await load_zones()
 
     params = {
         "key": AVIATION_EDGE_API_KEY,
@@ -164,6 +187,7 @@ async def fetch_historical_schedule_chunk(
         csv_rows = []
 
         parse_errors = 0
+        missing_zone_codes = set()
 
         for item in data:
 
@@ -177,9 +201,25 @@ async def fetch_historical_schedule_chunk(
                 codeshared_airline = codeshared.get("airline", {})
                 codeshared_flight = codeshared.get("flight", {})
 
-                departure_scheduled = ensure_utc(
-                    parse_dt(departure.get("scheduledTime"))
-                )
+                # AE gives each end its own local wall-clock time -> localise with that end's zone.
+                departure_iata = (departure.get("iataCode") or "").strip().lower() or None
+                arrival_iata = (arrival.get("iataCode") or "").strip().lower() or None
+                departure_zone = zones.get(departure_iata) if departure_iata else None
+                arrival_zone = zones.get(arrival_iata) if arrival_iata else None
+                if departure_iata and departure_zone is None:
+                    missing_zone_codes.add(departure_iata)
+                if arrival_iata and arrival_zone is None:
+                    missing_zone_codes.add(arrival_iata)
+
+                def dep_time(key):
+                    value, _ = to_utc(departure.get(key), departure_zone)
+                    return value
+
+                def arr_time(key):
+                    value, _ = to_utc(arrival.get(key), arrival_zone)
+                    return value
+
+                departure_scheduled = dep_time("scheduledTime")
 
                 row_data = {
                     # Base
@@ -194,18 +234,10 @@ async def fetch_historical_schedule_chunk(
                     "departure_delay": departure.get("delay"),
 
                     "departure_scheduled_time": departure_scheduled,
-                    "departure_estimated_time": ensure_utc(
-                        parse_dt(departure.get("estimatedTime"))
-                    ),
-                    "departure_actual_time": ensure_utc(
-                        parse_dt(departure.get("actualTime"))
-                    ),
-                    "departure_estimated_runway": ensure_utc(
-                        parse_dt(departure.get("estimatedRunway"))
-                    ),
-                    "departure_actual_runway": ensure_utc(
-                        parse_dt(departure.get("actualRunway"))
-                    ),
+                    "departure_estimated_time": dep_time("estimatedTime"),
+                    "departure_actual_time": dep_time("actualTime"),
+                    "departure_estimated_runway": dep_time("estimatedRunway"),
+                    "departure_actual_runway": dep_time("actualRunway"),
 
                     # Arrival
                     "arrival_iata_code": arrival.get("iataCode"),
@@ -215,21 +247,11 @@ async def fetch_historical_schedule_chunk(
                     "arrival_gate": arrival.get("gate"),
                     "arrival_delay": arrival.get("delay"),
 
-                    "arrival_scheduled_time": ensure_utc(
-                        parse_dt(arrival.get("scheduledTime"))
-                    ),
-                    "arrival_estimated_time": ensure_utc(
-                        parse_dt(arrival.get("estimatedTime"))
-                    ),
-                    "arrival_actual_time": ensure_utc(
-                        parse_dt(arrival.get("actualTime"))
-                    ),
-                    "arrival_estimated_runway": ensure_utc(
-                        parse_dt(arrival.get("estimatedRunway"))
-                    ),
-                    "arrival_actual_runway": ensure_utc(
-                        parse_dt(arrival.get("actualRunway"))
-                    ),
+                    "arrival_scheduled_time": arr_time("scheduledTime"),
+                    "arrival_estimated_time": arr_time("estimatedTime"),
+                    "arrival_actual_time": arr_time("actualTime"),
+                    "arrival_estimated_runway": arr_time("estimatedRunway"),
+                    "arrival_actual_runway": arr_time("actualRunway"),
 
                     # Airline
                     "airline_name": airline.get("name"),
@@ -317,6 +339,14 @@ async def fetch_historical_schedule_chunk(
                 f"Parse errors: {parse_errors}"
             )
 
+        if missing_zone_codes:
+            # Those airports' local times went in verbatim (labelled UTC) — visible, not silent.
+            logger.warning(
+                f"[Historical Schedule] No timezone for "
+                f"{len(missing_zone_codes)} airport(s), their times stored as-is: "
+                f"{', '.join(sorted(missing_zone_codes)[:20])}"
+            )
+
         return inserted
 
 
@@ -350,6 +380,10 @@ async def fetch_historical_schedules(
     """
 
     logger.info("[Historical Schedule] Starting fetch")
+
+    # Loaded once and shared by every chunk: AE timestamps are naive local airport time and must be
+    # localised per endpoint before storage (see Timezones). Raises if no source is reachable.
+    zones = await load_zones()
 
     start_dt = parse_date_or_datetime(start_date)
     end_dt = parse_date_or_datetime(end_date)
@@ -443,7 +477,8 @@ async def fetch_historical_schedules(
                                     airline_iata=airline_iata,
                                     http=http,
                                     storage_mode=storage_mode,
-                                    csv_path=csv_path
+                                    csv_path=csv_path,
+                                    zones=zones
                                 )
                             )
 
