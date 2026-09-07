@@ -59,7 +59,10 @@ from settings import (FORECAST_ASSEMBLE_ETA_SECONDS,
                       FORECAST_MERGE_ETA_SECONDS, FORECAST_FETCH_BUDGET_SECONDS,
                       FR24_SECONDS_PER_REQUEST_EST, FORECAST_PROGRESS_HEARTBEAT_SECONDS,
                       FORECAST_PROGRESS_MIN_INTERVAL_SECONDS, FORECAST_CALIB_WINDOW_DAYS,
-                      FORECAST_BOOT_SEARCH_SECONDS, FORECAST_BOOT_FORECAST_PER_OP_SECONDS)
+                      FORECAST_BOOT_SEARCH_SECONDS, FORECAST_BOOT_FORECAST_PER_OP_SECONDS,
+                      FORECAST_ETA_OVERRUN_TAIL, FORECAST_ETA_MEASURE_TRUST_FRACTION,
+                      FORECAST_ETA_FALL_ALPHA, FORECAST_ETA_RISE_ALPHA,
+                      FORECAST_ETA_MIN_BAND_SHARE)
 from status import publish_status
 
 from .params import load_params
@@ -704,18 +707,21 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             "cy2022_floor": _cy2022_floor(as_of),   # leap-safe CY2022 lower bound for _assemble_sql
             "pax_factor": params.pax_load_factor, **scope_params}
 
-    # ── Progress + ETA: an honest, self-calibrating FIVE-step model (no hardcoded step weights) ──────
-    # Pending steps are estimated from a moving average of past runs (forecast_step_timings) scaled by
+    # ── Progress + ETA: an honest, self-calibrating TEN-step model (no hardcoded step weights) ───────
+    # Pending steps are estimated from a high quantile of past runs (forecast_step_timings) scaled by
     # this run's unit count; completed steps use their measured wall time; a background heartbeat keeps
     # the bar and the countdown live even during a blocking SQL. Step titles + `detail` NEVER name a data
     # source. The frontend reads `message` + payload.{eta, detail, step, step_total, step_key}.
+    # The countdown is WHOLE-RUN (current step's remainder + every step still ahead), never per-step.
     from API.ForecastAPI.progress import Calibrator, ProgressReporter, Step
     from API.FlightRadarAPI.coverage import (plan_missing_ranges, fetch_planned_ranges,
                                              JobCancelled)   # lazy: avoid import cycle
 
-    # `weight` = each step's FIXED share of the visual bar so the two long steps (Fetching / Generating
-    # forecast) can't push the bar near 100% while earlier steps run; brief steps keep a small share.
-    # ETA stays time-based. Titles + detail NEVER name a data source.
+    # `weight` is only the FALLBACK share of the visual bar (used before any time estimate exists): the
+    # bar is normally banded by each step's share of the ESTIMATED TOTAL TIME, so it agrees with the
+    # countdown instead of telling a second, unrelated story. A step still fills only its own band, so a
+    # long step cannot push the bar near 100% while later steps remain.
+    # Titles + detail NEVER name a data source.
     steps = [
         Step("validating",    "Validating request",
              "Checking the request and matching the requested aircraft.", unit_based=False, weight=2),
@@ -780,7 +786,12 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
     ]
     reporter = ProgressReporter(publish=_pub, steps=steps, estimates=estimates,
                                 heartbeat_s=FORECAST_PROGRESS_HEARTBEAT_SECONDS,
-                                min_interval=FORECAST_PROGRESS_MIN_INTERVAL_SECONDS)
+                                min_interval=FORECAST_PROGRESS_MIN_INTERVAL_SECONDS,
+                                overrun_tail=FORECAST_ETA_OVERRUN_TAIL,
+                                measure_trust=FORECAST_ETA_MEASURE_TRUST_FRACTION,
+                                fall_alpha=FORECAST_ETA_FALL_ALPHA,
+                                rise_alpha=FORECAST_ETA_RISE_ALPHA,
+                                min_band_share=FORECAST_ETA_MIN_BAND_SHARE)
 
     try:
         await reporter.start()
@@ -814,7 +825,11 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         reporter.set_estimate("coverage",  cal.estimate("coverage", n_regs, boot_per_unit=0.03, boot_flat=FORECAST_BOOT_SEARCH_SECONDS))
         reporter.set_estimate("transform", cal.estimate("transform", n_regs, boot_per_unit=0.02, boot_flat=FORECAST_ASSEMBLE_ETA_SECONDS))
         reporter.set_estimate("measures",  cal.estimate("measures", n_regs, boot_per_unit=0.005, boot_flat=3))
-        reporter.set_estimate("merging",   cal.estimate("merging", n_regs, boot_per_unit=0.02, boot_flat=FORECAST_MERGE_ETA_SECONDS))
+        # NOT scaled by n_regs: `merging` RECORDS its units in dataset ROWS (history + forecast), so
+        # feeding it aircraft here multiplied a per-row rate by a per-aircraft count and under-estimated
+        # the step by orders of magnitude. Its unit count is only known after the forecast step, which is
+        # where the estimate is refined (see below); until then use the flat quantile of past runs.
+        reporter.set_estimate("merging",   cal.estimate("merging", boot_flat=FORECAST_MERGE_ETA_SECONDS))
         d = await reporter.complete()
         await cal.record("aircraft_list", d, n_regs, {"regs": n_regs})
 
@@ -958,13 +973,19 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
 
         # ── 9/10 Merging all data in the dataset — actuals + forecast → acys_summary_by_day. ─────────
         await _ck()
+        # The merge's work is the ROW COUNT it has to combine, which is only known now that both the
+        # history and the forecast exist — refine the estimate here, in the SAME units the step records
+        # below, so the countdown reflects this run's dataset size rather than a flat average.
+        merge_units = max(1, history_rows + forecast_rows)
+        reporter.set_estimate("merging", cal.estimate("merging", merge_units,
+                                                      boot_flat=FORECAST_MERGE_ETA_SECONDS))
         await reporter.enter("merging")
         async with db_client.session(_DB) as s:
             res = await s.execute(text(_merge_sql(final_scope)), scope_params)
             final_rows = res.rowcount
             await s.commit()
         d = await reporter.complete()
-        await cal.record("merging", d, max(1, history_rows + forecast_rows),
+        await cal.record("merging", d, merge_units,
                          {"history_rows": history_rows, "forecast_rows": forecast_rows,
                           "final_rows": final_rows})
 
