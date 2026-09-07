@@ -116,6 +116,25 @@ FORECAST_PROGRESS_HEARTBEAT_SECONDS: float = float(require_env("FORECAST_PROGRES
 FORECAST_PROGRESS_MIN_INTERVAL_SECONDS: float = float(require_env("FORECAST_PROGRESS_MIN_INTERVAL_SECONDS", 0.15))
 # Moving-average window (days) for reading the forecast_step_timings calibration ledger.
 FORECAST_CALIB_WINDOW_DAYS: int = int(require_env("FORECAST_CALIB_WINDOW_DAYS", 30))
+# A step whose measured elapsed time has already OUTRUN its estimate: the countdown must not collapse
+# to ~0 just because the estimate was wrong. The remaining time is then assumed proportional to what the
+# step has already spent (Lindy): remaining = elapsed * this fraction. 0.35 = "a step 30s over its 15s
+# estimate still has ~10s to go". Too low => the old bug (3s shown while a minute remains); too high =>
+# a countdown that never converges.
+FORECAST_ETA_OVERRUN_TAIL: float = float(require_env("FORECAST_ETA_OVERRUN_TAIL", 0.35))
+# A unit-based step (fetching / forecast) extrapolates its total from elapsed/fraction-done. That ratio is
+# wild for the first few units (1 of 2000 done => a 2000x extrapolation), so the measurement is BLENDED with
+# the prior estimate and only fully trusted once this fraction of the step is complete.
+FORECAST_ETA_MEASURE_TRUST_FRACTION: float = float(require_env("FORECAST_ETA_MEASURE_TRUST_FRACTION", 0.25))
+# Smoothing of the PUBLISHED countdown. Between publishes the shown value ticks down with the wall clock;
+# a new, LOWER estimate is approached at FALL_ALPHA per publish, a HIGHER one is climbed at RISE_ALPHA per
+# publish (so learning "this run needs 900s, not 50s" ramps over a few seconds instead of jumping). The raw
+# estimate is never exceeded in either direction.
+FORECAST_ETA_FALL_ALPHA: float = float(require_env("FORECAST_ETA_FALL_ALPHA", 0.35))
+FORECAST_ETA_RISE_ALPHA: float = float(require_env("FORECAST_ETA_RISE_ALPHA", 0.20))
+# Minimum share of the visual bar any single step may own, so a sub-second step is still visible when the
+# bands are derived from the time estimates (see ProgressReporter._rebuild_bands).
+FORECAST_ETA_MIN_BAND_SHARE: float = float(require_env("FORECAST_ETA_MIN_BAND_SHARE", 0.005))
 # Bootstrap seeds for the two steps without a per-request/per-operator seed above (first runs only).
 FORECAST_BOOT_SEARCH_SECONDS: float = float(require_env("FORECAST_BOOT_SEARCH_SECONDS", 3))
 FORECAST_BOOT_FORECAST_PER_OP_SECONDS: float = float(require_env("FORECAST_BOOT_FORECAST_PER_OP_SECONDS", 2))
