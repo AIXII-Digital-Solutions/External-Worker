@@ -137,7 +137,7 @@ months ≤ frontier feed the fit (recent lagging/incomplete months are ignored f
 
 Base per (aircraft, month) = the reference **Indicative Market Value (US$m)**. Rules:
 
-1. **Wet lease → 0** (`Lease Dry/Wet = 'Wet'`).
+1. **Wet lease → 0.00001** (`Lease Dry/Wet = 'Wet'`) — a non-zero sentinel rather than a plain 0.
 2. **Actuals, missing month** → carry the last known value **forward** (fills reference gaps); leading gaps take the earliest known value.
 3. **Forecast** → project the aircraft's **own depreciation** forward: `value(m) = last_actual_value + slope × months_after_last`, `slope = LEAST(0, regr_slope(value, month))` (**clamped ≤ 0 — never rises**), floored at 0.
 4. **Brand-new aircraft** (never flew → no valuation history of its own, and the reference carries no market value for an undelivered airframe) → **cross-operator type benchmark**: the mean value of the SAME `Aircraft Sub Series` **across ALL operators**, not just this one — one airline's handful of tails is a far thinner sample than every operator of the type. Taken from the **newest reference month**; if the type has no valued airframe in that month, from the **newest year**. Held flat (it has no depreciation history to project).

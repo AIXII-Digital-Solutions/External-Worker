@@ -37,7 +37,9 @@ IATA -> main.airports by ICAO.
 
 acys_summary_by_day (2.6) — merge acys_actuals + acys_forecast into ONE ROW PER FLIGHT, adding Age /
 geography / Origin&Dest lat-lon / Data Type:
-  * Agreed Value = 0    — when Lease Dry Wet = 'Wet'.
+  * Agreed Value = 0.00001 — when Lease Dry Wet = 'Wet'. A non-zero sentinel, not a real value:
+                          zero collapses BI ratios/averages into a genuine "$0 airframe", while a
+                          value this small is visibly not a market price and stays > 0.
   * Agreed Value        — own history projected forward; a BRAND-NEW tail (no history, and Cirium carries
                           no market value for an undelivered aircraft) falls back to the CROSS-OPERATOR
                           value of its Aircraft Sub Series (see the sfbench CTE in _merge_sql).
@@ -47,6 +49,9 @@ acys_summary_grouped (MATERIALIZED VIEW, refreshed in step 10) rolls by_day up t
 (aircraft, month, route):
   * # Of Flights        — count of grouped flights; SUMS Actual Distance FR / Circle Distance /
                           Flight Time FR / Flight Time; drops Date / Time Departed / Time Landed.
+acys_summary_grouped_by_reg drops the route from that (one row per aircraft-MONTH), and
+acys_summary_grouped_by_reg_and_year drops the month too (one row per aircraft x Contract Year x Data Type;
+Agreed Value = the mean of the year's MONTHLY values). Both are refreshed in step 10 as well.
 """
 import asyncio
 import json
@@ -604,7 +609,7 @@ SELECT
     p."Contract Year", p."Circle Distance", p."Flight Time",
     -- Agreed Value, in priority order: the aircraft's OWN projected/carried value -> its own Cirium market
     -- value -> the cross-operator benchmark for its type (the brand-new-tail case, which has neither).
-    CASE WHEN p."Lease Dry Wet" = 'Wet' THEN 0
+    CASE WHEN p."Lease Dry Wet" = 'Wet' THEN 0.00001
          ELSE coalesce(av.av, p."Agreed Value", sfb.av) END,
     p."Total Seats", p."Total PAX", p."Actual Distance FR", p."Flight Time FR",
     p."Delivery Date", p."Lease Type", p."Lease Dry Wet", p."Operational Lessor",
@@ -991,17 +996,18 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
 
         # ── 10/10 Rendering report — refresh the report rollup, record the run, finalise the dataset. ─
         await reporter.enter("rendering")
-        # The report reads FOUR materialized views instead of re-aggregating on every query, so all four MUST
-        # be refreshed now that acys_summary_by_day has just been filled — otherwise the report still serves
-        # the PREVIOUS run. Refresh in DEPENDENCY ORDER (each matview reads the one before it): grouped reads
-        # acys_summary_by_day; grouped_by_reg reads grouped; aircraft_information reads grouped_by_reg;
-        # z_dates_acys reads acys_summary_by_day. Plain (non-CONCURRENT) REFRESH — brief ACCESS EXCLUSIVE, as
-        # grouped always used. Not best-effort: a stale rollup is a wrong report, so let it fail loudly.
-        # Only an owner (or a member of the owning role) may REFRESH: all four are owned by grp_aviation_write,
-        # which this connection's role belongs to.
+        # The report reads MATERIALIZED views instead of re-aggregating on every query, so every one of them
+        # MUST be refreshed now that acys_summary_by_day has just been filled — otherwise the report still
+        # serves the PREVIOUS run. Refresh in DEPENDENCY ORDER (each matview reads one before it): grouped
+        # reads acys_summary_by_day; grouped_by_reg reads grouped; grouped_by_reg_and_year (the aircraft-YEAR
+        # rollup) and aircraft_information both read grouped_by_reg; z_dates_acys reads acys_summary_by_day.
+        # Plain (non-CONCURRENT) REFRESH — brief ACCESS EXCLUSIVE, as grouped always used. Not best-effort: a
+        # stale rollup is a wrong report, so let it fail loudly. Only an owner (or a member of the owning role)
+        # may REFRESH: all of them are owned by grp_aviation_write, which this connection's role belongs to.
         async with db_client.session(_DB) as s:
             for _mv in ("forecast.acys_summary_grouped",
                         "forecast.acys_summary_grouped_by_reg",
+                        "forecast.acys_summary_grouped_by_reg_and_year",
                         "forecast.aircraft_information",
                         "forecast.acys_origin_bucket",       # slicer lookups — read grouped, so AFTER it
                         "forecast.acys_destination_bucket",

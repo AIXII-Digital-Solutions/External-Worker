@@ -531,7 +531,8 @@ sup AS (   -- carry-forward: tails that OPERATED for the operator in the last ac
            -- they vanish at the actuals->forecast seam even though they were just flying. Identity is the real
            -- registration; attributes come from the tail's most recent actual flight; they are already
            -- delivered (they just flew), so they fly EVERY forecast month (is_sup bypasses the cutoff). Wet
-           -- leases keep ldw='Wet', so the INSERT still zeroes their Agreed Value — only activity is projected.
+           -- leases keep ldw='Wet', so the INSERT still sentinels their Agreed Value (0.00001) — only activity
+           -- is projected.
            -- This set MUST match run_forecast_model's fleet_deliv supplement exactly, or Active Fleet vs rows
            -- disagree.
     SELECT DISTINCT ON (coalesce(nullif(aa."Aircraft Sub Series",''),'NA'), aa."Registration")
