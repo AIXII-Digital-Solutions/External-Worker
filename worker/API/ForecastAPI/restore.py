@@ -29,7 +29,7 @@ from settings import (FORECAST_CALIB_WINDOW_DAYS, FORECAST_MERGE_ETA_SECONDS,
                       FORECAST_ETA_MIN_BAND_SHARE)
 from status import publish_status
 
-from .panel import REPORT_MATVIEWS, _DB, _REQUEST_TYPE
+from .panel import _DB, _REQUEST_TYPE, refresh_report_matviews
 from .progress import Calibrator, ProgressReporter, Step
 from .snapshots import get_snapshot, mark_restored, restore_snapshot
 
@@ -133,10 +133,7 @@ async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snaps
 
         # ── 3/3 Rendering — refresh exactly what a real run refreshes, in the same order. ────────────
         await reporter.enter("restore_rendering")
-        async with db_client.session(_DB) as s:
-            for _mv in REPORT_MATVIEWS:
-                await s.execute(text(f"REFRESH MATERIALIZED VIEW {_mv}"))
-            await s.commit()
+        await refresh_report_matviews(db_client)
         async with db_client.session(_DB) as s:
             await mark_restored(s, snapshot_id)
             await s.commit()

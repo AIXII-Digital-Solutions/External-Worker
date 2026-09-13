@@ -142,6 +142,45 @@ REPORT_MATVIEWS = (
     "powerbi.z_dates_acys",
 )
 
+# How long the FALLBACK refresh (see refresh_report_matviews) may wait for its exclusive lock before
+# giving up. Only reached on a database without the unique indexes; the point of the bound is that a
+# run can fail with an explanation instead of hanging forever.
+_REFRESH_LOCK_TIMEOUT = "120s"
+
+
+async def refresh_report_matviews(db_client) -> None:
+    """Refresh REPORT_MATVIEWS in dependency order WITHOUT locking the report out.
+
+    A plain REFRESH takes ACCESS EXCLUSIVE. That does not merely wait for the report queries already
+    running — it queues every NEW one behind itself, so one DirectQuery held open for minutes freezes
+    the run at its last step and takes PowerBI down with it for the duration. Seen in production: a
+    reader 13 minutes into its transaction, two runs abandoned at step 10 with the bar at 99%.
+
+    CONCURRENTLY takes no exclusive lock; readers keep reading throughout. It needs a UNIQUE index on
+    each matview (Core-API migration `acys_matview_unique_keys`) and it cannot run inside a
+    transaction, which is why it goes through db_client.refresh_materialized_view — that helper owns
+    the AUTOCOMMIT connection. Measured over the report set: 9s concurrent against 26-35s blocking,
+    so this is not even a trade.
+
+    The fallback exists for one case: a database that predates those indexes, where CONCURRENTLY is
+    refused outright. It refreshes the old way but under a lock_timeout, so the worst case is a run
+    that fails with a readable reason rather than one that hangs and has to be killed by hand."""
+    for mv in REPORT_MATVIEWS:
+        try:
+            await db_client.refresh_materialized_view(_DB, mv, concurrently=True)
+        except Exception as e:
+            logger.warning("concurrent refresh of %s refused (%s) — falling back to a blocking "
+                           "refresh; the report is locked out while it runs", mv, e)
+            try:
+                async with db_client.session(_DB) as s:
+                    await s.execute(text(f"SET LOCAL lock_timeout = '{_REFRESH_LOCK_TIMEOUT}'"))
+                    await s.execute(text(f"REFRESH MATERIALIZED VIEW {mv}"))
+                    await s.commit()
+            except Exception as e2:
+                raise RuntimeError(
+                    f"could not refresh {mv}: the report is being read and the exclusive lock did "
+                    f"not come free within {_REFRESH_LOCK_TIMEOUT} ({e2})") from e2
+
 
 def _ne(expr: str) -> str:
     """nullif(expr, '') — treat an empty string code as absent so it never matches a lookup."""
@@ -1054,14 +1093,10 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
 
         # ── 10/10 Rendering report — refresh the report rollup, record the run, finalise the dataset. ─
         await reporter.enter("rendering")
-        # Refresh the report rollup (REPORT_MATVIEWS, in dependency order). Plain (non-CONCURRENT) REFRESH —
-        # brief ACCESS EXCLUSIVE, as grouped always used. Not best-effort: a stale rollup is a wrong report,
-        # so let it fail loudly. Only an owner (or a member of the owning role) may REFRESH: all of them are
-        # owned by grp_aviation_write, which this connection's role belongs to.
-        async with db_client.session(_DB) as s:
-            for _mv in REPORT_MATVIEWS:
-                await s.execute(text(f"REFRESH MATERIALIZED VIEW {_mv}"))
-            await s.commit()
+        # Refresh the report rollup. Not best-effort: a stale rollup is a wrong report, so let it fail
+        # loudly. Only an owner (or a member of the owning role) may REFRESH: all of them are owned by
+        # grp_aviation_write, which this connection's role belongs to.
+        await refresh_report_matviews(db_client)
         # best-effort: never fail a good run
         try:
             async with db_client.session("service") as s:
