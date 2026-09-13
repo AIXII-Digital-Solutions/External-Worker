@@ -20,6 +20,14 @@ Tables:
                     ONE run, this is the only way a previous run can be shown again — restore.py
                     (`forecast_restore`) pours a stored one back with no fetch and no model.
 
+A SAME-DAY REPEAT DOES NOT REBUILD. Asked for a scope that already ran TODAY on the same as-of date
+and the same resolved parameters, this function pours that run back (three steps) instead of
+rebuilding a dataset that already exists (ten steps, up to an hour): same Cirium revision, same FR24
+history, same model, same answer. The check is the FIRST thing the run does — before any status
+machinery is built, so the caller sees a three-step restore rather than a ten-step run that
+mysteriously ends early. `force=True` skips it; see snapshots.find_reusable for what "the same
+request" has to mean.
+
 Assemble (acys_actuals) — per FLIGHT:
   * aircraft (2.2) from cirium.ciriumaircrafts: latest revision per (Registration, Period-month) for
     every month with Period >= 07-2022. Fields: Operator, Master Series, Manufacturer, Aircraft Sub
@@ -76,7 +84,7 @@ from settings import (FORECAST_ASSEMBLE_ETA_SECONDS,
 from status import publish_status
 
 from .params import load_params
-from .snapshots import prune_snapshots, save_snapshot
+from .snapshots import find_reusable, params_fingerprint, prune_snapshots, save_snapshot
 
 logger = setup_logger("forecast_panel")
 
@@ -85,7 +93,8 @@ logger = setup_logger("forecast_panel")
 # and the constant was duplicated in model.py, so the two could silently disagree. `HISTORY_START` is kept as
 # a module attribute only because ForecastAPI/__init__ re-exports it; it is the DEFAULT, and no code path in
 # this module reads it any more — every use goes through `params.history_start`.
-from .forecast_params import defaults as _param_defaults   # noqa: E402  (kept next to what it explains)
+from .forecast_params import (MODEL_VERSION,   # noqa: E402  (kept next to what it explains)
+                              defaults as _param_defaults)
 
 HISTORY_START = _param_defaults()["history_start"]
 _DB = "cirium"   # any aviation logical name -> the physical aixii DB (cirium/flightradar/main/forecast)
@@ -712,12 +721,16 @@ def _scope(operators, registrations):
 
 async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                              operators: list[str] | None = None, registrations: list[str] | None = None,
-                             as_of: date | None = None, profile: str | None = None) -> dict:
+                             as_of: date | None = None, profile: str | None = None,
+                             force: bool = False) -> dict:
     """Run the forecast panel for ONE request (one or more operators and/or a registrations list),
     publishing a status per step. The scope is the UNION of every operator's tails and the explicit
     registrations; each operator is forecast in turn (step 8). acys_actuals accumulates (this scope
     refreshed); acys_forecast/acys_summary per-request. `profile` names a row in service.forecast_profiles;
-    omitted, the default profile is used."""
+    omitted, the default profile is used.
+
+    An identical request already run TODAY is poured back from its snapshot instead of rebuilt, unless
+    `force` is set."""
     operators = [o for o in (operators or []) if o and o.strip()] or None
     if not operators and not registrations:
         raise ValueError("provide operators and/or registrations")
@@ -729,6 +742,28 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
     # pax_load_factor, the forecast projected at another. One run, one parameter set.
     params, profile_label = await load_params(db_client, profile=profile)
     logger.info("forecast panel: parameter profile %r", profile_label)
+
+    # ── Same-day repeat? Pour today's run back instead of rebuilding it. ─────────────────────────
+    # Done HERE, before the ten-step reporter exists: the caller must see a three-step restore from
+    # the first status, not a ten-step run that ends at step two. The fingerprint is computed from
+    # the parameters just resolved, so a profile edited between the two requests makes them
+    # different requests — which is the whole point, since that edit is what the second run is
+    # testing. A failure to even ASK is not a failure of the run: fall through and rebuild.
+    fingerprint = params_fingerprint(params.as_dict(), MODEL_VERSION)
+    if not force:
+        try:
+            async with db_client.session(_DB) as s:
+                reusable = await find_reusable(s, operators=operators, registrations=registrations,
+                                               as_of=as_of, fingerprint=fingerprint)
+        except Exception as e:
+            logger.warning("could not check for a reusable run (%s) — rebuilding", e)
+            reusable = None
+        if reusable:
+            logger.info("forecast panel: reusing today's run %s (%s rows) for %s",
+                        reusable["id"], reusable["row_count"], label)
+            from .restore import run_forecast_restore   # lazy: restore imports this module
+            return await run_forecast_restore(db_client=db_client, redis=redis, job_id=job_id,
+                                              ref=ref, snapshot_id=reusable["id"], reused=True)
 
     base = {"start_date": params.history_start, "as_of": as_of,
             "anchor_month": as_of.month, "anchor_day": as_of.day,
@@ -1054,7 +1089,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                 # "defaults (no default profile)" for a run that had no profile to read.
                 snapshot = await save_snapshot(s, job_id=job_id, operators=operators,
                                                registrations=registrations, as_of=as_of,
-                                               profile=profile_label)
+                                               profile=profile_label, fingerprint=fingerprint)
                 pruned = await prune_snapshots(s, retention_days=FORECAST_SNAPSHOT_RETENTION_DAYS)
                 await s.commit()
             snapshot["pruned"] = pruned
