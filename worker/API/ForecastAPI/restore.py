@@ -7,6 +7,10 @@ exactly the report objects a real run refreshes (panel.REPORT_MATVIEWS, in the s
 Nothing is fetched and nothing is forecast; acys_actuals / acys_forecast are left exactly as they are,
 because no report object reads them — only acys_summary_by_day feeds the rollups.
 
+Two paths reach it: an explicit request (core-api POST /forecast/ with a `snapshot_id`), and a
+same-day repeat that panel.py hands over rather than rebuilding — `reused` only changes what the
+caller is told, since the work either way is the same three steps.
+
 The live table holds ONE run, so a restore REPLACES its contents (TRUNCATE + INSERT), the same way
 every panel run does. Status is published per step through the same ProgressReporter the panel uses,
 so the portal renders a restore with the machinery it already has (step / step_total / eta / detail) —
@@ -32,8 +36,13 @@ from .snapshots import get_snapshot, mark_restored, restore_snapshot
 logger = setup_logger("forecast_restore")
 
 
-async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snapshot_id: int) -> dict:
-    """Pour snapshot `snapshot_id` back into acys_summary_by_day and refresh the report."""
+async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snapshot_id: int,
+                               reused: bool = False) -> dict:
+    """Pour snapshot `snapshot_id` back into acys_summary_by_day and refresh the report.
+
+    `reused` marks the hand-over from a same-day repeat: the same work, but the caller asked for a
+    build and needs to be told, in the status and in the summary, that it got today's existing run
+    back instead of a new one."""
     snapshot_id = int(snapshot_id)
 
     async def _pub(state, message, progress=None, payload=None):
@@ -56,11 +65,17 @@ async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snaps
         except Exception:
             return False
 
+    # Titles and detail never name a data source, and they say the same thing either way — the
+    # difference between "restore this" and "this already ran today" is in the detail line only.
     steps = [
         Step("restore_validating", "Validating request",
-             "Checking the saved report is still available.", unit_based=False, weight=2),
+             ("Checking today's existing report for this request." if reused
+              else "Checking the saved report is still available."),
+             unit_based=False, weight=2),
         Step("restore_loading", "Restoring saved report",
-             "Loading the saved dataset back into the report.", unit_based=False, weight=40),
+             ("Loading today's existing report instead of rebuilding it." if reused
+              else "Loading the saved dataset back into the report."),
+             unit_based=False, weight=40),
         Step("restore_rendering", "Rendering report",
              "Finalising the dataset for reporting.", unit_based=False, weight=58),
     ]
@@ -145,7 +160,8 @@ async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snaps
         await cal.record("restore_rendering", d, 1, {"final_rows": final_rows})
 
         summary = {
-            "mode": "snapshot",
+            "mode": "reused" if reused else "snapshot",
+            "reused_today": reused,
             "snapshot_id": snapshot_id,
             "snapshot_created_at": head["created_at"].isoformat() if head.get("created_at") else None,
             "operators": list(head.get("operators") or []) or None,
@@ -153,8 +169,11 @@ async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snaps
             "as_of": head["as_of"].isoformat() if head.get("as_of") else None,
             "final_rows": final_rows,
         }
-        await reporter.success(f"Completed — restored saved report {snapshot_id} ({final_rows} rows)",
-                               summary)
+        await reporter.success(
+            (f"Completed — reused today's report {snapshot_id} ({final_rows} rows), nothing rebuilt"
+             if reused else
+             f"Completed — restored saved report {snapshot_id} ({final_rows} rows)"),
+            summary)
         logger.info("forecast_restore done: %s", summary)
         return summary
 

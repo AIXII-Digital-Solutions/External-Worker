@@ -82,7 +82,7 @@ async def refresh_subscription(ctx, subscription_id: str | None = None):
 # preparing -> fr24 check -> assembling -> merging -> done) so the portal can render progress live.
 async def forecast_panel(ctx, operators: list[str] | None = None, operator: str | None = None,
                          registrations: list[str] | None = None, as_of: str | None = None,
-                         profile: str | None = None, correlation_id=None, **_):
+                         profile: str | None = None, force: bool = False, correlation_id=None, **_):
     from datetime import date
     _as_of = date.fromisoformat(as_of) if as_of else None
     # Accept both the new `operators` list and the legacy single `operator` (an in-flight enqueue from an
@@ -97,6 +97,7 @@ async def forecast_panel(ctx, operators: list[str] | None = None, operator: str 
         registrations=registrations,
         as_of=_as_of,
         profile=profile,      # names a service.forecast_profiles row; None -> the default profile
+        force=force,          # True -> rebuild even if the same request already ran today
     )
 
 

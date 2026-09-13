@@ -12,6 +12,10 @@ everything older than the retention window, and `restore_snapshot` pours a store
 acys_summary_by_day for the `forecast_restore` job (no fetch, no model — the rows and the matview
 refresh that follows them).
 
+`find_reusable` is what makes a same-day repeat cheap: asked for a scope that already ran TODAY on the
+same inputs, the panel pours that run back instead of rebuilding a dataset that exists. See the
+function for what "the same inputs" has to mean, and why a profile NAME is not one of them.
+
 COLUMNS ARE RESOLVED AT RUNTIME, not hardcoded: the copy uses the INTERSECTION of the two tables'
 column lists and logs a warning naming anything it had to skip. A column added to acys_summary_by_day
 without being added to acys_snapshot_rows therefore costs that one column in the snapshot instead of
@@ -22,6 +26,9 @@ GENERATED COLUMNS ARE NEVER COPIED, in either direction. Both tables declare the
 write to any of them; each table computes them from the columns that ARE copied, so the values match
 without being moved.
 """
+import hashlib
+import json
+
 from sqlalchemy import text
 
 from Config import setup_logger
@@ -33,6 +40,21 @@ _ROWS = "forecast.acys_snapshot_rows"
 _HEAD = "forecast.acys_snapshots"
 
 _REQUEST_TYPE = "ACYS"
+
+
+def params_fingerprint(params: dict, model_version: str) -> str:
+    """A stable hash of the RESOLVED parameter values a run used, plus the model version.
+
+    This is the third input a reuse decision has to compare, after the scope and the as-of date.
+    Profile NAMES cannot stand in for it: tuning the model means editing the default profile's params
+    and re-running, and both runs name no profile at all — so a name comparison would hand back the
+    pre-tuning report and hide the very change being tested. Values, not labels.
+
+    `default=str` renders the one non-JSON value (history_start, a date) and would render anything
+    similar added later; sorted keys make the hash independent of dict order."""
+    blob = json.dumps({"model_version": model_version, "params": params},
+                      sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def _q(col: str) -> str:
@@ -70,7 +92,7 @@ async def _shared_columns(session) -> list[str]:
 
 
 async def save_snapshot(session, *, job_id: str | None, operators, registrations,
-                        as_of, profile: str | None) -> dict:
+                        as_of, profile: str | None, fingerprint: str | None = None) -> dict:
     """Copy the finished acys_summary_by_day into a new snapshot; return {id, rows}.
 
     The caller commits. Both the REQUESTED scope (operators / registrations as sent) and the COVERED
@@ -81,14 +103,15 @@ async def save_snapshot(session, *, job_id: str | None, operators, registrations
     col_sql = ", ".join(_q(c) for c in cols)
 
     snapshot_id = (await session.execute(text(
-        f"INSERT INTO {_HEAD} (job_id, request_type, operators, registrations, as_of, profile) "
-        "VALUES (:job_id, :rt, :ops, :regs, CAST(:as_of AS date), :profile) "
+        f"INSERT INTO {_HEAD} (job_id, request_type, operators, registrations, as_of, profile, "
+        "                      params_fingerprint) "
+        "VALUES (:job_id, :rt, :ops, :regs, CAST(:as_of AS date), :profile, :fp) "
         "RETURNING id"),
         {"job_id": job_id, "rt": _REQUEST_TYPE,
          "ops": list(operators or []), "regs": list(registrations or []),
          # a real date object, not its isoformat(): CAST(:as_of AS date) makes the driver infer the
          # parameter's type as `date`, and asyncpg then refuses a string outright.
-         "as_of": as_of, "profile": profile})).scalar_one()
+         "as_of": as_of, "profile": profile, "fp": fingerprint})).scalar_one()
 
     res = await session.execute(text(
         f"INSERT INTO {_ROWS} (snapshot_id, {col_sql}) "
@@ -105,6 +128,54 @@ async def save_snapshot(session, *, job_id: str | None, operators, registrations
 
     logger.info("forecast snapshot %s saved (%d rows)", snapshot_id, n_rows)
     return {"id": int(snapshot_id), "rows": n_rows}
+
+
+# Scope equality is compared on the NORMALISED arrays, not on what was typed: ["Emirates"] and
+# [" emirates "] are one request, and so are two orderings of the same pair of tails. Registrations
+# fold to upper case (the model stores them that way), operator names to lower (a name's case is
+# spelling, not identity). An empty list normalises to NULL rather than '{}' so IS NOT DISTINCT FROM
+# matches "no operators" against "no operators" instead of comparing an empty array to NULL.
+_NORMALISED = ("(SELECT array_agg({fn}(btrim(x)) ORDER BY {fn}(btrim(x))) FROM unnest(s.{col}) x)")
+
+_REUSABLE_SQL = f"""
+SELECT s.id, s.created_at, s.row_count
+FROM {_HEAD} s
+WHERE s.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+  AND s.as_of = CAST(:as_of AS date)
+  AND s.params_fingerprint IS NOT NULL
+  AND s.params_fingerprint = :fp
+  AND s.row_count > 0
+  AND {_NORMALISED.format(fn='lower', col='operators')} IS NOT DISTINCT FROM CAST(:ops AS text[])
+  AND {_NORMALISED.format(fn='upper', col='registrations')} IS NOT DISTINCT FROM CAST(:regs AS text[])
+ORDER BY s.created_at DESC
+LIMIT 1
+"""
+
+
+def _norm(values, *, upper: bool):
+    """The scope as the reuse comparison sees it: trimmed, case-folded, sorted, empty -> None."""
+    out = sorted({(v.strip().upper() if upper else v.strip().lower()) for v in (values or []) if v and v.strip()})
+    return out or None
+
+
+async def find_reusable(session, *, operators, registrations, as_of, fingerprint: str) -> dict | None:
+    """Today's snapshot for exactly this request, or None.
+
+    "Exactly this request" is four things, and all four have to match or the reused report would be a
+    different report: the SCOPE (normalised, see _NORMALISED), the AS-OF date (it anchors the contract
+    year and the fact/forecast boundary), the resolved PARAMETERS (see params_fingerprint) and the
+    DAY. A run from yesterday is not reusable even if everything else agrees — the flight history has
+    moved on, which is the whole reason a daily rebuild exists.
+
+    The day is the UTC calendar day, the same one GET /forecast/snapshots filters its `date` on, so
+    "runs listed under today" and "runs a repeat can reuse" can never disagree.
+
+    An empty snapshot (row_count 0) is skipped: pouring it back would blank the report."""
+    row = (await session.execute(text(_REUSABLE_SQL), {
+        "as_of": as_of, "fp": fingerprint,
+        "ops": _norm(operators, upper=False), "regs": _norm(registrations, upper=True),
+    })).mappings().first()
+    return dict(row) if row else None
 
 
 async def prune_snapshots(session, *, retention_days: int) -> dict:
