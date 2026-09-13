@@ -18,7 +18,7 @@ from API.FlightRadarAPI.LiveFlightsAPI import live_flights_adaptive
 from API.Utils import (create_or_update_subscription, asg_regs_updater, refresh_cirium_delta,
                        collapse_completed_revisions, refresh_plantype_matviews,
                        ensure_livepositions_partitions)
-from API.ForecastAPI import run_forecast_panel
+from API.ForecastAPI import run_forecast_panel, run_forecast_restore
 from API.Airports import refresh_airports
 
 logger = setup_logger("external_worker_tasks")
@@ -100,6 +100,19 @@ async def forecast_panel(ctx, operators: list[str] | None = None, operator: str 
     )
 
 
+# NOT @status_task-wrapped either: it publishes its own per-step statuses (validating -> restoring ->
+# rendering). It runs NO fetch and NO model — it pours a saved run back into the report table and
+# refreshes the same report objects a real run refreshes.
+async def forecast_restore(ctx, snapshot_id: int, correlation_id=None, **_):
+    await run_forecast_restore(
+        db_client=ctx["db_client"],
+        redis=ctx.get("redis_client"),
+        job_id=ctx.get("job_id") or "forecast_restore",
+        ref="forecast_restore",
+        snapshot_id=snapshot_id,
+    )
+
+
 # -----------------------------
 # Scheduled (cron) jobs
 # -----------------------------
@@ -147,6 +160,7 @@ ON_DEMAND = [
     load_airports,
     refresh_subscription,
     forecast_panel,
+    forecast_restore,
 ]
 
 # Registry-driven schedulable jobs. Registered in WorkerSettings.functions so the

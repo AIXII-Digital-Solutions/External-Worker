@@ -14,6 +14,11 @@ Tables:
   * acys_summary_grouped — a DB VIEW over acys_summary_by_day (not written here): one row per
                     (aircraft, month, route) with "# Of Flights" = count and the four metric columns
                     summed, WITHOUT Date / Time Departed / Time Landed. For PBI Direct Query.
+  * acys_snapshots / acys_snapshot_rows — the HISTORY of the above: every successful run copies its
+                    finished acys_summary_by_day here (snapshots.py, step 10) and drops whatever has
+                    aged past FORECAST_SNAPSHOT_RETENTION_DAYS. Because acys_summary_by_day holds only
+                    ONE run, this is the only way a previous run can be shown again — restore.py
+                    (`forecast_restore`) pours a stored one back with no fetch and no model.
 
 Assemble (acys_actuals) — per FLIGHT:
   * aircraft (2.2) from cirium.ciriumaircrafts: latest revision per (Registration, Period-month) for
@@ -67,10 +72,11 @@ from settings import (FORECAST_ASSEMBLE_ETA_SECONDS,
                       FORECAST_BOOT_SEARCH_SECONDS, FORECAST_BOOT_FORECAST_PER_OP_SECONDS,
                       FORECAST_ETA_OVERRUN_TAIL, FORECAST_ETA_MEASURE_TRUST_FRACTION,
                       FORECAST_ETA_FALL_ALPHA, FORECAST_ETA_RISE_ALPHA,
-                      FORECAST_ETA_MIN_BAND_SHARE)
+                      FORECAST_ETA_MIN_BAND_SHARE, FORECAST_SNAPSHOT_RETENTION_DAYS)
 from status import publish_status
 
 from .params import load_params
+from .snapshots import prune_snapshots, save_snapshot
 
 logger = setup_logger("forecast_panel")
 
@@ -109,6 +115,23 @@ _FT_OVERHEAD_H = 2
 # Upper bound on implied ground speed: real flights top out ~960 km/h (block); a duration so short it implies
 # more than this over the route (e.g. 3638 km in 0.14 h => 26,000 km/h) is a broken record, not a real flight.
 _MAX_BLOCK_KMH = 1100
+
+# The report reads MATERIALIZED views instead of re-aggregating on every query, so every one of them MUST
+# be refreshed once acys_summary_by_day has been filled — otherwise the report still serves the PREVIOUS
+# run. DEPENDENCY ORDER (each reads one before it): grouped reads acys_summary_by_day; grouped_by_reg reads
+# grouped; grouped_by_reg_and_year (the aircraft-YEAR rollup) and aircraft_information both read
+# grouped_by_reg; the bucket slicers read grouped; z_dates_acys reads acys_summary_by_day.
+# Shared with restore.py — a snapshot poured back into acys_summary_by_day has to refresh exactly the same
+# objects in the same order, and a list that lived in only one of the two would drift.
+REPORT_MATVIEWS = (
+    "forecast.acys_summary_grouped",
+    "forecast.acys_summary_grouped_by_reg",
+    "forecast.acys_summary_grouped_by_reg_and_year",
+    "forecast.aircraft_information",
+    "forecast.acys_origin_bucket",       # slicer lookups — read grouped, so AFTER it
+    "forecast.acys_destination_bucket",
+    "powerbi.z_dates_acys",
+)
 
 
 def _ne(expr: str) -> str:
@@ -996,22 +1019,12 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
 
         # ── 10/10 Rendering report — refresh the report rollup, record the run, finalise the dataset. ─
         await reporter.enter("rendering")
-        # The report reads MATERIALIZED views instead of re-aggregating on every query, so every one of them
-        # MUST be refreshed now that acys_summary_by_day has just been filled — otherwise the report still
-        # serves the PREVIOUS run. Refresh in DEPENDENCY ORDER (each matview reads one before it): grouped
-        # reads acys_summary_by_day; grouped_by_reg reads grouped; grouped_by_reg_and_year (the aircraft-YEAR
-        # rollup) and aircraft_information both read grouped_by_reg; z_dates_acys reads acys_summary_by_day.
-        # Plain (non-CONCURRENT) REFRESH — brief ACCESS EXCLUSIVE, as grouped always used. Not best-effort: a
-        # stale rollup is a wrong report, so let it fail loudly. Only an owner (or a member of the owning role)
-        # may REFRESH: all of them are owned by grp_aviation_write, which this connection's role belongs to.
+        # Refresh the report rollup (REPORT_MATVIEWS, in dependency order). Plain (non-CONCURRENT) REFRESH —
+        # brief ACCESS EXCLUSIVE, as grouped always used. Not best-effort: a stale rollup is a wrong report,
+        # so let it fail loudly. Only an owner (or a member of the owning role) may REFRESH: all of them are
+        # owned by grp_aviation_write, which this connection's role belongs to.
         async with db_client.session(_DB) as s:
-            for _mv in ("forecast.acys_summary_grouped",
-                        "forecast.acys_summary_grouped_by_reg",
-                        "forecast.acys_summary_grouped_by_reg_and_year",
-                        "forecast.aircraft_information",
-                        "forecast.acys_origin_bucket",       # slicer lookups — read grouped, so AFTER it
-                        "forecast.acys_destination_bucket",
-                        "powerbi.z_dates_acys"):
+            for _mv in REPORT_MATVIEWS:
                 await s.execute(text(f"REFRESH MATERIALIZED VIEW {_mv}"))
             await s.commit()
         # best-effort: never fail a good run
@@ -1028,6 +1041,27 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                 await s.commit()
         except Exception as e:
             logger.warning("failed to record forecast_last_requests: %s", e)
+
+        # Keep this run in the snapshot history (forecast.acys_snapshots + acys_snapshot_rows) so it can be
+        # re-shown later without re-running anything, then drop whatever has aged out of the retention
+        # window. BEST-EFFORT, and deliberately so: the report is finished and correct by this point, and
+        # failing an hour-long run over its history copy would throw away the thing the user asked for. The
+        # failure is logged, reported in the summary, and costs exactly one entry in the history list.
+        snapshot = None
+        try:
+            async with db_client.session(_DB) as s:
+                # profile_LABEL, not the requested name: it says what was actually used, including
+                # "defaults (no default profile)" for a run that had no profile to read.
+                snapshot = await save_snapshot(s, job_id=job_id, operators=operators,
+                                               registrations=registrations, as_of=as_of,
+                                               profile=profile_label)
+                pruned = await prune_snapshots(s, retention_days=FORECAST_SNAPSHOT_RETENTION_DAYS)
+                await s.commit()
+            snapshot["pruned"] = pruned
+        except Exception as e:
+            logger.warning("failed to save the forecast snapshot: %s", e)
+            snapshot = {"error": str(e)}
+
         d = await reporter.complete()
         await cal.record("rendering", d, 1, {"final_rows": final_rows})
 
@@ -1039,6 +1073,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             "history_rows": history_rows, "future_aircraft": future_aircraft,
             "forecast_rows": forecast_rows, "final_rows": final_rows,
             "coverage": coverage,
+            "snapshot": snapshot,
         }
         await reporter.success(
             f"Completed — actuals {history_rows}, future {future_aircraft}, "
