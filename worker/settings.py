@@ -143,6 +143,11 @@ FORECAST_BOOT_FORECAST_PER_OP_SECONDS: float = float(require_env("FORECAST_BOOT_
 # next run). The ARQ job timeout must exceed this budget + the assemble/merge time.
 FORECAST_FETCH_BUDGET_SECONDS: float = float(require_env("FORECAST_FETCH_BUDGET_SECONDS", 3600))
 FORECAST_JOB_TIMEOUT_SECONDS: int = int(require_env("FORECAST_JOB_TIMEOUT_SECONDS", 4200))
+# How long a finished forecast run is kept in forecast.acys_snapshots / acys_snapshot_rows so it can be
+# re-shown without re-running the model (core-api: GET /forecast/snapshots, POST /forecast/ with
+# snapshot_id). Anything older is pruned at the end of the next run. One run is ~1.2M rows / ~0.5 GB, so
+# this window is what bounds the history's size — raise it knowing that.
+FORECAST_SNAPSHOT_RETENTION_DAYS: int = int(require_env("FORECAST_SNAPSHOT_RETENTION_DAYS", 30))
 # Cirium matview refreshes (delta/asg/all_/historical_) rebuild CONCURRENTLY over the full revision
 # history; with large full-fleet snapshots they exceed arq's default 300s job timeout (delta/plantype
 # time out). Give the heavy cirium refresh cron jobs their own longer timeout (main.py WorkerSettings).
