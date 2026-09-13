@@ -83,6 +83,11 @@ def _register_job(f):
     # max_tries=1 — never auto-retry on interruption/cancel (that is what turned a cancelled run back on).
     if f is tasks.forecast_panel:
         return func(f, name="forecast_panel", timeout=settings.FORECAST_JOB_TIMEOUT_SECONDS, max_tries=1)
+    # forecast_restore fetches nothing, but its matview refresh is the SAME chain a real run ends with and
+    # can exceed 300s on a full dataset. max_tries=1 for the same reason as the panel: it is user-triggered
+    # and cancellable, and an auto-retry would re-run a restore the user stopped.
+    if f is tasks.forecast_restore:
+        return func(f, name="forecast_restore", timeout=settings.FORECAST_JOB_TIMEOUT_SECONDS, max_tries=1)
     if getattr(f, "__name__", None) in _CIRIUM_REFRESH_JOBS:
         return func(f, name=f.__name__, timeout=settings.CIRIUM_REFRESH_JOB_TIMEOUT_SECONDS)
     return f
