@@ -68,6 +68,7 @@ Agreed Value = the mean of the year's MONTHLY values). Both are refreshed in ste
 """
 import asyncio
 import json
+import time
 from datetime import date, timedelta
 
 from sqlalchemy import text
@@ -80,7 +81,8 @@ from settings import (FORECAST_ASSEMBLE_ETA_SECONDS,
                       FORECAST_BOOT_SEARCH_SECONDS, FORECAST_BOOT_FORECAST_PER_OP_SECONDS,
                       FORECAST_ETA_OVERRUN_TAIL, FORECAST_ETA_MEASURE_TRUST_FRACTION,
                       FORECAST_ETA_FALL_ALPHA, FORECAST_ETA_RISE_ALPHA,
-                      FORECAST_ETA_MIN_BAND_SHARE, FORECAST_SNAPSHOT_RETENTION_DAYS)
+                      FORECAST_ETA_MIN_BAND_SHARE, FORECAST_SNAPSHOT_RETENTION_DAYS,
+                      FORECAST_REPORT_REFRESH_MODE, FORECAST_REFRESH_LOCK_WAIT)
 from status import publish_status
 
 from .params import load_params
@@ -127,59 +129,99 @@ _MAX_BLOCK_KMH = 1100
 
 # The report reads MATERIALIZED views instead of re-aggregating on every query, so every one of them MUST
 # be refreshed once acys_summary_by_day has been filled — otherwise the report still serves the PREVIOUS
-# run. DEPENDENCY ORDER (each reads one before it): grouped reads acys_summary_by_day; grouped_by_reg reads
-# grouped; grouped_by_reg_and_year (the aircraft-YEAR rollup) and aircraft_information both read
-# grouped_by_reg; the bucket slicers read grouped; z_dates_acys reads acys_summary_by_day.
+# run. They are refreshed LEVEL BY LEVEL, and the matviews within one level side by side: each reads only
+# acys_summary_by_day or a matview from an EARLIER level (verified against pg_depend, 2026-09-15):
+#   level 0  grouped, z_dates_acys                        <- acys_summary_by_day
+#   level 1  grouped_by_reg, origin_bucket, dest_bucket   <- grouped
+#   level 2  grouped_by_reg_and_year, aircraft_information <- grouped_by_reg
 # Shared with restore.py — a snapshot poured back into acys_summary_by_day has to refresh exactly the same
 # objects in the same order, and a list that lived in only one of the two would drift.
-REPORT_MATVIEWS = (
-    "forecast.acys_summary_grouped",
-    "forecast.acys_summary_grouped_by_reg",
-    "forecast.acys_summary_grouped_by_reg_and_year",
-    "forecast.aircraft_information",
-    "forecast.acys_origin_bucket",       # slicer lookups — read grouped, so AFTER it
-    "forecast.acys_destination_bucket",
-    "powerbi.z_dates_acys",
+REPORT_MATVIEW_LEVELS = (
+    ("forecast.acys_summary_grouped", "powerbi.z_dates_acys"),
+    ("forecast.acys_summary_grouped_by_reg", "forecast.acys_origin_bucket", "forecast.acys_destination_bucket"),
+    ("forecast.acys_summary_grouped_by_reg_and_year", "forecast.aircraft_information"),
 )
+REPORT_MATVIEWS = tuple(mv for level in REPORT_MATVIEW_LEVELS for mv in level)
 
-# How long the FALLBACK refresh (see refresh_report_matviews) may wait for its exclusive lock before
-# giving up. Only reached on a database without the unique indexes; the point of the bound is that a
-# run can fail with an explanation instead of hanging forever.
+# The last-resort blocking refresh (a database without the unique indexes, where CONCURRENTLY is refused)
+# may wait this long for its lock before the run fails with an explanation instead of hanging.
 _REFRESH_LOCK_TIMEOUT = "120s"
 
 
-async def refresh_report_matviews(db_client) -> None:
-    """Refresh REPORT_MATVIEWS in dependency order WITHOUT locking the report out.
+def _is_lock_timeout(exc: BaseException) -> bool:
+    """True for PostgreSQL's lock_not_available (55P03) however the driver wrapped it."""
+    for e in (exc, getattr(exc, "orig", None), getattr(exc, "__cause__", None)):
+        if e is None:
+            continue
+        if getattr(e, "sqlstate", None) == "55P03" or getattr(e, "pgcode", None) == "55P03":
+            return True
+        if "LockNotAvailable" in type(e).__name__ or "lock timeout" in str(e):
+            return True
+    return False
 
-    A plain REFRESH takes ACCESS EXCLUSIVE. That does not merely wait for the report queries already
-    running — it queues every NEW one behind itself, so one DirectQuery held open for minutes freezes
-    the run at its last step and takes PowerBI down with it for the duration. Seen in production: a
-    reader 13 minutes into its transaction, two runs abandoned at step 10 with the bar at 99%.
 
-    CONCURRENTLY takes no exclusive lock; readers keep reading throughout. It needs a UNIQUE index on
-    each matview (Core-API migration `acys_matview_unique_keys`) and it cannot run inside a
-    transaction, which is why it goes through db_client.refresh_materialized_view — that helper owns
-    the AUTOCOMMIT connection. Measured over the report set: 9s concurrent against 26-35s blocking,
-    so this is not even a trade.
+async def _refresh_one(db_client, mv: str) -> tuple[str, str, float]:
+    """Refresh one matview by the fastest mode the moment allows; return (matview, mode, seconds).
 
-    The fallback exists for one case: a database that predates those indexes, where CONCURRENTLY is
-    refused outright. It refreshes the old way but under a lock_timeout, so the worst case is a run
-    that fails with a readable reason rather than one that hangs and has to be killed by hand."""
-    for mv in REPORT_MATVIEWS:
+    FAST (the default): a plain REFRESH, allowed to wait only FORECAST_REFRESH_LOCK_WAIT for its lock.
+    Our rollup is replaced WHOLESALE on every run and every restore, and for a wholesale change a plain
+    rebuild is the cheap mode — measured on production, the report chain took 27s this way against 60s
+    concurrently, because CONCURRENTLY diffs every old row against every new one and then maintains each
+    index row by row. The short lock wait is what keeps the old failure out: if PowerBI is reading the
+    matview at that moment, the plain attempt gives up within seconds instead of queueing (and queueing
+    every new report query behind itself), and this matview is refreshed concurrently instead. The cost,
+    when the lock IS free: report queries that arrive during that one matview's rebuild wait for it —
+    seconds, bounded, never the indefinite freeze.
+
+    CONCURRENT: never takes the exclusive lock at all. Slower; set FORECAST_REPORT_REFRESH_MODE=concurrent
+    if even a few seconds' pause in the report is unacceptable.
+    """
+    t0 = time.monotonic()
+    if FORECAST_REPORT_REFRESH_MODE != "concurrent":
         try:
-            await db_client.refresh_materialized_view(_DB, mv, concurrently=True)
+            async with db_client.session(_DB) as s:
+                await s.execute(text(f"SET LOCAL lock_timeout = '{FORECAST_REFRESH_LOCK_WAIT}'"))
+                await s.execute(text(f"REFRESH MATERIALIZED VIEW {mv}"))
+                await s.commit()
+            return mv, "exclusive", time.monotonic() - t0
         except Exception as e:
-            logger.warning("concurrent refresh of %s refused (%s) — falling back to a blocking "
-                           "refresh; the report is locked out while it runs", mv, e)
-            try:
-                async with db_client.session(_DB) as s:
-                    await s.execute(text(f"SET LOCAL lock_timeout = '{_REFRESH_LOCK_TIMEOUT}'"))
-                    await s.execute(text(f"REFRESH MATERIALIZED VIEW {mv}"))
-                    await s.commit()
-            except Exception as e2:
-                raise RuntimeError(
-                    f"could not refresh {mv}: the report is being read and the exclusive lock did "
-                    f"not come free within {_REFRESH_LOCK_TIMEOUT} ({e2})") from e2
+            if not _is_lock_timeout(e):
+                raise
+            logger.info("%s is being read right now — refreshing it concurrently instead", mv)
+    try:
+        await db_client.refresh_materialized_view(_DB, mv, concurrently=True)
+        return mv, "concurrent", time.monotonic() - t0
+    except Exception as e:
+        logger.warning("concurrent refresh of %s refused (%s) — falling back to a blocking refresh "
+                       "that may wait up to %s", mv, e, _REFRESH_LOCK_TIMEOUT)
+    try:
+        async with db_client.session(_DB) as s:
+            await s.execute(text(f"SET LOCAL lock_timeout = '{_REFRESH_LOCK_TIMEOUT}'"))
+            await s.execute(text(f"REFRESH MATERIALIZED VIEW {mv}"))
+            await s.commit()
+        return mv, "exclusive-fallback", time.monotonic() - t0
+    except Exception as e:
+        raise RuntimeError(
+            f"could not refresh {mv}: the report is being read and the exclusive lock did not come "
+            f"free within {_REFRESH_LOCK_TIMEOUT} ({e})") from e
+
+
+async def refresh_report_matviews(db_client) -> list[tuple[str, str, float]]:
+    """Refresh the whole report rollup, level by level; return what each matview took and how.
+
+    Within a level every matview gets its own connection and they run together — nothing in a level reads
+    anything else in it. A failure anywhere still fails the step (a stale rollup is a wrong report), but
+    only after its level finishes, so one refused matview does not leave its siblings half-attempted."""
+    timings: list[tuple[str, str, float]] = []
+    for level in REPORT_MATVIEW_LEVELS:
+        results = await asyncio.gather(*(_refresh_one(db_client, mv) for mv in level), return_exceptions=True)
+        errors = [r for r in results if isinstance(r, BaseException)]
+        timings.extend(r for r in results if not isinstance(r, BaseException))
+        if errors:
+            raise errors[0]
+    logger.info("report rollup refreshed: %s",
+                ", ".join(f"{mv.split('.')[-1]} {mode} {secs:.1f}s" for mv, mode, secs in timings))
+    return timings
 
 
 def _ne(expr: str) -> str:
@@ -1093,10 +1135,34 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
 
         # ── 10/10 Rendering report — refresh the report rollup, record the run, finalise the dataset. ─
         await reporter.enter("rendering")
-        # Refresh the report rollup. Not best-effort: a stale rollup is a wrong report, so let it fail
-        # loudly. Only an owner (or a member of the owning role) may REFRESH: all of them are owned by
-        # grp_aviation_write, which this connection's role belongs to.
-        await refresh_report_matviews(db_client)
+
+        # Keep this run in the snapshot history (forecast.acys_snapshots + acys_snapshot_rows) so it can be
+        # re-shown later without re-running anything, then drop whatever has aged out of the retention
+        # window. BEST-EFFORT, and deliberately so: failing an hour-long run over its history copy would
+        # throw away the thing the user asked for. The failure is logged, reported in the summary, and costs
+        # exactly one entry in the history list.
+        async def _save_history():
+            try:
+                async with db_client.session(_DB) as s:
+                    # profile_LABEL, not the requested name: it says what was actually used, including
+                    # "defaults (no default profile)" for a run that had no profile to read.
+                    saved = await save_snapshot(s, job_id=job_id, operators=operators,
+                                                registrations=registrations, as_of=as_of,
+                                                profile=profile_label, fingerprint=fingerprint)
+                    saved["pruned"] = await prune_snapshots(s, retention_days=FORECAST_SNAPSHOT_RETENTION_DAYS)
+                    await s.commit()
+                return saved
+            except Exception as e:
+                logger.warning("failed to save the forecast snapshot: %s", e)
+                return {"error": str(e)}
+
+        # The two run TOGETHER. They share only acys_summary_by_day, which both merely read (it is final
+        # since step 9), and the snapshot copy is ~10s of a 1.2M-row insert that used to sit AFTER the
+        # rollup, extending the step by exactly that much. The rollup is not best-effort: a stale rollup is
+        # a wrong report, so its failure fails the step. Only an owner (or a member of the owning role) may
+        # REFRESH: all of them are owned by grp_aviation_write, which this connection's role belongs to.
+        refresh_timings, snapshot = await asyncio.gather(refresh_report_matviews(db_client), _save_history())
+
         # best-effort: never fail a good run
         try:
             async with db_client.session("service") as s:
@@ -1112,28 +1178,10 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         except Exception as e:
             logger.warning("failed to record forecast_last_requests: %s", e)
 
-        # Keep this run in the snapshot history (forecast.acys_snapshots + acys_snapshot_rows) so it can be
-        # re-shown later without re-running anything, then drop whatever has aged out of the retention
-        # window. BEST-EFFORT, and deliberately so: the report is finished and correct by this point, and
-        # failing an hour-long run over its history copy would throw away the thing the user asked for. The
-        # failure is logged, reported in the summary, and costs exactly one entry in the history list.
-        snapshot = None
-        try:
-            async with db_client.session(_DB) as s:
-                # profile_LABEL, not the requested name: it says what was actually used, including
-                # "defaults (no default profile)" for a run that had no profile to read.
-                snapshot = await save_snapshot(s, job_id=job_id, operators=operators,
-                                               registrations=registrations, as_of=as_of,
-                                               profile=profile_label, fingerprint=fingerprint)
-                pruned = await prune_snapshots(s, retention_days=FORECAST_SNAPSHOT_RETENTION_DAYS)
-                await s.commit()
-            snapshot["pruned"] = pruned
-        except Exception as e:
-            logger.warning("failed to save the forecast snapshot: %s", e)
-            snapshot = {"error": str(e)}
-
         d = await reporter.complete()
-        await cal.record("rendering", d, 1, {"final_rows": final_rows})
+        await cal.record("rendering", d, 1, {
+            "final_rows": final_rows,
+            "refresh": {mv.split(".")[-1]: [mode, round(secs, 1)] for mv, mode, secs in refresh_timings}})
 
         summary = {
             "mode": "+".join((["operators"] if operators else []) + (["registrations"] if registrations else [])),
