@@ -133,7 +133,7 @@ async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snaps
 
         # ── 3/3 Rendering — refresh exactly what a real run refreshes, in the same order. ────────────
         await reporter.enter("restore_rendering")
-        await refresh_report_matviews(db_client)
+        refresh_timings = await refresh_report_matviews(db_client)
         async with db_client.session(_DB) as s:
             await mark_restored(s, snapshot_id)
             await s.commit()
@@ -154,7 +154,9 @@ async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snaps
         except Exception as e:
             logger.warning("failed to record forecast_last_requests: %s", e)
         d = await reporter.complete()
-        await cal.record("restore_rendering", d, 1, {"final_rows": final_rows})
+        await cal.record("restore_rendering", d, 1, {
+            "final_rows": final_rows,
+            "refresh": {mv.split(".")[-1]: [mode, round(secs, 1)] for mv, mode, secs in refresh_timings}})
 
         summary = {
             "mode": "reused" if reused else "snapshot",

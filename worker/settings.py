@@ -148,6 +148,15 @@ FORECAST_JOB_TIMEOUT_SECONDS: int = int(require_env("FORECAST_JOB_TIMEOUT_SECOND
 # snapshot_id). Anything older is pruned at the end of the next run. One run is ~1.2M rows / ~0.5 GB, so
 # this window is what bounds the history's size — raise it knowing that.
 FORECAST_SNAPSHOT_RETENTION_DAYS: int = int(require_env("FORECAST_SNAPSHOT_RETENTION_DAYS", 30))
+# How the report matviews are rebuilt at the end of a run / restore (panel.refresh_report_matviews).
+#   fast       — a plain REFRESH that may wait only FORECAST_REFRESH_LOCK_WAIT for its lock, falling back to
+#                a concurrent one for any matview PowerBI is reading at that moment. About 2x faster for our
+#                wholesale changes; report queries arriving during a plain rebuild wait for it (seconds).
+#   concurrent — never takes the exclusive lock; slower, and the report never pauses at all.
+FORECAST_REPORT_REFRESH_MODE: str = str(require_env("FORECAST_REPORT_REFRESH_MODE", "fast")).strip().lower()
+# The fast mode's lock wait. Short on purpose: its job is to notice a busy report and step aside, not to
+# queue behind it (a queued exclusive lock blocks every new reader too).
+FORECAST_REFRESH_LOCK_WAIT: str = str(require_env("FORECAST_REFRESH_LOCK_WAIT", "2s")).strip()
 # Cirium matview refreshes (delta/asg/all_/historical_) rebuild CONCURRENTLY over the full revision
 # history; with large full-fleet snapshots they exceed arq's default 300s job timeout (delta/plantype
 # time out). Give the heavy cirium refresh cron jobs their own longer timeout (main.py WorkerSettings).
