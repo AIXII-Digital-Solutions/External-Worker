@@ -1103,7 +1103,10 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                 # move WITHIN this operator's share of the step so a single-operator run isn't frozen
                 await reporter.tick(_i + frac, n_ops)
 
-            async with db_client.session(_DB) as s:
+            # pinned_session, not session: the model keeps its route pool and fleet in TEMP tables
+            # across commits, and those live on the CONNECTION — a plain session can come back from
+            # the pool on a different backend mid-run and lose them (see DatabaseClient).
+            async with db_client.pinned_session(_DB) as s:
                 # scope the forecast source to THIS request's tails (acys_actuals accumulates across
                 # requests) so a registrations-scoped run does not forecast sibling tails
                 fr = await run_forecast_model(session=s, operator=op, as_of=as_of,
