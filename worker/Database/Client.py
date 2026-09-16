@@ -59,6 +59,35 @@ class DatabaseClient:
                 await session.rollback()
                 raise
 
+    @asynccontextmanager
+    async def pinned_session(self, db_name: str) -> AsyncGenerator[AsyncSession | Any, Any]:
+        """Like ``session()``, but keeps ONE connection for its whole life — across commits.
+
+        A normal session hands its connection back to the pool on every commit and checks one out
+        again for the next statement. That is usually the same connection, but not necessarily: the
+        pool is FIFO, so as soon as a second job holds a connection while this one is between
+        statements, the next checkout is a DIFFERENT backend. Everything that lives on the CONNECTION
+        rather than in the database is then silently gone — TEMP tables above all.
+
+        That is what broke the forecast: the model builds its route pool and fleet once as TEMP
+        tables and reads them across ~185 committed INSERTs, so any concurrent job (an FR24 poll, a
+        matview refresh) could move it onto a backend where `fc_fleet_tmp` does not exist.
+
+        Use this for work that carries connection state; plain ``session()`` for everything else, so
+        long-running jobs do not hold a pooled connection for no reason.
+        """
+        engine = self._get_engine(db_name)
+        # The session is bound to a connection it does not own, so committing does not release it;
+        # the connection goes back to the pool when this context manager exits.
+        async with engine.connect() as conn:
+            async with AsyncSession(bind=conn, expire_on_commit=False) as session:
+                try:
+                    yield session
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    raise
+
     async def refresh_materialized_view(
         self, db_name: str, qualified_view: str, concurrently: bool = True
     ) -> None:

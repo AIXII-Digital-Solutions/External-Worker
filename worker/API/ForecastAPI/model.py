@@ -755,8 +755,12 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
     # ── PRECOMPUTE (see the _POOL_DDL / _fleet_build_sql block above) ──────────────────────────────────
     # The route pool and the fleet are LOOP-INVARIANT, but used to be rebuilt inside each of the ~185 per-month
     # INSERTs (measured: 2,906 ms per INSERT, of which 2,878 ms was this re-derivation and only 28 ms real work).
-    # Build them ONCE here. TEMP tables live for the connection, survive the commits below, and are dropped at
+    # Build them ONCE here. TEMP tables live for the CONNECTION, survive the commits below, and are dropped at
     # the end; the DROP IF EXISTS guards a pooled connection that still carries them from an earlier run.
+    # This REQUIRES a session that keeps ONE connection across commits — DatabaseClient.pinned_session. A plain
+    # session releases its connection on every commit and can come back on another backend, where these tables
+    # do not exist: that is how a run died with `relation "fc_fleet_tmp" does not exist` whenever a concurrent
+    # job happened to hold a connection at the wrong moment.
     for stmt in _POOL_DDL.strip().split(";"):
         if stmt.strip():
             await session.execute(text(stmt))
