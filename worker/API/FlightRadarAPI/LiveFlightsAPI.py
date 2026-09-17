@@ -196,9 +196,18 @@ async def live_flights_adaptive(storage_mode: str = "db"):
     db_client = DatabaseClient()
 
     try:
-        # regs come from api.registration (active aircraft synced from cirium.asg), not main.
+        # The tracked fleet is the union of the two COMMERCIAL matviews: the ASG airlines and the
+        # insured aircraft that are not ASG (the latter also carries whatever registrations were typed
+        # into api.registration by hand). Only is_active tails — an order or a written-off airframe has
+        # nothing to report. api.registration is NOT read directly any more: a hand-listed tail reaches
+        # the poll through non_asg_insured_commercial, which is also where its Cirium identity is.
         async with db_client.session("cirium") as session:
-            result = await session.execute(text("SELECT reg FROM api.registration"))
+            result = await session.execute(text(
+                'SELECT "Registration" AS reg FROM cirium.asg_commercial '
+                'WHERE is_active AND "Registration" IS NOT NULL '
+                'UNION '
+                'SELECT "Registration" FROM cirium.non_asg_insured_commercial '
+                'WHERE is_active AND "Registration" IS NOT NULL'))
             all_regs = [row[0] for row in result.all()]
 
         await redis_storage.reconcile(all_regs)
