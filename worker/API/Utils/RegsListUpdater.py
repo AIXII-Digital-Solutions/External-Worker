@@ -11,35 +11,33 @@ REGISTRATIONS_VIEW = "cirium.registrations"   # latest Operator+Status per uniqu
 # asg / delta are now per-plan_type variants; *_full = UNION of the two, so refresh the two plan
 # variants FIRST, then the _full view that reads them (order matters for CONCURRENTLY).
 ASG_VIEWS = ["cirium.asg_commercial", "cirium.asg_business_helicopters", "cirium.asg_full"]
+# The non-ASG insured pair: the same shape as asg_*, but airlines flagged is_asg = false plus the
+# registrations typed into api.registration by hand. They read ciriumaircrafts directly, so they do
+# not depend on the asg matviews and their refresh order does not matter.
+NON_ASG_VIEWS = ["cirium.non_asg_insured_commercial", "cirium.non_asg_insured_business"]
 DELTA_VIEWS = ["cirium.delta_commercial", "cirium.delta_business_helicopters", "cirium.delta_full"]
 PLANTYPE_VIEWS = ["cirium.all_commercial", "cirium.all_business_helicopters",
                   "cirium.historical_commercial", "cirium.historical_business_helicopters"]
 
 
-async def regs_updater(client: DatabaseClient):
-    """Rebuild api.registration from cirium.asg_full (is_active aircraft).
-
-    The TRUNCATE + INSERT (joining api.airlines for airline_id) lives in the DB function
-    api.sync_registration_from_asg() — owned by core-api's Alembic (now reads cirium.asg_full) — so
-    this is a single call.
-    """
-    async with client.session("cirium") as session:
-        await session.execute(text("SELECT api.sync_registration_from_asg()"))
-
-
 @performance_timer
 async def asg_regs_updater():
-    """Refresh the asg matviews (commercial + business_helicopters, then full), cirium.airlines, and
-    rebuild api.registration from asg_full. The airline match / is_active / per-plan revision scoping
-    is the matview DEFINITION; this is just the refresh + the api.sync_registration_from_asg() call."""
+    """Refresh the fleet matviews: asg_* (commercial + business_helicopters, then full), the non-ASG
+    insured pair, cirium.airlines and cirium.registrations.
+
+    It no longer rebuilds api.registration. That table is now a HAND-KEPT list of registrations feeding
+    cirium.non_asg_insured_*, and the function that used to TRUNCATE and refill it from asg_full is
+    gone — refilling it here would delete what somebody typed in.
+
+    The airline match, the is_asg split, is_active and the per-plan revision scoping all live in the
+    matview DEFINITIONS; this job only refreshes them."""
     client = DatabaseClient()
-    for v in ASG_VIEWS:
+    for v in ASG_VIEWS + NON_ASG_VIEWS:
         logger.info("Refreshing %s", v)
         await client.refresh_materialized_view("cirium", v)
     await client.refresh_materialized_view("cirium", AIRLINES_VIEW)
     await client.refresh_materialized_view("cirium", REGISTRATIONS_VIEW)
-    await regs_updater(client=client)
-    logger.info("asg_* + cirium.airlines + cirium.registrations refresh + api.registration sync complete")
+    logger.info("asg_* + non_asg_insured_* + cirium.airlines + cirium.registrations refreshed")
 
 
 @performance_timer
