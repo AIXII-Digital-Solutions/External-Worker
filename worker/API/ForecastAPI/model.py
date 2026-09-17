@@ -310,6 +310,19 @@ _NOT_DEAD = """NOT EXISTS (
           AND ( (coalesce(ca."Serial Number",'') <> '' AND cd."Serial Number" = ca."Serial Number")
              OR (coalesce(ca."Serial Number",'') =  '' AND cd."Registration"  = ca."Registration") ))"""
 
+# A carry-forward tail must still be THIS operator's to carry: no other operator may have flown it since.
+# Without this a tail that changed hands inside the last actual month is supplemented into its OLD operator's
+# fleet and forecast for the whole horizon, in parallel with the operator that actually has it now — two
+# forecasts of one airframe. The wet-lease case this carry-forward exists for is unaffected: there the flying
+# operator's own flights ARE the latest ones.
+_NOT_MOVED_ON = """NOT EXISTS (
+        SELECT 1 FROM forecast.acys_actuals later
+        WHERE later."Registration" = aa."Registration" AND later."Date" IS NOT NULL
+          AND later."Operator" IS DISTINCT FROM aa."Operator"
+          AND later."Date" > (SELECT max(x."Date") FROM forecast.acys_actuals x
+                              WHERE x."Registration" = aa."Registration" AND x."Operator" = aa."Operator"
+                                AND x."Date" IS NOT NULL))"""
+
 _IDENT = """CASE WHEN coalesce(ca."Serial Number",'') <> ''
             THEN 'SN:' || ca."Serial Number" || '|' || coalesce(nullif(ca."Aircraft Sub Series",''),'NA')
             ELSE 'REG:' || coalesce(ca."Registration",'') END"""
@@ -546,6 +559,7 @@ sup AS (   -- carry-forward: tails that OPERATED for the operator in the last ac
     FROM forecast.acys_actuals aa
     WHERE aa."Operator" = :op AND aa."Date" IS NOT NULL AND aa."Date" >= :sup_since
       AND aa."Registration" NOT IN (SELECT reg FROM owned_regs) {scope}
+      AND {_NOT_MOVED_ON}
     ORDER BY coalesce(nullif(aa."Aircraft Sub Series",''),'NA'), aa."Registration", aa."Date" DESC
 )
 SELECT * FROM cirium_fleet
@@ -704,10 +718,21 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         {"op": operator, **sp})).scalar()
     fc_start = (last_fact + timedelta(days=1)) if last_fact is not None else as_of
 
-    # Fleet carry-forward window: the first day of the LAST ACTUAL month. Tails that operated for the operator
-    # inside this window but are NOT in the owned Cirium fleet (sister-airline / wet-lease) are supplemented
-    # into the forecast fleet so they do not vanish at the seam (see _insert_sql's `sup` CTE).
-    sup_since = last_fact.replace(day=1) if last_fact is not None else fc_start
+    # Fleet carry-forward window: the first day of the operator's LAST ACTUAL month — measured over ALL of its
+    # facts, deliberately NOT through this request's scope. Tails that operated for the operator inside this
+    # window but are NOT in the owned Cirium fleet (sister-airline / wet-lease) are supplemented into the
+    # forecast fleet so they do not vanish at the seam (see _insert_sql's `sup` CTE).
+    #
+    # The scope decides WHAT to forecast, never WHEN an operator last flew. Dating the window through it lets a
+    # registrations-scoped request judge an operator by the scoped tails alone: TC-GPD last flew for Tailwind in
+    # 10-2023 and moved on, but in a 14-registration request that was Tailwind's entire visible history, so the
+    # window opened in 2023, the tail was carried forward as if it had just been flying, and the run produced
+    # 7,610 forecast flights for it under Tailwind from 11-2023 to 2028 — beside the real forecast under BBN,
+    # who actually holds the aircraft.
+    sup_window_end = (await session.execute(text(
+        'SELECT max("Date") FROM forecast.acys_actuals WHERE "Operator" = :op AND "Date" IS NOT NULL'),
+        {"op": operator})).scalar() or last_fact
+    sup_since = sup_window_end.replace(day=1) if sup_window_end is not None else fc_start
 
     frontier, fmonths, plan_sf, fits_sf = _plan(rows_sf, fc_start, as_of, p)
     fr_ms, fm_ms, plan_ms, fits_ms = _plan(rows_ms, fc_start, as_of, p)
@@ -747,6 +772,7 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
             'FROM forecast.acys_actuals aa '
             'WHERE aa."Operator" = :op AND aa."Date" IS NOT NULL AND aa."Date" >= :sup_since '
             f'  AND aa."Registration" NOT IN (SELECT reg FROM owned_regs) {scope_sql} '
+            f'  AND {_NOT_MOVED_ON} '
             'ORDER BY aa."Registration", aa."Date" DESC'),
             {"op": operator, "sup_since": sup_since, **sp})).all():
         fleet_deliv[r[0]].append(r[2])
