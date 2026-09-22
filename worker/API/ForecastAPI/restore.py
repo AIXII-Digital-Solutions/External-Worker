@@ -29,7 +29,8 @@ from settings import (FORECAST_CALIB_WINDOW_DAYS, FORECAST_MERGE_ETA_SECONDS,
                       FORECAST_ETA_MIN_BAND_SHARE)
 from status import publish_status
 
-from .panel import _DB, _REQUEST_TYPE, refresh_report_matviews
+from .panel import (_DB, _REQUEST_TYPE, acquire_staging_lock, refresh_report_matviews,
+                    release_staging_lock)
 from .progress import Calibrator, ProgressReporter, Step
 from .snapshots import get_snapshot, mark_restored, restore_snapshot
 
@@ -98,8 +99,12 @@ async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snaps
                                 rise_alpha=FORECAST_ETA_RISE_ALPHA,
                                 min_band_share=FORECAST_ETA_MIN_BAND_SHARE)
 
+    # A restore TRUNCATEs and refills the same single-run staging table a panel run does, so it takes
+    # the same lock — otherwise it can land in the middle of a run and the two overwrite each other.
+    staging_lock = None
     try:
         await reporter.start()
+        staging_lock = await acquire_staging_lock(db_client)
 
         # ── 1/3 Validating — the snapshot still exists (retention may have dropped it). ──────────────
         await reporter.enter("restore_validating")
@@ -187,4 +192,5 @@ async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snaps
         logger.exception("forecast_restore failed (snapshot %s)", snapshot_id)
         raise
     finally:
+        await release_staging_lock(staging_lock)
         reporter.request_stop()

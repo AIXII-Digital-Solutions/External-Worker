@@ -143,6 +143,61 @@ REPORT_MATVIEW_LEVELS = (
 )
 REPORT_MATVIEWS = tuple(mv for level in REPORT_MATVIEW_LEVELS for mv in level)
 
+# ── ONE forecast run at a time ────────────────────────────────────────────────────────────────
+# forecast.acys_summary_by_day is a SINGLE-RUN staging table: every run TRUNCATEs it (step 2) and
+# rebuilds it (step 9). Nothing used to stop two runs overlapping, and on 2026-09-18 two did, 18
+# seconds apart — the second run's TRUNCATE landed before the first run's INSERT, so BOTH datasets
+# ended up in the table. Snapshot 16 then froze it: a snapshot requested for ['Emirates'] whose
+# covered_operators read ['Emirates', 'SCAT Airlines']. Restoring it failed on
+# uq_acys_by_reg_refresh, because SCAT's forecast was in there twice carrying two different Agreed
+# Values and the rollup's GROUP BY could not collapse them.
+#
+# That unique index is the only reason this was noticed: had the two runs agreed on the Agreed
+# Value, the rows would have merged and every SCAT forecast figure would have quietly doubled.
+#
+# A session-level advisory lock, held on a PINNED connection for the whole run. try_ rather than a
+# blocking wait: a panel run can take the best part of an hour, and a caller is better told that
+# one is already in progress than left watching a queued job that looks hung.
+_STAGING_LOCK_KEY = 8147320615004001      # arbitrary but fixed: forecast.acys_summary_by_day
+
+
+async def acquire_staging_lock(db_client):
+    """Claim the staging table for this run, or refuse the run. Returns a handle for release().
+
+    Entered by hand rather than with `async with`, so the caller can hold it across its existing
+    try/finally without the whole body moving an indent level.
+    """
+    ctx = db_client.pinned_session(_DB)
+    s = await ctx.__aenter__()
+    try:
+        got = (await s.execute(text("SELECT pg_try_advisory_lock(:k)"),
+                               {"k": _STAGING_LOCK_KEY})).scalar()
+    except BaseException:
+        await ctx.__aexit__(None, None, None)
+        raise
+    if not got:
+        await ctx.__aexit__(None, None, None)
+        raise RuntimeError(
+            "another forecast run is already rebuilding forecast.acys_summary_by_day — "
+            "wait for it to finish and run this again")
+    return ctx, s
+
+
+async def release_staging_lock(handle) -> None:
+    """Release it. Safe with None, and safe if the unlock itself fails — closing the connection
+    drops a session-level advisory lock anyway."""
+    if handle is None:
+        return
+    ctx, s = handle
+    try:
+        await s.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _STAGING_LOCK_KEY})
+    except Exception:
+        logger.warning("could not release the staging lock explicitly; "
+                       "closing the connection will drop it")
+    finally:
+        await ctx.__aexit__(None, None, None)
+
+
 # The last-resort blocking refresh (a database without the unique indexes, where CONCURRENTLY is refused)
 # may wait this long for its lock before the run fails with an explanation instead of hanging.
 _REFRESH_LOCK_TIMEOUT = "120s"
@@ -691,7 +746,13 @@ panel AS (
     -- not fly that month); future-delivery stubs (Date + Contract Year both NULL) stay excluded.
     WHERE ("Date" IS NOT NULL OR "Contract Year" IS NOT NULL) AND {final_scope}
     UNION ALL
+    -- SCOPED, like the Actuals branch above. acys_forecast is TRUNCATEd per run, so in a world of
+    -- one run at a time this filter changes nothing — which is exactly why it was missing. When two
+    -- runs overlapped on 2026-09-18 it was the hole another run's forecast poured through, into a
+    -- snapshot that had not asked for it. Cheap, and it makes the rebuild correct on its own rather
+    -- than only correct while the lock above holds.
     SELECT {_PANEL_COLS}, 'Forecast' AS "Data Type" FROM forecast.acys_forecast
+    WHERE {final_scope}
 ),
 avfill AS (     -- fixed Agreed Value per (reg, month, data type):
     --  * Actuals  -> the real month value, else CARRY FORWARD the last known one (fills Cirium gaps),
@@ -937,8 +998,11 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
                                 rise_alpha=FORECAST_ETA_RISE_ALPHA,
                                 min_band_share=FORECAST_ETA_MIN_BAND_SHARE)
 
+    staging_lock = None
     try:
         await reporter.start()
+        # claimed before anything touches the staging table, released in the finally below
+        staging_lock = await acquire_staging_lock(db_client)
 
         # ── 1/10 Validating request — the scope has matching aircraft (else fail fast). ─────────────
         await reporter.enter("validating")
@@ -1227,3 +1291,4 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         raise
     finally:
         reporter.request_stop()
+        await release_staging_lock(staging_lock)
