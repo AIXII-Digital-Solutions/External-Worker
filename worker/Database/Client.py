@@ -1,8 +1,59 @@
+import os
+import time
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Any
 
-from sqlalchemy import text
+from sqlalchemy import event, exc, text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine, AsyncSession
+from sqlalchemy.util import await_only
+
+# Pool sizing is PER PROCESS, and this process is not core-api: a worker runs batch jobs that hold a
+# connection for the length of a job, so it is sized larger than the API's per-request pool. Same
+# env var names as core-api so operations tunes both the same way; different defaults because the
+# work is different.
+_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
+_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
+_POOL_RECYCLE_S = int(os.getenv("DB_POOL_RECYCLE_SECONDS", "1800"))
+# A pooled connection idle for longer than this is checked before it is handed out; a busier one is not.
+_PING_IDLE_S = float(os.getenv("DB_PING_IDLE_SECONDS", "30"))
+
+
+def _install_idle_ping(engine: AsyncEngine) -> None:
+    """Validate a pooled connection on checkout ONLY if it has been idle, in ONE round trip.
+
+    This replaces `pool_pre_ping=True`, which pinged on EVERY checkout — and with the asyncpg
+    adapter the ping is wrapped in its own transaction, measured on the wire as
+    `BEGIN; ; ROLLBACK;`: three round trips before the first real statement. The database is on
+    another host, so that is tens of milliseconds of pure waiting per checkout, and this worker
+    opens a session per iteration in the FlightRadar polling loops.
+
+    A connection returned to the pool moments ago is not going to be stale, so only one idle past
+    DB_PING_IDLE_SECONDS is checked, with a bare `SELECT 1` on the raw asyncpg connection: no
+    transaction, one round trip. A failed check raises DisconnectionError, which makes the pool
+    discard that connection and hand out a fresh one — the caller never sees the dead one. The
+    window this leaves (a connection that died less than DB_PING_IDLE_SECONDS after its last use,
+    e.g. a database restart mid-run) fails one job per such connection and self-heals.
+
+    Kept byte-identical to core-api's copy in `db-contract/Database/Client.py`, which is the
+    source of truth for this file.
+    """
+
+    @event.listens_for(engine.sync_engine, "checkin")
+    def _stamp_checkin(dbapi_connection, connection_record):
+        connection_record.info["last_checkin"] = time.monotonic()
+
+    @event.listens_for(engine.sync_engine, "checkout")
+    def _ping_if_idle(dbapi_connection, connection_record, connection_proxy):
+        last = connection_record.info.get("last_checkin")
+        if last is None or time.monotonic() - last < _PING_IDLE_S:
+            return            # freshly opened, or used moments ago
+        try:
+            # Runs inside the greenlet the async engine checks connections out in, so await_only is
+            # legal here. The raw asyncpg connection, not the SQLAlchemy adapter: the adapter would
+            # open a transaction around the ping.
+            await_only(dbapi_connection._connection.execute("SELECT 1"))
+        except Exception as e:
+            raise exc.DisconnectionError(f"pooled connection failed its idle check: {e}") from e
 
 
 class DatabaseClient:
@@ -31,11 +82,13 @@ class DatabaseClient:
             engine = create_async_engine(
                 self.settings.get_db_url(db_name),
                 echo=False,
-                pool_size=10,
-                max_overflow=20,
+                pool_size=_POOL_SIZE,
+                max_overflow=_MAX_OVERFLOW,
+                pool_recycle=_POOL_RECYCLE_S,
+                pool_pre_ping=False,          # replaced by _install_idle_ping — see there
                 future=True,
-                pool_pre_ping=True,
             )
+            _install_idle_ping(engine)
             self._engines[phys] = engine
             self._session_factories[phys] = async_sessionmaker(
                 engine, class_=AsyncSession, expire_on_commit=False
