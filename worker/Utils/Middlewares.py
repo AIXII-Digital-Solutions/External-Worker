@@ -11,6 +11,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
 from Config import setup_logger, DBSettings, ENABLE_PERFORMANCE_LOGGER
+from Utils import JobMetrics
 
 logger = setup_logger(
     'fastapi_app',
@@ -185,14 +186,26 @@ def cache_query(key_template: str, ttl: int = 60, update: bool = False, related_
     return decorator
 
 
-def _performance_log(seconds: float, name):
-    if ENABLE_PERFORMANCE_LOGGER:
-        if seconds < 60:
-            perf_dec_logger.info(f"{name} completed in {seconds:.2f} seconds")
-        elif seconds < 600:
-            perf_dec_logger.warning(f"{name} completed in {seconds:.2f} seconds. Improve performance")
-        else:
-            perf_dec_logger.critical(f"{name} completed in {seconds:.2f} seconds. Improve performance!!")
+def _performance_log(seconds: float, name, cost=None):
+    """How long, AND how much of it was waiting on the database.
+
+    `db=<statements>/<seconds in them>` is the number that explains the rest: this worker is a
+    network away from its database, so a slow job is usually one that asked too many times, and
+    that is invisible from the clock alone. A job slow enough to warn also gets its slowest
+    statement named, once — enough to recognise the query without logging every query of every job.
+    """
+    if not ENABLE_PERFORMANCE_LOGGER:
+        return
+    db = f" | {cost.summary()}" if cost is not None else ""
+    if seconds < 60:
+        perf_dec_logger.info(f"{name} completed in {seconds:.2f} seconds{db}")
+        return
+    level = perf_dec_logger.warning if seconds < 600 else perf_dec_logger.critical
+    suffix = "Improve performance" if seconds < 600 else "Improve performance!!"
+    level(f"{name} completed in {seconds:.2f} seconds{db}. {suffix}")
+    if cost is not None and cost.slowest_statement:
+        level(f"  slowest statement of {name}: {cost.slowest_seconds * 1000:.0f}ms  "
+              f"{cost.slowest_statement}")
 
 
 def performance_timer(func):
@@ -204,12 +217,13 @@ def performance_timer(func):
         # --- ASYNC  ---
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
+            cost = JobMetrics.begin()
             start = time.perf_counter()
             result = await func(*args, **kwargs)
             end = time.perf_counter()
 
             elapsed = end - start
-            _performance_log(elapsed, func.__name__)
+            _performance_log(elapsed, func.__name__, cost)
 
             return result
 
@@ -219,6 +233,8 @@ def performance_timer(func):
         # --- SYNC  ---
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            # Synchronous, so it does no database work of its own through the async engine —
+            # timed, but with nothing to count.
             start = time.perf_counter()
             result = func(*args, **kwargs)
             end = time.perf_counter()

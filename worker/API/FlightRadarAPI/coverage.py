@@ -132,6 +132,26 @@ async def _covered(session, reg):
     return [(r[0], r[1]) for r in rows]
 
 
+async def _covered_many(session, regs):
+    """The ledger for the WHOLE batch — `{reg: [(from, to), ...]}` — in one query.
+
+    Same shape as `_data_days` above, and for the same reason. Read one reg at a time this cost a
+    SELECT per tail, each in its own session, which against a database on another host is three
+    round trips (BEGIN, the query, COMMIT) times the size of the fleet. The planner needs every
+    tail's ledger before it can do anything, so there is nothing to gain by asking one at a time.
+    """
+    out: dict = {}
+    if not regs:
+        return out
+    rows = (await session.execute(
+        text(f"SELECT reg, covered_from, covered_to FROM {_TBL} "
+             f"WHERE reg = ANY(:regs) ORDER BY reg, covered_from"),
+        {"regs": list(regs)})).all()
+    for reg, f, t in rows:
+        out.setdefault(reg, []).append((f, t))
+    return out
+
+
 async def _data_days(session, regs, w_start, w_end, up_to):
     """The days each reg ALREADY has flightsummary rows on, within [w_start, min(w_end, up_to)] — one bulk
     query for the whole batch. A day with data is, by definition, already fetched: including it in the
@@ -195,14 +215,14 @@ async def plan_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_d
     finalize_cut = date.today() - timedelta(days=1 + COVERAGE_REVALIDATE_DAYS)
     async with db_client.session("flightradar") as s:
         data_days = await _data_days(s, regs, w_start, w_end, finalize_cut)
+        covered_all = await _covered_many(s, regs)
 
     groups: dict = {}   # (gf, gt) -> [regs]
     for i, reg in enumerate(regs):
         if should_cancel is not None and await should_cancel():
             raise JobCancelled()
         try:
-            async with db_client.session("flightradar") as s:
-                covered = await _covered(s, reg)
+            covered = covered_all.get(reg, [])
             # Bridge only the DATA-days with gap_days (short no-fly gaps between real flights — we hold data on
             # both sides, so assuming the tiny gap is "seen" is safe and saves empty requests). Do NOT bridge
             # the ledger's own gaps: a gap between two ledger ranges is a genuinely un-fetched stretch and must
@@ -222,8 +242,10 @@ async def plan_missing_ranges(db_client, regs, w_start: date, w_end: date, gap_d
         if on_progress is not None and (i % 10 == 0 or i == total - 1):
             try:
                 await on_progress(i + 1, total)
-            except Exception:
-                pass
+            except Exception as e:
+                # The job carries on — progress reporting is not the work. But in silence there
+                # was no way to find out why a job stopped showing progress.
+                logger.warning("coverage progress report failed at %s/%s: %s", i + 1, total, e)
 
     plan = _segment_groups(groups)
     plan.sort(key=lambda c: c[1], reverse=True)
@@ -290,11 +312,17 @@ async def fetch_planned_ranges(db_client, plan, total_requests: int, time_budget
         # blocking the trailing catch-up, while still bounding token spend on genuinely-empty old ranges.
         finalize_to = date.today() - timedelta(days=1 + COVERAGE_REVALIDATE_DAYS)
         async with db_client.session("flightradar") as s:
+            # One query for the whole group, not one per tail: every reg in `grp_regs` shares the
+            # same [gf, gt] window, so the "where did flights actually land" question is the same
+            # question asked once with a GROUP BY. A reg with no flights is simply absent, which is
+            # what `actual_to = None` meant before.
+            landed = {r: d for r, d in (await s.execute(text(
+                "SELECT reg, max(first_seen::date) FROM flightradar.flightsummary "
+                "WHERE reg = ANY(:regs) AND first_seen::date BETWEEN :f AND :t "
+                "GROUP BY reg"),
+                {"regs": list(grp_regs), "f": gf, "t": gt})).all()}
             for reg in grp_regs:
-                actual_to = (await s.execute(text(
-                    "SELECT max(first_seen::date) FROM flightradar.flightsummary "
-                    "WHERE reg = :r AND first_seen::date BETWEEN :f AND :t"),
-                    {"r": reg, "f": gf, "t": gt})).scalar()
+                actual_to = landed.get(reg)
                 settled = min(gt, finalize_to)          # finalize (even if empty) no later than here
                 record_to = settled if actual_to is None else max(actual_to, settled)
                 record_to = min(record_to, gt)

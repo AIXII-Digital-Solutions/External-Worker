@@ -903,8 +903,11 @@ async def run_forecast_model(*, session, operator: str, as_of: date,
         if on_progress is not None:
             try:
                 await on_progress((fi + 1) / nfm)
-            except Exception:
-                pass
+            except Exception as e:
+                # Same as the coverage planner: the run continues, but a stalled progress bar
+                # should leave a trace of its own rather than looking like a stalled job.
+                logger.warning("forecast progress report failed at month %s/%s: %s",
+                               fi + 1, nfm, e)
     await session.commit()
 
     # coefficients table (per-operator refresh) — powers "how the forecast is computed" charts
