@@ -606,11 +606,26 @@ first_flight AS (   -- the tail's first observed flight DATE (else its delivery 
     SELECT "Registration" reg, min("Date") ff
     FROM forecast.acys_actuals WHERE "Date" IS NOT NULL {scope_sql} GROUP BY 1
 ),
+op_first AS (   -- each operator's first real flight in scope: where its observed history starts
+    SELECT "Operator" op, min("Date") d
+    FROM forecast.acys_actuals WHERE "Date" IS NOT NULL {scope_sql} GROUP BY 1
+),
 span AS (
-    SELECT l.*, coalesce(f.ff, l.deliv) life_start,
-           date_trunc('month', coalesce(f.ff, l.deliv))::date start_m,
+    -- Never before the OBSERVED window. A tail that never flew inside it falls back to its DELIVERY date,
+    -- and without a floor it was stubbed back to 1992 — thirty empty Contract Years on the fleet sheet.
+    -- The floor is the operator's first real flight (FR24 coverage of an operator can start well after the
+    -- window opens, and a year of zero-flight stubs before it would read as "the fleet stood still"),
+    -- and never earlier than the day after :cy2022_floor, where _assemble_sql starts real flights.
+    SELECT l.*, b.life_start,
+           date_trunc('month', b.life_start)::date start_m,
            date_trunc('month', CAST(:as_of AS date))::date end_m
     FROM live l LEFT JOIN first_flight f ON f.reg = l.reg
+    LEFT JOIN op_first o ON o.op = l.op
+    CROSS JOIN LATERAL (
+        SELECT CASE WHEN coalesce(f.ff, l.deliv) IS NOT NULL
+                    THEN GREATEST(coalesce(f.ff, l.deliv), CAST(:cy2022_floor AS date) + 1, o.d)
+               END AS life_start
+    ) b
 ),
 cells AS (   -- (tail, month, Contract Year) presence cells over the span; the anchor month splits into two CYs
     SELECT DISTINCT s.reg, s.op, s.ms, s.mf, s.ss, s.pu, s.av, s.seats, s.deliv, s.lt, s.ldw, s.ol,
@@ -646,7 +661,7 @@ SELECT
 FROM cells2 c
 LEFT JOIN flown f ON f.reg = c.reg AND f.mon = c.mon AND f.cy = c.cy
 WHERE f.reg IS NULL
-  AND c.cdate >= c.life_start::date          -- not before the tail's first flight / delivery
+  AND c.cdate >= c.life_start::date          -- not before first flight / delivery / the actuals window
   AND c.cdate <= CAST(:as_of AS date)        -- not after the request 'now'
 """
 
