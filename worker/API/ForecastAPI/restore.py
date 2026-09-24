@@ -35,7 +35,7 @@ from settings import (FORECAST_CALIB_WINDOW_DAYS, FORECAST_MERGE_ETA_SECONDS,
                       FORECAST_PROGRESS_HEARTBEAT_SECONDS, FORECAST_PROGRESS_MIN_INTERVAL_SECONDS,
                       FORECAST_ETA_OVERRUN_TAIL, FORECAST_ETA_MEASURE_TRUST_FRACTION,
                       FORECAST_ETA_FALL_ALPHA, FORECAST_ETA_RISE_ALPHA,
-                      FORECAST_ETA_MIN_BAND_SHARE)
+                      FORECAST_ETA_MIN_BAND_SHARE, FORECAST_STAGING_LOCK_WAIT_SECONDS)
 from status import publish_status
 
 from .panel import (_DB, _REQUEST_TYPE, acquire_staging_lock, refresh_report_matviews,
@@ -48,12 +48,15 @@ logger = setup_logger("forecast_restore")
 
 
 async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snapshot_id: int,
-                               reused: bool = False) -> dict:
+                               reused: bool = False, staging_lock=None) -> dict:
     """Pour snapshot `snapshot_id` back into acys_summary_by_day and refresh the report.
 
     `reused` marks the hand-over from a same-day repeat: the same work, but the caller asked for a
     build and needs to be told, in the status and in the summary, that it got today's existing run
-    back instead of a new one."""
+    back instead of a new one.
+
+    `staging_lock` is a lock the caller already holds (edits_apply takes it first, so a busy moment
+    costs it nothing but a skipped tick). It is released here either way."""
     snapshot_id = int(snapshot_id)
 
     async def _pub(state, message, progress=None, payload=None):
@@ -121,10 +124,10 @@ async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snaps
 
     # A restore TRUNCATEs and refills the same single-run staging table a panel run does, so it takes
     # the same lock — otherwise it can land in the middle of a run and the two overwrite each other.
-    staging_lock = None
     try:
         await reporter.start()
-        staging_lock = await acquire_staging_lock(db_client)
+        if staging_lock is None:
+            staging_lock = await acquire_staging_lock(db_client, wait_s=FORECAST_STAGING_LOCK_WAIT_SECONDS)
 
         # ── 1/3 Validating — the snapshot still exists (retention may have dropped it). ──────────────
         await reporter.enter("restore_validating")

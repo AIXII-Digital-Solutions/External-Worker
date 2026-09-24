@@ -157,6 +157,22 @@ FORECAST_REPORT_REFRESH_MODE: str = str(require_env("FORECAST_REPORT_REFRESH_MOD
 # The fast mode's lock wait. Short on purpose: its job is to notice a busy report and step aside, not to
 # queue behind it (a queued exclusive lock blocks every new reader too).
 FORECAST_REFRESH_LOCK_WAIT: str = str(require_env("FORECAST_REFRESH_LOCK_WAIT", "2s")).strip()
+# How long a forecast run or restore WAITS for the staging lock before refusing. It used to refuse at
+# once, which was right while the only other holder was another hour-long run (core-api answers that
+# case with a 409 before enqueuing anything). Now the automatic fleet-edit apply below holds it too,
+# for the seconds a report refresh takes — a user's run starting in that window must wait it out, not
+# fail. Longer than any refresh, far shorter than a run.
+FORECAST_STAGING_LOCK_WAIT_SECONDS: int = int(require_env("FORECAST_STAGING_LOCK_WAIT_SECONDS", 180))
+# Automatic application of the portal's fleet-sheet edits to the forecast report
+# (API/ForecastAPI/edits_apply.py, cron `cron_apply_fleet_edits`). Every POLL seconds the worker asks
+# the database whether edits are waiting; it applies them once the editing has been QUIET that long, or
+# once the oldest unapplied edit has waited MAX_WAIT — so a burst of edits becomes one refresh, and
+# someone who never stops typing still sees the report catch up. POLL must divide 60 (a cron second set).
+FLEET_EDITS_AUTO_APPLY: bool = str(require_env("FLEET_EDITS_AUTO_APPLY", "true")).strip().lower() in (
+    "1", "true", "yes", "on")
+FLEET_EDITS_POLL_SECONDS: int = int(require_env("FLEET_EDITS_POLL_SECONDS", 15))
+FLEET_EDITS_QUIET_SECONDS: int = int(require_env("FLEET_EDITS_QUIET_SECONDS", 10))
+FLEET_EDITS_MAX_WAIT_SECONDS: int = int(require_env("FLEET_EDITS_MAX_WAIT_SECONDS", 60))
 # Cirium matview refreshes (delta/asg/all_/historical_) rebuild CONCURRENTLY over the full revision
 # history; with large full-fleet snapshots they exceed arq's default 300s job timeout (delta/plantype
 # time out). Give the heavy cirium refresh cron jobs their own longer timeout (main.py WorkerSettings).
