@@ -227,3 +227,43 @@ async def mark_restored(session, snapshot_id: int) -> None:
     await session.execute(text(
         f"UPDATE {_HEAD} SET restored_at = now(), restore_count = restore_count + 1 "
         "WHERE id = :sid"), {"sid": int(snapshot_id)})
+
+
+# ── Which run the staging table holds, and when the report last absorbed the fleet-sheet edits ──
+# forecast.acys_live_state (Core-API migration `acys_edits_overlay`) is ONE row. The report chain reads
+# acys_summary_by_day THROUGH forecast.acys_summary_by_day_effective, which lays the portal's fleet-sheet
+# edits over the model's rows, so "apply the edits" is a refresh of the report — and when the snapshot
+# asked for is already the one in the table, not even the pour is needed. That shortcut is only safe if
+# the pointer is never stale: it is CLEARED before anything rewrites the table and SET only once the
+# rewrite and its refresh have both finished.
+
+async def get_live_snapshot(session) -> int | None:
+    """The snapshot acys_summary_by_day holds right now, or None while it is being rewritten."""
+    return (await session.execute(text(
+        "SELECT snapshot_id FROM forecast.acys_live_state WHERE id = 1"))).scalar()
+
+
+async def clear_live(session) -> None:
+    """Called BEFORE the staging table is truncated: until the new contents are complete, it holds
+    no snapshot at all."""
+    await session.execute(text("UPDATE forecast.acys_live_state SET snapshot_id = NULL WHERE id = 1"))
+
+
+async def report_clock(session):
+    """The database's clock, read just BEFORE a report refresh starts: the edits the refresh can see
+    are the ones made before this instant, so it — not the end of the refresh — is what the report
+    is up to date with."""
+    return (await session.execute(text("SELECT clock_timestamp()"))).scalar()
+
+
+async def mark_live(session, snapshot_id: int | None, refreshed_at) -> None:
+    """Record that the report now shows `snapshot_id`, refreshed as of `refreshed_at`, and stamp that
+    snapshot as having had the fleet-sheet edits applied then. The SAME snapshot row is stamped every
+    time — applying edits never creates a snapshot."""
+    await session.execute(text(
+        "UPDATE forecast.acys_live_state SET snapshot_id = :sid, refreshed_at = :at WHERE id = 1"),
+        {"sid": snapshot_id, "at": refreshed_at})
+    if snapshot_id is not None:
+        await session.execute(text(
+            f"UPDATE {_HEAD} SET edits_applied_at = :at WHERE id = :sid"),
+            {"sid": int(snapshot_id), "at": refreshed_at})
