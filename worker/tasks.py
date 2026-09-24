@@ -18,7 +18,7 @@ from API.FlightRadarAPI.LiveFlightsAPI import live_flights_adaptive
 from API.Utils import (create_or_update_subscription, asg_regs_updater, refresh_cirium_delta,
                        collapse_completed_revisions, refresh_plantype_matviews,
                        ensure_livepositions_partitions)
-from API.ForecastAPI import run_forecast_panel, run_forecast_restore
+from API.ForecastAPI import run_forecast_panel, run_forecast_restore, apply_fleet_edits_if_due
 from API.Airports import refresh_airports
 
 logger = setup_logger("external_worker_tasks")
@@ -112,6 +112,14 @@ async def forecast_restore(ctx, snapshot_id: int, correlation_id=None, **_):
         ref="forecast_restore",
         snapshot_id=snapshot_id,
     )
+
+
+# NOT status_task-wrapped and NOT in the registry: a native ARQ cron (main.py) that ticks every
+# FLEET_EDITS_POLL_SECONDS — far below the registry dispatcher's one-minute resolution — and publishes
+# nothing when there is nothing to do. An actual apply publishes its own steps (ref
+# `forecast_edits_apply`) through run_forecast_restore. See API/ForecastAPI/edits_apply.py.
+async def cron_apply_fleet_edits(ctx, **_):
+    return await apply_fleet_edits_if_due(ctx["db_client"], ctx.get("redis_client"))
 
 
 # -----------------------------

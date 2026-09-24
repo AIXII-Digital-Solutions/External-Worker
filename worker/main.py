@@ -69,6 +69,25 @@ _CRON_JOBS = [
 ]
 
 
+def _poll_seconds() -> set[int]:
+    """The cron second set for FLEET_EDITS_POLL_SECONDS. A cron fires at fixed seconds of the minute, so
+    the period has to divide 60; anything else falls back to 15 rather than drifting."""
+    step = settings.FLEET_EDITS_POLL_SECONDS
+    if step <= 0 or 60 % step:
+        logger.warning("FLEET_EDITS_POLL_SECONDS=%s does not divide 60 — using 15", step)
+        step = 15
+    return set(range(0, 60, step))
+
+
+# Fleet-sheet edits reach the report on their own, in batches (API/ForecastAPI/edits_apply.py). Native
+# ARQ cron rather than a registry row: the registry dispatcher ticks once a minute, this needs seconds.
+# On the same single replica as the dispatcher (SCHEDULER_ENABLED), so two workers never race for it.
+# unique: a tick still running (an apply in progress) is not started again by the next one.
+if settings.FLEET_EDITS_AUTO_APPLY:
+    _CRON_JOBS.append(cron(tasks.cron_apply_fleet_edits, second=_poll_seconds(), unique=True,
+                           run_at_startup=False, timeout=settings.FORECAST_JOB_TIMEOUT_SECONDS))
+
+
 # Cirium matview refreshes rebuild CONCURRENTLY over the full revision history; with large full-fleet
 # snapshots delta/plantype exceed arq's default 300s job timeout, so they get their own longer timeout.
 _CIRIUM_REFRESH_JOBS = {

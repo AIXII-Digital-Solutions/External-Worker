@@ -82,7 +82,8 @@ from settings import (FORECAST_ASSEMBLE_ETA_SECONDS,
                       FORECAST_ETA_OVERRUN_TAIL, FORECAST_ETA_MEASURE_TRUST_FRACTION,
                       FORECAST_ETA_FALL_ALPHA, FORECAST_ETA_RISE_ALPHA,
                       FORECAST_ETA_MIN_BAND_SHARE, FORECAST_SNAPSHOT_RETENTION_DAYS,
-                      FORECAST_REPORT_REFRESH_MODE, FORECAST_REFRESH_LOCK_WAIT)
+                      FORECAST_REPORT_REFRESH_MODE, FORECAST_REFRESH_LOCK_WAIT,
+                      FORECAST_STAGING_LOCK_WAIT_SECONDS)
 from status import publish_status
 
 from .params import load_params
@@ -162,17 +163,26 @@ REPORT_MATVIEWS = tuple(mv for level in REPORT_MATVIEW_LEVELS for mv in level)
 _STAGING_LOCK_KEY = 8147320615004001      # arbitrary but fixed: forecast.acys_summary_by_day
 
 
-async def acquire_staging_lock(db_client):
+async def acquire_staging_lock(db_client, wait_s: float = 0):
     """Claim the staging table for this run, or refuse the run. Returns a handle for release().
+
+    `wait_s` > 0 retries for that long before refusing: a run or restore waits out the automatic
+    fleet-edit apply (a refresh, seconds) instead of failing on it. 0 refuses at once — what the apply
+    itself uses, since skipping a tick costs nothing.
 
     Entered by hand rather than with `async with`, so the caller can hold it across its existing
     try/finally without the whole body moving an indent level.
     """
     ctx = db_client.pinned_session(_DB)
     s = await ctx.__aenter__()
+    deadline = time.monotonic() + max(0.0, wait_s)
     try:
-        got = (await s.execute(text("SELECT pg_try_advisory_lock(:k)"),
-                               {"k": _STAGING_LOCK_KEY})).scalar()
+        while True:
+            got = (await s.execute(text("SELECT pg_try_advisory_lock(:k)"),
+                                   {"k": _STAGING_LOCK_KEY})).scalar()
+            if got or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(2)
     except BaseException:
         await ctx.__aexit__(None, None, None)
         raise
@@ -1018,7 +1028,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
     try:
         await reporter.start()
         # claimed before anything touches the staging table, released in the finally below
-        staging_lock = await acquire_staging_lock(db_client)
+        staging_lock = await acquire_staging_lock(db_client, wait_s=FORECAST_STAGING_LOCK_WAIT_SECONDS)
 
         # ── 1/10 Validating request — the scope has matching aircraft (else fail fast). ─────────────
         await reporter.enter("validating")
