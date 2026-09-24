@@ -12,9 +12,18 @@ same-day repeat that panel.py hands over rather than rebuilding — `reused` onl
 caller is told, since the work either way is the same three steps.
 
 The live table holds ONE run, so a restore REPLACES its contents (TRUNCATE + INSERT), the same way
-every panel run does. Status is published per step through the same ProgressReporter the panel uses,
-so the portal renders a restore with the machinery it already has (step / step_total / eta / detail) —
-it just has three steps instead of ten.
+every panel run does.
+
+APPLYING FLEET-SHEET EDITS IS THIS JOB TOO. The report chain reads acys_summary_by_day through
+forecast.acys_summary_by_day_effective, which lays the portal's fleet-sheet edits over the model's rows,
+so bringing a run's report up to date with its edits is exactly "refresh the report". When the snapshot
+asked for is ALREADY the one in the staging table (forecast.acys_live_state), the pour is skipped and
+only the refresh runs — seconds, not a re-copy of the run. Either way the SAME snapshot is stamped
+(`edits_applied_at`); no new snapshot is ever made, and the snapshot's rows stay the model's own.
+
+Status is published per step through the same ProgressReporter the panel uses, so the portal renders
+a restore with the machinery it already has (step / step_total / eta / detail) — it just has three
+steps instead of ten.
 """
 import asyncio
 import json
@@ -32,7 +41,8 @@ from status import publish_status
 from .panel import (_DB, _REQUEST_TYPE, acquire_staging_lock, refresh_report_matviews,
                     release_staging_lock)
 from .progress import Calibrator, ProgressReporter, Step
-from .snapshots import get_snapshot, mark_restored, restore_snapshot
+from .snapshots import (clear_live, get_live_snapshot, get_snapshot, mark_live, mark_restored,
+                        report_clock, restore_snapshot)
 
 logger = setup_logger("forecast_restore")
 
@@ -66,6 +76,15 @@ async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snaps
         except Exception:
             return False
 
+    # Already in the staging table? Then this is "apply the fleet-sheet edits": no pour, just the
+    # refresh. Read here only to word the steps — the decision is taken again under the staging lock,
+    # since a run could finish in between.
+    try:
+        async with db_client.session(_DB) as s:
+            loaded = (await get_live_snapshot(s)) == snapshot_id
+    except Exception:
+        loaded = False
+
     # Titles and detail never name a data source, and they say the same thing either way — the
     # difference between "restore this" and "this already ran today" is in the detail line only.
     steps = [
@@ -75,6 +94,7 @@ async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snaps
              unit_based=False, weight=2),
         Step("restore_loading", "Restoring saved report",
              ("Loading today's existing report instead of rebuilding it." if reused
+              else "The saved dataset is already loaded; applying the fleet edits." if loaded
               else "Loading the saved dataset back into the report."),
              unit_based=False, weight=40),
         Step("restore_rendering", "Rendering report",
@@ -130,17 +150,28 @@ async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snaps
             boot_flat=FORECAST_MERGE_ETA_SECONDS))
         await reporter.enter("restore_loading")
         async with db_client.session(_DB) as s:
-            final_rows = await restore_snapshot(s, snapshot_id)
+            loaded = (await get_live_snapshot(s)) == snapshot_id   # decided under the lock
+            if loaded:
+                final_rows = (await s.execute(text(
+                    "SELECT count(*) FROM forecast.acys_summary_by_day"))).scalar()
+            else:
+                await clear_live(s)
+                final_rows = await restore_snapshot(s, snapshot_id)
             await s.commit()
         d = await reporter.complete()
-        await cal.record("restore_loading", d, max(1, final_rows),
-                         {"snapshot_id": snapshot_id, "final_rows": final_rows})
+        if not loaded:   # a skipped pour says nothing about how long a pour takes
+            await cal.record("restore_loading", d, max(1, final_rows),
+                             {"snapshot_id": snapshot_id, "final_rows": final_rows})
 
         # ── 3/3 Rendering — refresh exactly what a real run refreshes, in the same order. ────────────
         await reporter.enter("restore_rendering")
+        async with db_client.session(_DB) as s:
+            refreshed_at = await report_clock(s)
         refresh_timings = await refresh_report_matviews(db_client)
         async with db_client.session(_DB) as s:
-            await mark_restored(s, snapshot_id)
+            if not loaded:
+                await mark_restored(s, snapshot_id)
+            await mark_live(s, snapshot_id, refreshed_at)
             await s.commit()
         # The live table now holds THIS snapshot's run — /forecast/last must say so, or it keeps
         # describing a run the report no longer shows. Best-effort, as in the panel.
@@ -164,7 +195,8 @@ async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snaps
             "refresh": {mv.split(".")[-1]: [mode, round(secs, 1)] for mv, mode, secs in refresh_timings}})
 
         summary = {
-            "mode": "reused" if reused else "snapshot",
+            "mode": "reused" if reused else "edits_applied" if loaded else "snapshot",
+            "edits_applied_at": refreshed_at.isoformat() if refreshed_at else None,
             "reused_today": reused,
             "snapshot_id": snapshot_id,
             "snapshot_created_at": head["created_at"].isoformat() if head.get("created_at") else None,
@@ -176,6 +208,8 @@ async def run_forecast_restore(*, db_client, redis, job_id: str, ref: str, snaps
         await reporter.success(
             (f"Completed — reused today's report {snapshot_id} ({final_rows} rows), nothing rebuilt"
              if reused else
+             f"Completed — applied the fleet edits to report {snapshot_id} ({final_rows} rows)"
+             if loaded else
              f"Completed — restored saved report {snapshot_id} ({final_rows} rows)"),
             summary)
         logger.info("forecast_restore done: %s", summary)

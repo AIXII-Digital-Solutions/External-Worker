@@ -86,7 +86,8 @@ from settings import (FORECAST_ASSEMBLE_ETA_SECONDS,
 from status import publish_status
 
 from .params import load_params
-from .snapshots import find_reusable, params_fingerprint, prune_snapshots, save_snapshot
+from .snapshots import (clear_live, find_reusable, mark_live, params_fingerprint, prune_snapshots,
+                        report_clock, save_snapshot)
 
 logger = setup_logger("forecast_panel")
 
@@ -1038,6 +1039,7 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
             await s.execute(text(hist_delete), scope_params)   # acys_actuals keeps other scopes
             await s.execute(text("TRUNCATE forecast.acys_forecast"))
             await s.execute(text("TRUNCATE forecast.acys_summary_by_day"))
+            await clear_live(s)   # the table holds no finished run until step 10 says so
             await s.commit()
         async with db_client.session(_DB) as s:
             scope_regs = (await s.execute(text(_SCOPE_REGS_TMPL.format(a5_where=a5_where)),
@@ -1243,7 +1245,18 @@ async def run_forecast_panel(*, db_client, redis, job_id: str, ref: str,
         # rollup, extending the step by exactly that much. The rollup is not best-effort: a stale rollup is
         # a wrong report, so its failure fails the step. Only an owner (or a member of the owning role) may
         # REFRESH: all of them are owned by grp_aviation_write, which this connection's role belongs to.
+        async with db_client.session(_DB) as s:
+            refreshed_at = await report_clock(s)
         refresh_timings, snapshot = await asyncio.gather(refresh_report_matviews(db_client), _save_history())
+        # The report now shows this run with the fleet-sheet edits as of `refreshed_at` laid over it
+        # (the chain reads acys_summary_by_day_effective). Best-effort like the history copy: a run whose
+        # snapshot failed to save still has a correct report, it just cannot be pointed at.
+        try:
+            async with db_client.session(_DB) as s:
+                await mark_live(s, snapshot.get("id"), refreshed_at)
+                await s.commit()
+        except Exception as e:
+            logger.warning("failed to record the live snapshot: %s", e)
 
         # best-effort: never fail a good run
         try:
