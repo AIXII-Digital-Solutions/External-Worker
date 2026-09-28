@@ -315,13 +315,20 @@ _NOT_DEAD = """NOT EXISTS (
 # fleet and forecast for the whole horizon, in parallel with the operator that actually has it now — two
 # forecasts of one airframe. The wet-lease case this carry-forward exists for is unaffected: there the flying
 # operator's own flights ARE the latest ones.
+#
+# The tail's last date under this operator is computed in a derived table, NOT as a scalar subquery in the
+# WHERE. Written as `later."Date" > (SELECT max(...))` the planner pulled the NOT EXISTS up into a hash anti
+# join over the WHOLE of acys_actuals and re-ran the max() as a join filter for every (aa row, later row) pair
+# of the same tail — ~2M aggregate runs for Air Arabia; step 8 hung for 35+ minutes. The derived table cannot
+# be pulled up, so the max() runs once per aa row (Air Arabia: 9 s).
 _NOT_MOVED_ON = """NOT EXISTS (
-        SELECT 1 FROM forecast.acys_actuals later
-        WHERE later."Registration" = aa."Registration" AND later."Date" IS NOT NULL
-          AND later."Operator" IS DISTINCT FROM aa."Operator"
-          AND later."Date" > (SELECT max(x."Date") FROM forecast.acys_actuals x
-                              WHERE x."Registration" = aa."Registration" AND x."Operator" = aa."Operator"
-                                AND x."Date" IS NOT NULL))"""
+        SELECT 1
+        FROM (SELECT max(x."Date") AS last_here FROM forecast.acys_actuals x
+              WHERE x."Registration" = aa."Registration" AND x."Operator" = aa."Operator"
+                AND x."Date" IS NOT NULL) lh
+        JOIN forecast.acys_actuals later
+          ON later."Registration" = aa."Registration" AND later."Date" > lh.last_here
+         AND later."Operator" IS DISTINCT FROM aa."Operator")"""
 
 _IDENT = """CASE WHEN coalesce(ca."Serial Number",'') <> ''
             THEN 'SN:' || ca."Serial Number" || '|' || coalesce(nullif(ca."Aircraft Sub Series",''),'NA')
