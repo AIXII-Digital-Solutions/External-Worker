@@ -23,7 +23,8 @@ PLANTYPE_VIEWS = ["cirium.all_commercial", "cirium.all_business_helicopters",
 @performance_timer
 async def asg_regs_updater():
     """Refresh the fleet matviews: asg_* (commercial + business_helicopters, then full), the non-ASG
-    insured pair, cirium.airlines and cirium.registrations.
+    insured pair, cirium.airlines and cirium.registrations — then sync the insured fleet's
+    usage/insurance status from them (sync_insured_fleet_status).
 
     It no longer rebuilds api.registration. That table is now a HAND-KEPT list of registrations feeding
     cirium.non_asg_insured_*, and the function that used to TRUNCATE and refill it from asg_full is
@@ -38,6 +39,26 @@ async def asg_regs_updater():
     await client.refresh_materialized_view("cirium", AIRLINES_VIEW)
     await client.refresh_materialized_view("cirium", REGISTRATIONS_VIEW)
     logger.info("asg_* + non_asg_insured_* + cirium.airlines + cirium.registrations refreshed")
+    await sync_insured_fleet_status(client)
+
+
+async def sync_insured_fleet_status(client: DatabaseClient) -> int:
+    """Bring the insured fleet's service block in line with the revision just refreshed:
+    `usage_status` from Cirium's newest revision, and `status` from the coverage in force today
+    (which also catches a cover that started or ended with the calendar).
+
+    The logic is fleet.sync_service_status() (owned by core-api's Alembic, revision
+    service_status_sync); it writes only the values that changed. Run AFTER the matview refresh so
+    a failure here cannot hold the fleet matviews back — it is logged and the refresh stands."""
+    try:
+        async with client.session("cirium") as session:
+            changed = (await session.execute(
+                text("SELECT fleet.sync_service_status()"))).scalar() or 0
+        logger.info("fleet.sync_service_status changed %d value(s)", changed)
+        return changed
+    except Exception:
+        logger.exception("fleet.sync_service_status failed; the fleet statuses were not refreshed")
+        return 0
 
 
 @performance_timer
